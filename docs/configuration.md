@@ -26,6 +26,10 @@ The extension root `.env` supplies defaults; `providers/<selected-name>.env` ove
 - HINDSIGHT_WORKER_ID, HINDSIGHT_API_WORKER_MAX_SLOTS
 - HINDSIGHT_API_PORT, HINDSIGHT_UI_PORT
 
+The launcher writes container variables to a temporary environment file inside an owner-only directory, with file permissions `0600`, and passes its path through Docker's `--env-file`. API keys, authorization headers, and credential-bearing proxy URLs stay out of command-line arguments, and container variables do not change the Docker client's environment. The file is removed after creation succeeds or fails; abrupt process termination can leave the owner-only temporary directory behind. Credentials remain container environment values visible to Docker administrators.
+
+Environment values containing line breaks are rejected before Docker work, so a value cannot introduce another env-file entry.
+
 Ports must be 1–65535 and worker slots a positive integer. Paths are relative to the extension root, independent of the project or its model selection. Logs, image-check timestamps and temporary development state remain local.
 
 For native settings, precedence is selected profile over base `.env`; independent process provider/model/key overrides are not used. The combined configuration must contain a supported provider, model, schema boolean, positive concurrency and the appropriate authentication. A profile may omit settings supplied by the base.
@@ -34,7 +38,7 @@ If a profile changes the native LLM provider or explicitly changes its endpoint,
 
 The merged `HINDSIGHT_API_PORT` is also the container API port (default `8888` when absent); Docker maps the effective host API port to it. The container control-plane port is `HINDSIGHT_CP_PORT` (default `9999`), mapped from the effective host `HINDSIGHT_UI_PORT`. Host process port overrides change publishing, not the forwarded file values. Both host and container ports are validated. Unless explicitly configured, `HINDSIGHT_CP_DATAPLANE_API_URL` points to the container API at its configured port.
 
-The launcher allocates 1 GiB of Docker shared memory for PostgreSQL. Docker’s 64 MiB default caused real project-bank creation to fail with a roughly 509 MiB shared-memory allocation. Startup reconciles this limit along with environment and mounts, recreating stale containers while retaining the named database volume.
+The launcher allocates 1 GiB of Docker shared memory for PostgreSQL. Startup reconciles this limit along with environment and mounts, recreating stale containers while retaining the named database volume.
 
 For native Codex mounts, reconciliation uses the canonical host-directory identity in the managed environment plus the writable bind mount at the container destination. Docker Desktop translates inspected mount source paths into daemon-side paths, so comparing them directly with the host path would recreate an unchanged container on every launch.
 
@@ -50,11 +54,12 @@ The provider templates below live in [examples/](../examples/), outside the acti
 | --- | --- |
 | [openai.env.example](../examples/openai.env.example) | OpenAI Chat Completions |
 | [anthropic.env.example](../examples/anthropic.env.example) | Anthropic Messages |
+| [deepseek.env.example](../examples/deepseek.env.example) | Official DeepSeek API with native JSON-object output |
 | [openai-responses.env.example](../examples/openai-responses.env.example) | OpenAI Responses |
 | [openai-codex.env.example](../examples/openai-codex.env.example) | Native Codex with dedicated file credentials |
-| [opencode-go-chat.env.example](../examples/opencode-go-chat.env.example) | OpenCode Go Chat Completions |
-| [opencode-go-messages.env.example](../examples/opencode-go-messages.env.example) | OpenCode Go Anthropic Messages |
-| [opencode-go-responses.env.example](../examples/opencode-go-responses.env.example) | OpenCode Go Responses |
+| [opencode-zen-chat.env.example](../examples/opencode-zen-chat.env.example) | OpenCode Zen pay-as-you-go Chat Completions |
+| [opencode-zen-messages.env.example](../examples/opencode-zen-messages.env.example) | OpenCode Zen pay-as-you-go Anthropic Messages |
+| [opencode-zen-responses.env.example](../examples/opencode-zen-responses.env.example) | OpenCode Zen pay-as-you-go Responses |
 
 From the extension root, copy just the intended template to a new profile name. The following refuses to overwrite an existing profile and restricts the new file’s permissions:
 
@@ -70,13 +75,13 @@ From the extension root, copy just the intended template to a new profile name. 
 ```
 
 1. Replace every `replace-with-...` model/key value in `providers/primary.env` with your intended model and independently authorized credential. These are literal placeholders, not working credentials or model recommendations. Codex instead needs an existing absolute dedicated auth-directory path and independently authorized file credentials; follow [Native Codex authentication](#native-codex-authentication).
-2. Keep the required [shared infrastructure](#shared-infrastructure) and common defaults in the root `.env`; profiles override only what differs. The complete examples can still be used without base LLM defaults. OpenAI, Anthropic and Responses examples use native default endpoints. For an OpenAI-compatible service, add `HINDSIGHT_API_LLM_BASE_URL=https://your-compatible-endpoint.example/v1` to the OpenAI profile and use that service's own model/key. Go templates already bind the required protocol endpoint; use a bare model ID, without `opencode-go/`.
-3. Keep `STRICT_SCHEMA` as `true` or `false` and `MAX_CONCURRENT` as a positive integer suited to your model/image and quota; the example values are not remote-compatibility guarantees.
+2. Keep the required [shared infrastructure](#shared-infrastructure) and common defaults in the root `.env`; profiles override only what differs. The complete examples can still be used without base LLM defaults. OpenAI, Anthropic and Responses examples use native default endpoints. For an OpenAI-compatible service, add `HINDSIGHT_API_LLM_BASE_URL=https://your-compatible-endpoint.example/v1` to the OpenAI profile and use that service's own model/key. Zen templates already bind the required protocol endpoint; use a bare model ID, without `opencode/`.
+3. Keep `STRICT_SCHEMA` as `true` or `false` and `MAX_CONCURRENT` as a positive integer suited to your model/image and quota. The templates using `true` require a model/endpoint that supports strict structured output; use `false` for JSON-object-only services. Choose a model meeting [Hindsight's output and schema requirements](https://hindsight.vectorize.io/developer/models#model-requirements), or lower its retain output budget as documented there.
 4. In OMP, run `/hindsight-provider` and select `primary` (or your chosen filename without `.env`). This only saves the name. Exit and launch a fresh OMP process to apply it when container reconciliation is authorized; `/new` and `/reload` do not apply or retry it.
 
 Never source these files or put shell credential references in them: the launcher reads literal values. Do not copy all examples into active profiles, reuse OMP tokens, or commit populated profiles. Setup remains operator-owned; copying a template does not authorize login, inference or credential migration.
 
-Supported native providers: openai, anthropic, opencode-go, openai-responses and openai-codex. Provider, model, schema boolean and positive concurrency are required after combining the base and selected profile; key-based providers additionally require their own API key. BASE_URL is optional for native defaults, except Go configurations bind an explicit protocol endpoint. DEFAULT_HEADERS, when present, is a JSON object with string values, for example:
+These templates use native providers openai, anthropic, deepseek, openai-responses and openai-codex. Provider, model, schema boolean and positive concurrency are required after combining the base and selected profile; key-based providers additionally require their own API key. BASE_URL is optional for native defaults; Zen templates set an explicit gateway endpoint. DEFAULT_HEADERS, when present, is a JSON object with string values, for example:
 
 ```dotenv
 HINDSIGHT_API_LLM_DEFAULT_HEADERS='{"User-Agent":"omp-hindsight"}'
@@ -84,9 +89,15 @@ HINDSIGHT_API_LLM_DEFAULT_HEADERS='{"User-Agent":"omp-hindsight"}'
 
 Use simple literal KEY=VALUE entries, optionally quoted. There is no shell execution or interpolation: $VAR remains literal, not an environment credential reference. `OLLAMA_API_KEY` in either file is forwarded literally, but is not substituted for the required native LLM API key. Process provider/model/key overrides are not used. Credentials are never borrowed from ~/.omp/agent/.env.
 
-Optional `HINDSIGHT_API_LLM_REASONING_EFFORT` can be a base default or selected-profile override and is forwarded to Hindsight. The original development configuration used `low` for a Luna 6 Codex candidate; this is not a model recommendation. Omitting it from both files restores the model's native default. Adding, changing or removing it reconciles the container only in the next fresh OMP process. Support depends on the provider/model and installed image; see Hindsight's [reasoning configuration](https://hindsight.vectorize.io/developer/performance).
+Optional `HINDSIGHT_API_LLM_REASONING_EFFORT` can be a base default or selected-profile override and is forwarded to Hindsight. Omitting it from both files restores the model's native default. Adding, changing or removing it reconciles the container only in the next fresh OMP process. Support depends on the provider/model and installed image; see Hindsight's [reasoning configuration](https://hindsight.vectorize.io/developer/performance).
 
-Hindsight supports [separate reflect models](https://hindsight.vectorize.io/developer/configuration); native per-operation settings in either file are forwarded too. Hindsight validates these additional settings; forwarding does not prove provider/image support. `openai/gpt-oss-120b` requires a separately configured compatible service and its own credential (or a self-hosted endpoint); it is not listed under the installed OMP catalog's Codex provider. The original development Codex candidate had no reflect override, so reflect used its default model. Do not add an unauthenticated override or borrow OMP credentials.
+Hindsight supports [separate reflect models](https://hindsight.vectorize.io/developer/configuration); native per-operation settings in either file are forwarded too. Hindsight validates these additional settings; forwarding does not prove provider/image support. Configure each target's endpoint, model, and independently authorized credential rather than borrowing OMP credentials.
+
+### Official DeepSeek API
+
+The [DeepSeek template](../examples/deepseek.env.example) connects directly to DeepSeek. It uses Hindsight's native `deepseek` provider so its adapter handles DeepSeek's JSON-object response format, including calls that request strict schemas. DeepSeek documents JSON-object output rather than the strict `json_schema` response format; keep `STRICT_SCHEMA=false`.
+
+The template uses the current [`deepseek-flash` model](https://api-docs.deepseek.com/) and an independently issued DeepSeek API key. `REASONING_EFFORT=none` disables its default thinking mode, as documented in the [Chat Completions reference](https://api-docs.deepseek.com/api/create-chat-completion). The launcher forwards that setting to Hindsight.
 
 ### Native Codex authentication
 
@@ -109,17 +120,18 @@ Local checks require a readable/writable/searchable directory and a regular, rea
 The whole directory—not just auth.json—is necessary for native refresh locks, sibling temporary files and atomic replacement. Container-user permissions must allow reading and persisting credentials; host access checks cannot prove the Docker container UID can write or that a token/model is accepted remotely. Confirm these separately against an authorized image and account. The directory is preserved on recreation, and changing its host path forces reconciliation. Switching back to a key-based profile removes the Codex mount and native auth-home setting.
 
 
-### OpenCode Go protocol choices
+### OpenCode Zen protocol choices
 
-Each operator-authored Go profile must pair its bare model identifier with the documented native protocol. Do not include the CLI prefix opencode-go/ or infer the protocol from a commercial label. No model discovery/catalog is provided.
+The Zen examples use OpenCode's pay-as-you-go Console API with an independently issued key and a paid model. Free-tier chat models are restricted to the OpenCode client. Use a bare model ID, without the CLI prefix `opencode/`, and choose a model that supports structured output. See the official [model catalog](https://opencode.ai/docs/zen/) and [protocol base URLs](https://opencode.ai/v2/docs/console/harnesses#base-urls).
 
-| Protocol | Native provider | SDK base URL | Additional native headers |
-| --- | --- | --- | --- |
-| Chat Completions | opencode-go or openai | https://opencode.ai/zen/go/v1 | Native Hindsight client/session identity depends on image support |
-| Anthropic Messages | anthropic | https://opencode.ai/zen/go | Application-specific User-Agent in DEFAULT_HEADERS |
-| Responses | openai-responses | https://opencode.ai/zen/go/v1 | Native Hindsight client/session identity depends on image support |
+| Protocol | Native provider | SDK base URL |
+| --- | --- | --- |
+| Chat Completions | openai | https://opencode.ai/inference/openai/v1 |
+| Anthropic Messages | anthropic | https://opencode.ai/inference/anthropic |
+| Responses | openai-responses | https://opencode.ai/inference/openai/v1 |
 
-The Anthropic SDK appends /v1/messages, so its base excludes /v1. Go's protocol/model catalog and policies can change; consult the actual model documentation. Adapter support alone does not establish Go's acceptance of memory-service workloads or uniform privacy/retention guarantees. The chosen image must support native headers/session identity.
+The Anthropic SDK appends `/v1/messages`, so its base excludes `/v1`. OpenCode documents [Bearer authentication for Anthropic clients](https://opencode.ai/v2/docs/console/harnesses/claude-code): put the same Zen key in `HINDSIGHT_API_LLM_API_KEY` and the Messages template's `Authorization` header. Replace both literal placeholders; there is no variable interpolation. The OpenAI adapters already send the key as Bearer authentication.
+
 
 ## Selection and startup timing
 

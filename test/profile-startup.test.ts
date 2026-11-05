@@ -287,10 +287,45 @@ test("subagents and noninteractive sessions do not resolve configuration or invo
     expect(f.state().calls).toEqual([]);
 });
 
+test.each(["\n", "\r"])("line break %j cannot inject container variables or replace the existing container", separator => {
+    const f = setup();
+    f.run();
+    const before = f.state();
+    expect(f.run([{}], { HINDSIGHT_WORKER_ID: "worker" + separator + "INJECTED=unexpected" }).notifications.at(-1)?.level).toBe("error");
+    expect(f.state()).toEqual(before);
+});
+
+test.each(["create", "recreate"])("Docker %s receives credentials without exposing them in arguments", operation => {
+    const f = setup();
+    if (operation === "recreate") f.run();
+    const secrets = {
+        HINDSIGHT_API_LLM_API_KEY: "synthetic-key=with spaces $HOME",
+        HINDSIGHT_API_LLM_DEFAULT_HEADERS: '{"Authorization":"Bearer synthetic-header"}',
+        HTTPS_PROXY: "http://synthetic-user:synthetic-password@proxy.invalid:8080",
+    };
+    const containerControls = { PATH: "/container-only/bin", DOCKER_HOST: "unix:///container.sock", DOCKER_CONTEXT: "container-context", DOCKER_CONFIG: "/container/.docker" };
+    const hostControls = { DOCKER_HOST: "unix:///host.sock", DOCKER_CONTEXT: "host-context", DOCKER_CONFIG: "/host/.docker" };
+    f.envFile("providers/primary.env", { ...profile, ...secrets, ...containerControls, CUSTOM_EMPTY: "", CUSTOM_LITERAL: "a=b $HOME" });
+    expect(f.run([{}], { ...hostControls, HINDSIGHT_API_LLM_API_KEY: "synthetic-ambient-key", UNRELATED_HOST_SECRET: "synthetic-unrelated-secret" }).notifications.at(-1)?.level).toBe("info");
+    const state = f.state();
+    const applied = nativeEnv(state);
+    for (const [key, value] of Object.entries(secrets)) expect(applied[key]).toBe(value);
+    for (const [key, value] of Object.entries(containerControls)) expect(applied[key]).toBe(value);
+    expect(state.runEnvironment).toEqual({ ...hostControls, PATH: path.join(f.root, "bin") + ":" + process.env.PATH });
+    expect(state.envFile?.mode).toBe(0o600);
+    expect(fs.existsSync(path.dirname(state.envFile!.path))).toBe(false);
+    expect(applied.CUSTOM_EMPTY).toBe("");
+    expect(applied.CUSTOM_LITERAL).toBe("a=b $HOME");
+    expect(applied.UNRELATED_HOST_SECRET).toBeUndefined();
+    const argumentsText = state.calls.filter(call => call[0] === "run").at(-1)!.join("\0");
+    for (const value of Object.values(secrets)) expect(argumentsText).not.toContain(value);
+});
+
 test("transport failure cannot echo profile credentials to logs or UI", () => {
     const f = setup(); const state = f.state(); state.runFails = true; f.setState(state);
     const result = f.run();
     expect(result.notifications.at(-1)?.level).toBe("error");
     expect(JSON.stringify(result)).not.toContain("synthetic-profile-key");
     expect(fs.readFileSync(path.join(f.root, "hindsight.log"), "utf8")).not.toContain("synthetic-profile-key");
+    expect(fs.existsSync(path.dirname(f.state().envFile!.path))).toBe(false);
 });

@@ -2,20 +2,37 @@
 
 [Back to the README](../README.md) · [Full configuration reference](configuration.md)
 
-This guide assumes a writable standalone checkout, an installed [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support, Docker, and a Hindsight-compatible AI provider credential and model. The commands below use a POSIX shell. Run them from the extension root unless a step says otherwise.
+This guide assumes a writable installation directory, an installed [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support, [Bun](https://bun.sh/), Docker, and a Hindsight-compatible AI provider credential and model. The commands below use a POSIX shell. Run them from the extension root unless a step says otherwise.
 
-No `npm install` is needed to load the extension: OMP supplies its runtime imports. The package is currently marked `private`; these instructions use a local checkout, not an npm release.
+OMP supplies the extension's runtime imports; no separate dependency installation or build is needed to load its source.
 
 ## 1. Check the prerequisites
 
 ```sh
+bun --version
 omp --version
 docker version
 ```
 
-Docker must report an accessible server, not just a client version. The latest recorded native verification used OMP 18.16.0; no minimum-version or cross-platform compatibility matrix has been established.
+Docker must report an accessible server, not just a client version. OMP 18.16.0 and Bun 1.4.4 have been exercised; no minimum-version or cross-platform compatibility matrix has been established.
 
 The launcher manages one shared container across projects. If you already run Hindsight, inspect your container and volume names before proceeding: pointing the launcher at an existing container authorizes reconciliation, including replacement when settings differ. Keep its volume name if you intend to preserve that database. If you only need OMP to connect to an existing server, use OMP’s native Hindsight configuration; this launcher is not required.
+
+## Install with git clone
+
+This extension is not published on npm. Clone the repository directly into OMP's default-profile extensions directory. Replace `REPOSITORY_URL` with this repository's clone URL:
+
+```sh
+mkdir -p "$HOME/.omp/agent/extensions"
+git clone REPOSITORY_URL "$HOME/.omp/agent/extensions/hindsight-omp-extra"
+cd "$HOME/.omp/agent/extensions/hindsight-omp-extra"
+```
+
+The **extension root** is this clone, containing `package.json`, `src/`, and `.env.example`. No `bun install` or build is required. Complete the remaining setup there before launching OMP: its native extensions directory makes the launcher discoverable automatically.
+
+For a named profile or custom agent directory, use that profile's or override's extensions directory instead. Configure the clone's directory explicitly as shown below so OMP also discovers the bundled skill.
+
+The launcher keeps `.env`, `providers/`, `.selected-provider`, optional `credentials/`, and logs in the extension root. These local files are Git-ignored; keep the clone writable and back them up before replacing or removing it. Keep the same Docker volume name when restoring configuration.
 
 ## 2. Create local configuration
 
@@ -120,14 +137,14 @@ A configured scout and active native `retain` tool are required. The skill repor
 
 ## Load persistently
 
-To load the package without `-e`, add its absolute directory to the active OMP configuration’s `extensions` list. Replace the example path with the checkout’s actual path and preserve existing entries:
+To load the extension and its bundled skill, add the clone's directory to the active OMP configuration's `extensions` list. For the default-profile installation above, use the following and preserve existing entries:
 
 ```yaml
 extensions:
-  - /absolute/path/to/hindsight-omp
+  - ~/.omp/agent/extensions/hindsight-omp-extra
 ```
 
-Configure the package directory, not just `src/hindsight-omp.ts`, so OMP discovers the bundled `hindsight-ingest` skill as well. A symlink in OMP’s native extensions directory alone exposes the launcher but not the packaged skill. No symlink is needed when the package directory is configured explicitly.
+Configure the package directory, not just `src/hindsight-omp.ts`, so OMP discovers the bundled `hindsight-ingest` skill as well. No symlink is needed.
 
 Restart OMP after deployment. Extension package settings arrays replace rather than append across configuration layers, so check the effective list if a project or overlay also supplies `extensions`.
 
@@ -148,3 +165,13 @@ docker stop hindsight-omp
 ```
 
 Use your configured `HINDSIGHT_CONTAINER_NAME` if different. This stops the container without deleting its named data volume. The next eligible fresh OMP launch can start it again. The container uses Docker’s `unless-stopped` restart policy; closing OMP is not an instruction to stop Docker.
+
+## Development checks
+
+Run checks from the extension root:
+
+```sh
+bun run check
+```
+
+This runs the Bun test suite and bundles the extension into `.tmp/build`. Tests use synthetic configuration and fake Docker rather than your running Hindsight deployment.

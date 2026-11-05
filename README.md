@@ -1,4 +1,4 @@
-# hindsight-omp
+# hindsight-omp-extra
 
 An [OMP](https://github.com/can1357/oh-my-pi) extension for running [Hindsight](https://hindsight.vectorize.io/) in Docker and inspecting the sources behind recalled knowledge.
 
@@ -13,9 +13,9 @@ Use it when you want OMP to manage a self-hosted Hindsight instance or need to i
 - [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support.
 - Docker running and accessible.
 - A Hindsight-compatible model and its own AI API credentials. Memory processing can incur model-provider charges.
-- A writable checkout for local configuration, provider selection, and logs.
+- A writable installation directory for local configuration, provider selection, and logs.
 
-Clone or download this repository. From its root, check:
+Install by [cloning the repository](docs/setup.md#install-with-git-clone); it is not published on npm. From the extension root, check:
 
 ```sh
 omp --version
@@ -66,3 +66,4 @@ The skill uses a scout to distill useful knowledge and queues it through OMP’s
 - [Recall guidance](docs/recall.md) — footer, lesson guidance, and optional nudges
 - [Source ingestion](docs/ingestion.md) — importing files, directories, URLs, and wiki content
 - [Architecture](docs/architecture.md)
+- [Changelog](CHANGELOG.md)

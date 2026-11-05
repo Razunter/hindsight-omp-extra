@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md)
 
-Hindsight-OMP adds deployment and evidence access to OMP’s native Hindsight integration. It is an extension, not a replacement memory engine or a separate OMP build.
+hindsight-omp-extra adds deployment and evidence access to OMP's native Hindsight integration. It is an extension, not a replacement memory engine or a separate OMP build.
 
 ## Ownership
 
@@ -36,4 +36,4 @@ The retrieval footer and optional recall nudges advise the main agent to conside
 
 The retrieval footer is enabled by default; dynamic nudges are independently disabled by default. A positive completed-work interval enables them. Counting successful leaf-tool results avoids a catalog-specific work-tool list, with explicit exclusions for known control, memory, and wrapper operations. It is a coarse cadence heuristic, not semantic progress analysis.
 
-Curated lesson guidance asks for evidence-backed corrections, attribution, scope, and observed procedure outcomes. It adds no writer or persistence guarantee. Useful-retrieval and task-correctness benefits from dynamic nudges remain unestablished; [recorded comparisons](recall.md) did not meet the effectiveness gate.
+Curated lesson guidance asks for evidence-backed corrections, attribution, scope, and observed procedure outcomes. It adds no writer or persistence guarantee. Useful-retrieval and task-correctness benefits from dynamic nudges remain unestablished.

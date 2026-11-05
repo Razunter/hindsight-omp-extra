@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md) · [Skill instructions](../skills/hindsight-ingest/SKILL.md)
 
-The package includes the user-invoked `hindsight-ingest` skill. [Persistent package loading](setup.md#load-persistently) enables it persistently. OMP discovers packaged skills when the package directory is loaded through `-e`, configured `extensions`, or plugin installation; a native extension-directory symlink alone loads only the launcher. For a one-session launch without changing settings, run `omp -e /absolute/path/to/hindsight-omp`, then:
+The package includes the user-invoked `hindsight-ingest` skill. [Persistent package loading](setup.md#load-persistently) enables it persistently. OMP discovers packaged skills when the package directory is loaded through `-e`, configured `extensions`, or plugin installation; a native extension-directory symlink alone loads only the launcher. For a one-session launch without changing settings, run `omp -e /absolute/path/to/hindsight-omp-extra`, then:
 
 ```text
 /skill:hindsight-ingest <file, directory, URL, or pasted source>

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
+import { tmpdir } from "node:os";
 import { getAgentDir, type ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { registerEvidence } from "./evidence";
 import { registerRecallAssistance } from "./recall-assistance";
@@ -157,7 +158,7 @@ function selectedProviderConfiguration(extensionEnv: Record<string, string>): { 
         }
     }
     const provider = env.HINDSIGHT_API_LLM_PROVIDER;
-    if (!["openai", "anthropic", "opencode-go", "openai-responses", "openai-codex"].includes(provider)) {
+    if (!["openai", "anthropic", "deepseek", "opencode-go", "openai-responses", "openai-codex"].includes(provider)) {
         throw new Error("Hindsight: selected profile requires a supported native HINDSIGHT_API_LLM_PROVIDER");
     }
     for (const key of ["HINDSIGHT_API_LLM_MODEL", "HINDSIGHT_API_LLM_STRICT_SCHEMA", "HINDSIGHT_API_LLM_MAX_CONCURRENT"]) {
@@ -387,6 +388,10 @@ async function startContainer(
     const cleanupImages: { id: string; tags: string[] }[] = [];
     try {
         const env = desiredContainerEnv(settings);
+        if (Object.values(env).some(value => /[\r\n]/.test(value))) {
+            log("Container environment values must not contain line breaks");
+            return false;
+        }
 
         // 0 — quick Docker reachability check (fail fast)
         const alive = await docker(
@@ -471,43 +476,47 @@ async function startContainer(
             await docker(["rm", "-f", settings.containerName]);
         }
 
-        // 2 — doesn't exist (or was recreated): create the container.
-        const bindAddress = settings.bindAddress.includes(":") ? "[" + settings.bindAddress + "]" : settings.bindAddress;
-        const run = await docker(
-            [
-                "run",
-                "-d",
-                "--pull",
-                "never",
-                "--name",
-                settings.containerName,
-                "--restart",
-                "unless-stopped",
-                "--shm-size",
-                String(SHM_SIZE_BYTES),
-                "-p",
-                `${bindAddress}:${settings.apiPort}:${env.HINDSIGHT_API_PORT ?? "8888"}`,
-                "-p",
-                `${bindAddress}:${settings.uiPort}:${env.HINDSIGHT_CP_PORT ?? "9999"}`,
-                ...Object.entries(env).flatMap(([key, value]) => [
-                    "-e",
-                    `${key}=${value}`,
-                ]),
-                "-v",
-                `${settings.volumeName}:/home/hindsight/.pg0`,
-                ...(settings.codexAuthDir ? ["-v", settings.codexAuthDir + ":/home/hindsight/.codex:rw"] : []),
-                settings.image,
-            ],
-            60_000,
-        ); // longer for image pull
+        const environmentDirectory = fs.mkdtempSync(path.join(tmpdir(), "hindsight-docker-"));
+        try {
+            const environmentFile = path.join(environmentDirectory, "env");
+            fs.writeFileSync(environmentFile, Object.entries(env).map(([key, value]) => `${key}=${value}`).join("\n"), { flag: "wx", mode: 0o600 });
+            const bindAddress = settings.bindAddress.includes(":") ? "[" + settings.bindAddress + "]" : settings.bindAddress;
+            const run = await docker(
+                [
+                    "run",
+                    "-d",
+                    "--pull",
+                    "never",
+                    "--name",
+                    settings.containerName,
+                    "--restart",
+                    "unless-stopped",
+                    "--shm-size",
+                    String(SHM_SIZE_BYTES),
+                    "-p",
+                    `${bindAddress}:${settings.apiPort}:${env.HINDSIGHT_API_PORT ?? "8888"}`,
+                    "-p",
+                    `${bindAddress}:${settings.uiPort}:${env.HINDSIGHT_CP_PORT ?? "9999"}`,
+                    "--env-file",
+                    environmentFile,
+                    "-v",
+                    `${settings.volumeName}:/home/hindsight/.pg0`,
+                    ...(settings.codexAuthDir ? ["-v", settings.codexAuthDir + ":/home/hindsight/.codex:rw"] : []),
+                    settings.image,
+                ],
+                60_000,
+            );
 
-        if (run.exitCode !== 0) {
-            log("docker run failed; exit code:", run.exitCode);
-            return false;
+            if (run.exitCode !== 0) {
+                log("docker run failed; exit code:", run.exitCode);
+                return false;
+            }
+
+            log("Container created and started");
+            return true;
+        } finally {
+            fs.rmSync(environmentDirectory, { recursive: true, force: true });
         }
-
-        log("Container created and started");
-        return true;
     } catch {
         log("Container startup transport failed; check Docker availability and permissions");
         return false;

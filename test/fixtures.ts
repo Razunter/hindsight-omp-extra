@@ -14,6 +14,8 @@ export interface DockerState {
     waitForStartup?: boolean;
     pullReleased?: boolean;
     pullOutputBytes?: number;
+    runEnvironment?: Record<string, string | undefined>;
+    envFile?: { path: string; mode: number };
 }
 export interface StartupResult {
     notifications: { message: string; level: string }[];
@@ -90,9 +92,14 @@ case "rm": state.container = null; break;
 case "start": state.container.running = true; break;
 case "volume": if (args[1] === "rm" && args.includes("fixture-data")) state.data = null; else code = 1; break;
 case "run": {
+state.runEnvironment = Object.fromEntries(["PATH", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"].map(key => [key, process.env[key]]));
 const env = [], mounts = [], portBindings = {};
 for (let i = 1; i < args.length; i++) {
-if (args[i] === "-e") env.push(args[++i]);
+if (args[i] === "--env-file") {
+const file = args[++i];
+state.envFile = { path: file, mode: fs.statSync(file).mode & 0o777 };
+env.push(...fs.readFileSync(file, "utf8").split("\\n").filter(Boolean));
+}
 if (args[i] === "-v") { const [source, destination, mode] = args[++i].split(":"); mounts.push({ Source: source, Destination: destination, RW: mode !== "ro" }); }
 if (args[i] === "-p") {
 const parts = args[++i].split(":");
