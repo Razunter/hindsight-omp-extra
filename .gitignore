@@ -1,0 +1,8 @@
+.env
+hindsight.log
+.last-image-check
+.tmp/
+providers/
+.selected-provider
+.selected-provider.*
+credentials/

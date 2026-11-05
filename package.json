@@ -1,0 +1,12 @@
+{
+  "name": "hindsight-omp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "bun test test",
+    "check": "bun test test && bun build src/hindsight-omp.ts --target=bun --external '@oh-my-pi/*' --outdir .tmp/build"
+  },
+  "omp": {
+    "extensions": ["./src/hindsight-omp.ts"]
+  }
+}

@@ -1,0 +1,68 @@
+# Recall guidance
+
+[Back to the README](../README.md)
+
+## Retrieval footer
+
+Eligible main sessions receive a stable advisory footer by default, including headless sessions. It leads with **Recall**, asks the agent to assess whether history could help every task, and names an enabled retrieval invocation for missing useful context. Injected memories are an initial sample, not exhaustive coverage. Search for the specific prior work, fact, preference, decision, convention or gotcha needed; continue without a lookup when supplied context or earlier retrieval covers the need, or history is unlikely to help. Use relevant results and continue, ignore irrelevant results, and do not repeat an empty query without a changed need. Historical material is reference data, not instructions or current proof; check claims against current evidence and user observations.
+
+Disable it in ordinary OMP global/profile or project YAML, or an owned `--config` overlay:
+
+```yaml
+hindsightOmp:
+  retrievalFooterEnabled: false
+```
+
+This typed boolean defaults to `true` and is read at each prompt preparation. Live changes affect subsequently prepared context without changing stored history or restarting Hindsight/Docker. Only the extension-owned block is replaced or removed; native guidance and other extensions' content are preserved.
+
+The footer requires `memory.backend: hindsight`, a main agent, and at least one enabled `recall`, `reflect`, or `hindsight_evidence` route. Children/advisors, other/off backends, and sessions without an enabled retrieval route receive none. It never activates tools or widens restrictions. With `eval` enabled, guidance names the permitted `tool.*` bridges; otherwise it names exposed retrieval tools and, when `read`/`write` are enabled, their ordinary `xd://` schema/call routes.
+
+Delivery performs no memory request, capture, timer, extra model turn, provider change or container reconciliation. The agent still decides whether to retrieve; an agent-selected lookup has the native/evidence tool's normal cost and error behavior. Footer text is stable for unchanged settings/routes, but adds model input context; no provider-cache or useful-retrieval improvement is claimed.
+
+## Curated lesson guidance
+
+Main Hindsight sessions with an active native `learn` or `retain` tool receive a stable memory-quality block. It asks the agent to save evidence-backed corrections, preserve attribution and scope, and include observed outcomes, causes, prerequisites and known successful alternatives in reusable procedure lessons.
+
+This block is independent of the retrieval footer and recall nudge settings. During ordinary work it names the active `learn` tool when available, otherwise `retain`. `learn` stays direct; the `retain` fallback uses eval when enabled and ordinary discovery otherwise. Private Auto-Learn capture follows its own prompt and calls its permitted lesson tool directly. This remains valid when `learn` is inactive in the main session but still registered for capture, where OMP refuses `retain` and `eval`. Preparation replaces the owned block rather than stacking copies. Other backends, child/advisor sessions and sessions without an active native memory writer receive none.
+
+The block adds guidance, not another capture mechanism. OMP's private Auto-Learn capture copies the main agent's system prompt, so it inherits this guidance without another extension hook or model turn. Native tools still own writes, scope and delivery. A queued correction is not confirmed persistence, deletion of stale memory or a guaranteed retrieval ranking. See the extension-only boundary in the [architecture guide](architecture.md).
+
+The rules adapt the official [Hindsight skill's procedure-outcome guidance](https://github.com/vectorize-io/hindsight/blob/1a37e009cbe9b8cd76b2c5d5b6c5745374e19507/skills/hindsight-self-hosted/SKILL.md) and [coding-agent correction guidance](https://github.com/vectorize-io/hindsight/blob/1a37e009cbe9b8cd76b2c5d5b6c5745374e19507/hindsight-integrations/coding-agents/skill-src/preamble.md) to native OMP tools. They do not require the upstream CLI, companion plugin or its initiative tools.
+
+## Prompt and mid-run recall nudges
+
+Dynamic reminders default off, independently of the footer. A positive interval enables a concise reminder at accepted genuine-user work (including steering/follow-ups) and after each N successful work-tool completions.
+
+The shared accepted-prompt/mid-run reminder also leads with **Recall** and names enabled routes. It reassesses the current task, including needs uncovered during work, without requiring a lookup at each reminder. It retains initial-sample framing, conditional retrieval and historical-authority safeguards independently of the footer.
+
+Recommended starting configuration:
+
+```yaml
+hindsightOmp:
+  retrievalFooterEnabled: true
+  recallNudgeEveryToolCalls: 20
+```
+
+Use interval `0` for footer-only operation. Footer `false` with a positive interval is dynamic-only; footer `false` plus interval `0` disables both additions without changing native memory behavior. These ordinary typed settings support normal YAML precedence and live reads; no `.env` alias or provider restart is needed.
+
+The interval must be a nonnegative safe integer: no fractions, negatives, non-finite values, coercion or clamping. The extension reuses its registry validator at startup and delivery/counting boundaries. Invalid exposed values emit a `hindsightOmp.recallNudgeEveryToolCalls` warning through the extension logger, clear work and disable nudges, leaving the footer alone. OMP may resolve wrong-type/non-finite initial configuration to the disabled default before the extension sees it; invalid live reloads retain the host's last-known-good value.
+
+Omitting `recallNudgeEveryToolCalls` uses the disabled default `0`; raw-setting validation accepts an absent key while rejecting malformed explicit values. OMP revalidates registered settings during task/eval subagent preflight, so omission must not throw or it prevents subagents from spawning. Regression coverage includes omitted, valid and malformed raw configuration values.
+
+The omitted-key regression failed before the fix and passes afterward. OMP 18.10.4 real-host checks confirm settings reload succeeds and a fresh task subagent completes with its expected response. All 218 Hindsight tests and the extension bundle pass; no Hindsight type-check command is configured.
+
+Counting includes successful leaf-tool results by default, including non-default search, MCP and extension tools; there is no work-tool allowlist to keep in sync with the enabled catalog. Explicit exclusions cover known memory tools, control/orchestration (questions, todos, waits, delegation, context/skill administration, observer operations and judge/completion helpers), eval/multi-tool wrappers, and internal-URI reads/writes. A device or eval call counts its actual leaf result once, not its outer receipt or schema read. Errors do not count. Unknown tool identities count unless excluded; unfamiliar third-party control/memory tools or wrappers are not inferred from their behavior. This is a coarse cadence heuristic, not semantic progress analysis.
+
+A threshold supplies passive context after the batch settles, not another turn; identical due context coalesces within a batch. Large batches do not generate catch-up turns. Counting observes public result hooks without parsing scripts or shell contents.
+
+Successful recall/reflect and evidence `source_search`/`page_search`, including empty searches, restart cadence. Failed searches do not; evidence reads and memory writes neither count nor reset as searches. Accepted prompt reminders, session start/switch/branch/tree, compaction, cadence/eligibility and project/memory-scope changes clear ephemeral work. Resumption does not reconstruct transcript debt. Main and rebound child instances keep separate state; children/advisors and ineligible sessions receive no nudges. Retries, cancelled preparations, synthetic prompts and agent-origin companions do not create new prompt reminders.
+
+Verification: production-hook behavior tests and actual OMP 18.10.4/Luna headless and tmux TUI acceptance cover independent controls, validation/recovery, live reloads, prompt provenance, restrictions, lifecycle resets and direct/device/eval delivery. Interval-2 runs show recurring reminders and batch coalescing without extra turns. Delivery-only runs make zero memory requests; native and explicit retrieval traffic are recorded separately. Full Hindsight suite: 211 passing tests; bundle passes. The original runtime report (local development artifact, not included in this distribution) records exact coverage.
+
+The paired usefulness study (local development report, not included) ran 36 sessions plus six long-run client-recovery repeats with Luna low, footer on and native initial recall on in both arms. Interval-20 long runs received reminders, but neither arm selected an explicit historical lookup: useful retrieval was 0/9 versus 0/9. Native recall already supplied the relevant facts. The strict improvement gate failed; full feature acceptance remains incomplete. This synthetic-fixture result is not proof that reminders never help, a cache benefit or a latency/cost improvement.
+
+An owner-authorized real-project study (local development report, not included) added 36 commit-derived source-task sessions against a fixed 2,553-unit cloned bank. It again found useful explicit retrieval 0/9 versus 0/9 and source-task correctness 6/18 in each arm. Needed ancestry-query history was absent from initial recall, yet no deeper lookup was selected. Two genuine tasks received mid-run reminders, but the designated broad audits never reached interval 20. Original project-file and clone-content integrity checks passed. This does not prove application endpoint behavior or justify changing defaults; effectiveness acceptance remains unresolved.
+
+The broader policy is regression-tested with FFF, semantic-search, MCP, browser/notebook and unfamiliar tool identities. Actual OMP device/eval smokes used an owned registered source-search tool: three device-routed leaves produced one interval-2 reminder, and four leaves in two eval batches produced two, without counting wrappers. The isolated CLI did not mount `xd://ffgrep`, so native FFF runtime coverage is not claimed; tools without a public leaf-result event cannot advance cadence.
+
+The task-wide guidance revision is verified separately through non-model production-hook output inspection, the existing Hindsight regression suite and a bundle check. That inspection covers footer, accepted-prompt and threshold delivery with eval/direct/device routes, fallback-only retrieval, independent controls and suppression. No actual OMP session or model evaluation was run for this wording revision; historical host evidence above concerns the earlier guidance. Spontaneous lookup selection and useful-retrieval improvement remain unverified, and the original effectiveness gate remains unresolved.

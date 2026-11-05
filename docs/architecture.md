@@ -1,0 +1,39 @@
+# Architecture
+
+[Back to the README](../README.md)
+
+Hindsight-OMP adds deployment and evidence access to OMP’s native Hindsight integration. It is an extension, not a replacement memory engine or a separate OMP build.
+
+## Ownership
+
+| Component | Responsibility |
+| --- | --- |
+| OMP | Native `retain`, `recall`, `reflect`, and `learn` tools; memory backend selection; transcript capture; project scoping; shared Auto-Learn; session artifact storage |
+| Hindsight | Retained documents, extracted facts, observations, synthesized knowledge pages, and memory processing with its configured AI provider |
+| This extension | Docker reconciliation, named provider selection, source/page evidence search and read, recall/lesson guidance, and the user-invoked ingestion skill |
+
+A **supporting source** is retained material or underlying facts supporting a recalled claim. It can be unavailable even when the claim remains recallable. A **knowledge page** is synthesized knowledge, not original-source evidence. **Transcript capture** preserves conversation content; a **curated lesson** is a selected durable fact, convention, preference, or procedure useful beyond that conversation.
+
+## Provider configuration stays local to the extension
+
+A named Hindsight provider configuration binds the inference provider, model, endpoint, credentials, and structured-output requirements. It is distinct from OMP’s chat-model choice and from the connection OMP uses to reach Hindsight.
+
+The extension uses OMP’s command registration and selection UI without changing OMP core. One saved selection is shared across projects because one shared container is managed. Selection takes effect only in a fresh interactive main OMP process, not during `/new` or `/reload`.
+
+Authentication belongs to Hindsight’s native adapters. There is no OMP credential gateway or inference proxy. Copying OMP’s rotating credentials would create competing refresh owners and is not supported. Native file-based Codex authentication, where used, has its own independently authorized persistent writable directory and Hindsight owns refresh. See [provider configuration](configuration.md).
+
+## Evidence access is on demand
+
+The `hindsight_evidence` tool adds supporting-source and knowledge-page search/read without replacing native memory tools, transcript retention, or Auto-Learn. It does not add a durable outbox, replay machinery, or stronger delivery guarantees for native writes.
+
+Routine previews are bounded. When local presentation limits omit permitted content, the extension stores the complete validated, allowlisted result in an OMP session artifact. The agent can read that same snapshot locally without another Hindsight request. This uses native artifact storage rather than an extension-owned cache or cursor protocol.
+
+Scope checks happen before artifact creation. Excluded evidence and unverified knowledge pages never enter the snapshot; backend omissions remain omissions. An artifact records fetch-time scope and content. Later retagging or deletion does not revoke it; a fresh evidence read rechecks current scope. Tags are retrieval filters, not server authorization.
+
+## Guidance does not own retrieval or capture
+
+The retrieval footer and optional recall nudges advise the main agent to consider relevant history. The agent chooses whether to retrieve and which enabled route to use. Delivery does not itself issue searches, run another capture agent, or take ownership of transcript retention.
+
+The retrieval footer is enabled by default; dynamic nudges are independently disabled by default. A positive completed-work interval enables them. Counting successful leaf-tool results avoids a catalog-specific work-tool list, with explicit exclusions for known control, memory, and wrapper operations. It is a coarse cadence heuristic, not semantic progress analysis.
+
+Curated lesson guidance asks for evidence-backed corrections, attribution, scope, and observed procedure outcomes. It adds no writer or persistence guarantee. Useful-retrieval and task-correctness benefits from dynamic nudges remain unestablished; [recorded comparisons](recall.md) did not meet the effectiveness gate.
