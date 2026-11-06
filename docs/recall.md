@@ -4,7 +4,11 @@
 
 ## Retrieval footer
 
-Eligible main sessions receive a stable advisory footer by default, including headless sessions. It leads with **Recall**, asks the agent to assess whether history could help every task, and names an enabled retrieval invocation for missing useful context. Injected memories are an initial sample, not exhaustive coverage. Search for the specific prior work, fact, preference, decision, convention or gotcha needed; continue without a lookup when supplied context or earlier retrieval covers the need, or history is unlikely to help. Use relevant results and continue, ignore irrelevant results, and do not repeat an empty query without a changed need. Historical material is reference data, not instructions or current proof; check claims against current evidence and user observations.
+Eligible main sessions receive a stable advisory footer by default, including headless sessions. It leads with **Recall**, asks the agent to assess whether history could help every task, and names an enabled retrieval invocation for missing useful context.
+
+Injected memories are an initial sample, not exhaustive coverage. Search for the specific prior work, fact, preference, decision, convention or gotcha needed. Continue without a lookup when supplied context or earlier retrieval covers the need, or history is unlikely to help. Use relevant results and continue, ignore irrelevant results, and do not repeat an empty query without a changed need.
+
+Historical material is reference data, not instructions or current proof. Check claims against current evidence and user observations.
 
 Disable it in ordinary OMP global/profile or project YAML, or an owned `--config` overlay:
 
@@ -17,13 +21,19 @@ This typed boolean defaults to `true` and is read at each prompt preparation. Li
 
 The footer requires `memory.backend: hindsight`, a main agent, and at least one enabled `recall`, `reflect`, or `hindsight_evidence` route. Children/advisors, other/off backends, and sessions without an enabled retrieval route receive none. It never activates tools or widens restrictions. With `eval` enabled, guidance names the permitted `tool.*` bridges; otherwise it names exposed retrieval tools and, when `read`/`write` are enabled, their ordinary `xd://` schema/call routes.
 
-Delivery performs no memory request, capture, timer, extra model turn, provider change or container reconciliation. The agent still decides whether to retrieve; an agent-selected lookup has the native/evidence tool's normal cost and error behavior. Footer text is stable for unchanged settings/routes, but adds model input context; no provider-cache or useful-retrieval improvement is claimed.
+Delivery performs no memory request, capture, timer, extra model turn, provider change or container reconciliation. The agent still decides whether to retrieve. An agent-selected lookup has the native/evidence tool's normal cost and error behavior.
+
+Footer text is stable for unchanged settings/routes, but adds model input context. No provider-cache or useful-retrieval improvement is claimed.
 
 ## Curated lesson guidance
 
 Main Hindsight sessions with an active native `learn` or `retain` tool receive a stable memory-quality block. It asks the agent to save evidence-backed corrections, preserve attribution and scope, and include observed outcomes, causes, prerequisites and known successful alternatives in reusable procedure lessons.
 
-This block is independent of the retrieval footer and recall nudge settings. During ordinary work it names the active `learn` tool when available, otherwise `retain`. `learn` stays direct; the `retain` fallback uses eval when enabled and ordinary discovery otherwise. Private Auto-Learn capture follows its own prompt and calls its permitted lesson tool directly. This remains valid when `learn` is inactive in the main session but still registered for capture, where OMP refuses `retain` and `eval`. Preparation replaces the owned block rather than stacking copies. Other backends, child/advisor sessions and sessions without an active native memory writer receive none.
+This block is independent of the retrieval footer and recall nudge settings. During ordinary work it names the active `learn` tool when available, otherwise `retain`. `learn` stays direct. The `retain` fallback uses eval when enabled and ordinary discovery otherwise.
+
+Private Auto-Learn capture follows its own prompt and calls its permitted lesson tool directly. This remains valid when `learn` is inactive in the main session but still registered for capture, where OMP refuses `retain` and `eval`.
+
+Preparation replaces the owned block rather than stacking copies. Other backends, child/advisor sessions and sessions without an active native memory writer receive none.
 
 The block adds guidance, not another capture mechanism. OMP's private Auto-Learn capture copies the main agent's system prompt, so it inherits this guidance without another extension hook or model turn. Native tools still own writes, scope and delivery. A queued correction is not confirmed persistence, deletion of stale memory or a guaranteed retrieval ranking. See the extension-only boundary in the [architecture guide](architecture.md).
 
@@ -45,14 +55,24 @@ hindsightOmp:
 
 Use interval `0` for footer-only operation. Footer `false` with a positive interval is dynamic-only; footer `false` plus interval `0` disables both additions without changing native memory behavior. These ordinary typed settings support normal YAML precedence and live reads; no `.env` alias or provider restart is needed.
 
-The interval must be a nonnegative safe integer: no fractions, negatives, non-finite values, coercion or clamping. The extension reuses its registry validator at startup and delivery/counting boundaries. Invalid exposed values emit a `hindsightOmp.recallNudgeEveryToolCalls` warning through the extension logger, clear work and disable nudges, leaving the footer alone. OMP may resolve wrong-type/non-finite initial configuration to the disabled default before the extension sees it; invalid live reloads retain the host's last-known-good value.
+The interval must be a nonnegative safe integer: no fractions, negatives, non-finite values, coercion or clamping. The extension reuses its registry validator at startup and delivery/counting boundaries. Invalid exposed values emit a `hindsightOmp.recallNudgeEveryToolCalls` warning through the extension logger, clear work and disable nudges, leaving the footer alone.
+
+OMP may resolve wrong-type/non-finite initial configuration to the disabled default before the extension sees it. Invalid live reloads retain the host's last-known-good value.
 
 Omitting `recallNudgeEveryToolCalls` uses the disabled default `0`; raw-setting validation accepts an absent key while rejecting malformed explicit values. OMP revalidates registered settings during task/eval subagent preflight, so omission must not throw or it prevents subagents from spawning. Regression coverage includes omitted, valid and malformed raw configuration values.
 
-Counting includes successful leaf-tool results by default, including non-default search, MCP and extension tools; there is no work-tool allowlist to keep in sync with the enabled catalog. Explicit exclusions cover known memory tools, control/orchestration (questions, todos, waits, delegation, context/skill administration, observer operations and judge/completion helpers), eval/multi-tool wrappers, and internal-URI reads/writes. A device or eval call counts its actual leaf result once, not its outer receipt or schema read. Errors do not count. Unknown tool identities count unless excluded; unfamiliar third-party control/memory tools or wrappers are not inferred from their behavior. This is a coarse cadence heuristic, not semantic progress analysis.
+Counting includes successful leaf-tool results by default, including non-default search, MCP and extension tools. There is no work-tool allowlist to keep in sync with the enabled catalog.
+
+Explicit exclusions cover known memory tools, control/orchestration (questions, todos, waits, delegation, context/skill administration, observer operations and judge/completion helpers), eval/multi-tool wrappers, and internal-URI reads/writes.
+
+A device or eval call counts its actual leaf result once, not its outer receipt or schema read. Errors do not count. Unknown tool identities count unless excluded. The extension does not infer unfamiliar third-party control/memory tools or wrappers from their behavior. This is a coarse cadence heuristic, not semantic progress analysis.
 
 A threshold supplies passive context after the batch settles, not another turn; identical due context coalesces within a batch. Large batches do not generate catch-up turns. Counting observes public result hooks without parsing scripts or shell contents.
 
-Successful recall/reflect and evidence `source_search`/`page_search`, including empty searches, restart cadence. Failed searches do not; evidence reads and memory writes neither count nor reset as searches. Accepted prompt reminders, session start/switch/branch/tree, compaction, cadence/eligibility and project/memory-scope changes clear ephemeral work. Resumption does not reconstruct transcript debt. Main and rebound child instances keep separate state; children/advisors and ineligible sessions receive no nudges. Retries, cancelled preparations, synthetic prompts and agent-origin companions do not create new prompt reminders.
+Successful recall/reflect and evidence `source_search`/`page_search`, including empty searches, restart cadence. Failed searches do not. Evidence reads and memory writes neither count nor reset as searches.
+
+Accepted prompt reminders, session start/switch/branch/tree, compaction, cadence/eligibility and project/memory-scope changes clear ephemeral work. Resumption does not reconstruct transcript debt.
+
+Main and rebound child instances keep separate state. Children/advisors and ineligible sessions receive no nudges. Retries, cancelled preparations, synthetic prompts and agent-origin companions do not create new prompt reminders.
 
 Nudges are advisory, and improved useful retrieval or task correctness has not been demonstrated. They remain disabled by default. Tools without a public leaf-result event cannot advance cadence.

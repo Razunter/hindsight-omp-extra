@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md) · [Full configuration reference](configuration.md)
 
-This guide assumes a writable installation directory, an installed [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support, [Bun](https://bun.sh/), Docker, and a Hindsight-compatible AI provider credential and model. The commands below use a POSIX shell. Run them from the extension root unless a step says otherwise.
+Requires a writable installation directory, [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support, [Bun](https://bun.sh/), Git on `PATH`, Docker, and a Hindsight-compatible AI credential and model. Commands use a POSIX shell and run from the extension root unless stated otherwise.
 
 OMP supplies the extension's runtime imports; no separate dependency installation or build is needed to load its source.
 
@@ -16,27 +16,38 @@ docker version
 
 Docker must report an accessible server, not just a client version. OMP 18.16.0 and Bun 1.4.4 have been exercised; no minimum-version or cross-platform compatibility matrix has been established.
 
-The launcher manages one shared container across projects. If you already run Hindsight, inspect your container and volume names before proceeding: pointing the launcher at an existing container authorizes reconciliation, including replacement when settings differ. Keep its volume name if you intend to preserve that database. If you only need OMP to connect to an existing server, use OMP’s native Hindsight configuration; this launcher is not required.
+The launcher manages one shared container across projects. If you already run Hindsight, inspect its container and volume names first. Targeting an existing container authorizes reconciliation, including replacement when settings differ. Keep its volume name to preserve the database. To connect OMP to an existing server without this launcher, use OMP’s native Hindsight configuration.
+
+## Install from Git
+
+```sh
+omp install https://github.com/Razunter/hindsight-omp-extra.git
+cd "$HOME/.omp/plugins/node_modules/hindsight-omp-extra"
+```
+
+The `cd` path is the default-profile installation location. If you use another profile or configuration root, find the package's `path` with `omp plugin list --json` and use that directory.
+
+OMP installs and enables the package for your user, including the launcher and bundled `hindsight-ingest` skill. No manual clone or `extensions` entry is needed. Complete configuration below before launching OMP; installation does not configure the provider or enable the memory backend.
 
 ## Install with git clone
 
-This extension is not published on npm. Clone the repository directly into OMP's default-profile extensions directory. Replace `REPOSITORY_URL` with this repository's clone URL:
+Alternatively, clone into OMP's default-profile extensions directory. The extension is not published on npm:
 
 ```sh
 mkdir -p "$HOME/.omp/agent/extensions"
-git clone REPOSITORY_URL "$HOME/.omp/agent/extensions/hindsight-omp-extra"
+git clone https://github.com/Razunter/hindsight-omp-extra.git "$HOME/.omp/agent/extensions/hindsight-omp-extra"
 cd "$HOME/.omp/agent/extensions/hindsight-omp-extra"
 ```
 
-The **extension root** is this clone, containing `package.json`, `src/`, and `.env.example`. No `bun install` or build is required. Complete the remaining setup there before launching OMP: its native extensions directory makes the launcher discoverable automatically.
+The **extension root** is the installed package or clone, containing `package.json`, `src/`, and `.env.example`. No `bun install` or build is required. Complete setup before launching OMP. A clone in the native extensions directory makes the launcher discoverable automatically.
 
-For a named profile or custom agent directory, use that profile's or override's extensions directory instead. Configure the clone's directory explicitly as shown below so OMP also discovers the bundled skill.
+For a clone in a named profile or custom agent directory, use that extensions directory instead. [Configure the package directory](#load-persistently) so OMP also discovers the bundled skill.
 
-The launcher keeps `.env`, `providers/`, `.selected-provider`, optional `credentials/`, and logs in the extension root. These local files are Git-ignored; keep the clone writable and back them up before replacing or removing it. Keep the same Docker volume name when restoring configuration.
+The launcher stores `.env`, `providers/`, `.selected-provider`, optional `credentials/`, and logs in the extension root. These files are Git-ignored in a clone. Keep the directory writable and back up local files before reinstalling, upgrading, replacing, or removing the package. Keep the same Docker volume name when restoring configuration.
 
 ## 2. Create local configuration
 
-For a new installation, copy the root [`.env.example`](../.env.example) and one provider template. This block refuses to overwrite existing files and restricts permissions:
+For a new installation, copy the root [`.env.example`](../.env.example) and one provider template. This block refuses overwrites and restricts permissions:
 
 ```sh
 (
@@ -50,16 +61,16 @@ For a new installation, copy the root [`.env.example`](../.env.example) and one 
 )
 ```
 
-If a destination already exists, keep it and edit the existing configuration rather than rerunning the copy block. The block is not transactional: if its second copy fails, the first file can already have been created.
+If a destination exists, edit it rather than rerun the block. The copies are not transactional: if the second fails, the first file may already exist.
 
 Edit these files before launching:
 
 - **`.env`:** choose the Docker container, named volume, image, worker settings, and API/dashboard ports. The example uses `hindsight-omp`, `hindsight-omp-data`, and ports `8888`/`9999`; change them if occupied. Both published ports bind to `127.0.0.1` by default. [Changing the bind address](configuration.md#network-binding) is explicit.
 - **`providers/primary.env`:** replace the model and API-key placeholders with values authorized for Hindsight. Never copy OMP tokens or put shell variable references in this file: values are literal, not interpolated. For another provider, use the appropriate [provider template](configuration.md#copy-a-complete-example) instead.
 
-The image example follows Hindsight’s [official Docker installation](https://hindsight.vectorize.io/developer/installation) and uses the rolling `latest` tag. For reproducible deployments, choose an image tag or digest you have verified with your provider. The launcher checks for updates at most daily on fresh startup; a newly pulled image can cause container replacement. Back up the database before upgrading. A named volume is not a backup.
+The image example follows Hindsight’s [official Docker installation](https://hindsight.vectorize.io/developer/installation) and uses the rolling `latest` tag. For reproducible deployments, choose a tag or digest verified with your provider. The launcher checks for updates at most daily on fresh startup; a newly pulled image can replace the container. Back up the database before upgrading. A named volume is not a backup.
 
-Only put values intended for Hindsight in these files: the validated merged file configuration is forwarded to the container, including credentials and variables without a `HINDSIGHT_` prefix. Your selected AI provider may receive content for memory processing. Self-hosting the database does not make remote inference offline.
+Include only values intended for Hindsight. The validated merged configuration is forwarded to the container, including credentials and variables without a `HINDSIGHT_` prefix. Your AI provider may receive content for memory processing; self-hosting the database does not make remote inference offline.
 
 For a fresh setup, save the profile name without launching OMP first:
 
@@ -72,7 +83,7 @@ For a fresh setup, save the profile name without launching OMP first:
 )
 ```
 
-This refuses to overwrite an existing selection. For later switches, use `/hindsight-provider` in interactive OMP; it lists names rather than credentials and saves the selected name for the next fresh process.
+This refuses to overwrite an existing selection. For later switches, use `/hindsight-provider` in interactive OMP. It lists names, not credentials, and saves the choice for the next fresh process.
 
 ## 3. Enable OMP’s native Hindsight backend
 
@@ -103,11 +114,13 @@ The extension does not enable this backend or edit OMP settings. Native OMP owns
 
 ## 4. Launch and verify
 
-From the extension root, start a fresh interactive OMP process:
+Start a fresh interactive OMP process from the project whose memories you want to use:
 
 ```sh
-omp -e "$PWD"
+omp
 ```
+
+For a clone not yet [loaded persistently](#load-persistently), use `omp -e /absolute/path/to/hindsight-omp-extra` instead. Pass the package directory so the ingestion skill loads too.
 
 The extension downloads the configured Hindsight Docker image if it is not already cached, then creates and starts the container. **The first launch can be slow** while the image downloads and Hindsight initializes. Docker setup runs in the background, so OMP stays usable while you wait.
 
@@ -127,7 +140,7 @@ The [Hindsight dashboard](http://127.0.0.1:9999) uses the example UI port. For e
 
 The launcher starts only from an interactive main session. Headless OMP processes and subagents can use the evidence tool but do not start or reconcile Docker. Keep the server running before using those modes.
 
-For a first ingestion trial from this checkout, follow [source ingestion](ingestion.md) and run:
+For an ingestion trial from the extension directory, follow [source ingestion](ingestion.md) and run:
 
 ```text
 /skill:hindsight-ingest docs/architecture.md
@@ -137,20 +150,20 @@ A configured scout and active native `retain` tool are required. The skill repor
 
 ## Load persistently
 
-To load the extension and its bundled skill, add the clone's directory to the active OMP configuration's `extensions` list. For the default-profile installation above, use the following and preserve existing entries:
+Git installations already load the launcher and bundled skill in new sessions. For a clone, add its directory to the active OMP configuration's `extensions` list. For the default-profile clone above, preserve existing entries and add:
 
 ```yaml
 extensions:
   - ~/.omp/agent/extensions/hindsight-omp-extra
 ```
 
-Configure the package directory, not just `src/hindsight-omp.ts`, so OMP discovers the bundled `hindsight-ingest` skill as well. No symlink is needed.
+Configure the package directory, not just `src/hindsight-omp.ts`, so OMP discovers `hindsight-ingest` too. No symlink is needed.
 
 Restart OMP after deployment. Extension package settings arrays replace rather than append across configuration layers, so check the effective list if a project or overlay also supplies `extensions`.
 
 ## Apply configuration changes
 
-Editing `.env`, a provider profile, or `.selected-provider` does not immediately restart the container. The next fresh interactive main OMP launch reads the files and recreates the container if managed settings changed. The named data volume is reused. `/new` and `/reload` neither apply a changed selection nor retry failed startup.
+Editing `.env`, a provider profile, or `.selected-provider` does not restart the container. The next fresh interactive main OMP launch reads them and recreates the container if managed settings changed, reusing the named data volume. `/new` and `/reload` neither apply a changed selection nor retry failed startup.
 
 The same fresh-process rule applies to `HINDSIGHT_BIND_ADDRESS`: older all-interface bindings are corrected on the next launch. Until that reconciliation has run, an already-running container retains its old bindings.
 

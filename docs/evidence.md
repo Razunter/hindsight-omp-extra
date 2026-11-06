@@ -4,22 +4,43 @@
 
 The additive `hindsight_evidence` tool exposes `source_search`/`page_search` with a query and `source_read`/`page_read` with a document/page ID. It works in interactive and headless OMP sessions, using the current native Hindsight connection, bank and project/global scope. Native memory tools, Auto-Learn and Docker startup behavior are unchanged.
 
-Example input: `{"action":"source_search","query":"Why was this architecture chosen?"}`. One recall POST includes bounded supporting facts, independently checks each returned record’s scope, and returns at most five fact excerpts with available retained-document IDs. Observations are labeled synthesis; missing or excluded support is not original evidence. This is query-based retrieval, not exact expansion of a native recall hit. It does not fetch documents, chunks, files or URLs automatically.
+Example input: `{"action":"source_search","query":"Why was this architecture chosen?"}`. One recall POST includes bounded supporting facts, independently checks each returned record’s scope, and returns at most five fact excerpts with available retained-document IDs.
 
-Explicit read example: `{"action":"source_read","id":"document-id-from-search"}`. One bank document GET independently validates its current bank, ID and tags before returning original retained text and safe available provenance. A prior fact hit is not permission to read the full document. Retagging, configuration and cwd changes are checked afresh; missing/deleted/disallowed documents are unavailable without their content or IDs. Empty retained text is marked honestly, not replaced by synthesis. Retained text is not guaranteed original external-file bytes.
+Observations are labeled synthesis. Missing or excluded support is not original evidence. This is query-based retrieval, not exact expansion of a native recall hit. It does not fetch documents, chunks, files or URLs automatically.
+
+Explicit read example: `{"action":"source_read","id":"document-id-from-search"}`. One bank document GET independently validates its current bank, ID and tags before returning original retained text and safe available provenance.
+
+A prior fact hit is not permission to read the full document. Retagging, configuration and cwd changes are checked afresh. Missing, deleted or disallowed documents are unavailable without their content or IDs. Empty retained text is marked honestly, not replaced by synthesis. Retained text is not guaranteed original external-file bytes.
+
 Use the search item’s `document_id` for `source_read.id`, not its extracted fact `id`. The tool remains normally discoverable; its object schema exposes actions and inputs in OMP Code Mode without `--tools` or an always-loaded full schema.
 
-`{"action":"page_read","id":"knowledge-page-id"}` performs one current-bank page GET, rechecks its ID/current tags, and returns the stored body as synthesis, not original-source proof or rendered frontmatter. Empty body stays empty; missing/disallowed pages withhold identifiers and content. Name/type/description/timestamp are bounded when supplied; generation provenance is unavailable in this page response contract. Reads never create or refresh pages.
+`{"action":"page_read","id":"knowledge-page-id"}` performs one current-bank page GET and rechecks its ID/current tags. It returns the stored body as synthesis, not original-source proof or rendered frontmatter.
 
-`{"action":"page_search","query":"shared bank decision"}` performs one scoped search GET, then concurrently verifies at most five unique candidates using their current page GETs. Only verified current-body excerpts/names are returned, never search snippets or mental-model IDs. Maximum cost is six requests (one search plus up to five reads), without refill or retries; no measured latency guarantee. Missing/disallowed candidates use a generic omission marker. Other failures fail the action and abort pending reads; cancellation/deadline covers the whole search. Explicit page_read always performs another fresh GET. Page tags do not establish generation isolation.
+Empty body stays empty. Missing/disallowed pages withhold identifiers and content. Name/type/description/timestamp are bounded when supplied. Generation provenance is unavailable in this page response contract. Reads never create or refresh pages.
 
-Search previews contain at most five items. Excerpts and metadata are at most 512 Unicode characters; explicit read bodies are at most 8192, and the inline JSON result is at most 16 KiB UTF-8. The tool streams at most 1 MiB per HTTP response and uses the cancellable `hindsight.recallTimeoutMs` deadline, which defaults to 30 seconds, without retries. Query clipping follows native recall settings. Errors and unavailable contracts are explicit; excluded evidence uses generic markers without its text or IDs. Available provenance is limited to source/source_id/title/filename metadata plus supplied context/timestamps; absent provenance is marked unavailable. Selection is byte-aware: excess items or support references may be omitted, and text may be shortened further, while returned identifiers stay complete. Missing or malformed current tags fail in every scope mode.
+`{"action":"page_search","query":"shared bank decision"}` performs one scoped search GET, then concurrently verifies at most five unique candidates using their current page GETs. Only verified current-body excerpts/names are returned, never search snippets or mental-model IDs.
 
-When local preview limits omit permitted content, all four actions return `full_output`, an `artifact://` URI for the complete filtered snapshot. Read it locally with the ordinary `read` tool and line selectors, for example `artifact://12:raw:1-80`, then request later ranges as needed. These reads make no Hindsight requests. The artifact contains JSON with `text_encoding` instructions and a `result` envelope. Long text fields are arrays of verbatim chunks of at most 512 Unicode characters. Concatenate those arrays without a separator to reconstruct the original strings; identifiers remain strings. Chunked text keeps even single-line bodies readable in bounded pages.
+Maximum cost is six requests (one search plus up to five reads), without refill or retries. There is no measured latency guarantee. Missing/disallowed candidates use a generic omission marker. Other failures fail the action and abort pending reads. Cancellation/deadline covers the whole search. Explicit page_read always performs another fresh GET. Page tags do not establish generation isolation.
 
-The snapshot preserves all allowed returned facts, supporting-fact references, text and allowlisted metadata before preview clipping. Page-search snapshots contain only the bodies from the same at-most-five verified page GETs. Excluded evidence, unverified candidates, backend-truncated supporting facts and content the backend never returned cannot be recovered. `truncated` can therefore remain true in the snapshot. Complete results need no artifact. Storage failure preserves the bounded evidence result with `expansion_error: "artifact_unavailable"` and no recovery URI.
+Search previews contain at most five items. Excerpts and metadata are at most 512 Unicode characters. Explicit read bodies are at most 8192, and the inline JSON result is at most 16 KiB UTF-8.
 
-Artifacts follow OMP's native session storage and access rules. Persistent sessions save them alongside session data; nonpersistent sessions keep them in memory. An artifact is a fetch-time snapshot, not a new authorized read of current Hindsight state. Later retagging, configuration changes or source deletion do not revoke an existing artifact. Use a new `source_read` or `page_read` when current content and scope checks are needed.
+The tool streams at most 1 MiB per HTTP response and uses the cancellable `hindsight.recallTimeoutMs` deadline, which defaults to 30 seconds, without retries. Query clipping follows native recall settings.
+
+Errors and unavailable contracts are explicit. Excluded evidence uses generic markers without its text or IDs. Available provenance is limited to source/source_id/title/filename metadata plus supplied context/timestamps. Absent provenance is marked unavailable.
+
+Selection is byte-aware. Excess items or support references may be omitted, and text may be shortened further, while returned identifiers stay complete. Missing or malformed current tags fail in every scope mode.
+
+When local preview limits omit permitted content, all four actions return `full_output`, an `artifact://` URI for the complete filtered snapshot. Read it locally with the ordinary `read` tool and line selectors, for example `artifact://12:raw:1-80`, then request later ranges as needed. These reads make no Hindsight requests.
+
+The artifact contains JSON with `text_encoding` instructions and a `result` envelope. Long text fields are arrays of verbatim chunks of at most 512 Unicode characters. Concatenate those arrays without a separator to reconstruct the original strings. Identifiers remain strings. Chunked text keeps even single-line bodies readable in bounded pages.
+
+The snapshot preserves all allowed returned facts, supporting-fact references, text and allowlisted metadata before preview clipping. Page-search snapshots contain only the bodies from the same at-most-five verified page GETs.
+
+Excluded evidence, unverified candidates, backend-truncated supporting facts and content the backend never returned cannot be recovered. `truncated` can therefore remain true in the snapshot. Complete results need no artifact. Storage failure preserves the bounded evidence result with `expansion_error: "artifact_unavailable"` and no recovery URI.
+
+Artifacts follow OMP's native session storage and access rules. Persistent sessions save them alongside session data. Nonpersistent sessions keep them in memory.
+
+An artifact is a fetch-time snapshot, not a new authorized read of current Hindsight state. Later retagging, configuration changes or source deletion do not revoke an existing artifact. Use a new `source_read` or `page_read` when current content and scope checks are needed.
 
 Retrieval tags are not server authorization and do not prove that synthesized content was generated from only one project. Returned evidence is untrusted reference data, not instructions.
 

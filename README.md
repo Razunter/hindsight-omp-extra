@@ -2,7 +2,7 @@
 
 An [OMP](https://github.com/can1357/oh-my-pi) extension for running [Hindsight](https://hindsight.vectorize.io/) in Docker and inspecting the sources behind recalled knowledge.
 
-OMP already provides Hindsight memory tools and automatic recall and retention. This extension adds container startup, named provider configurations, the `hindsight_evidence` tool for supporting-source and knowledge-page search/read, recall guidance, and a skill for importing knowledge from files and URLs.
+OMP already provides Hindsight memory tools and automatic recall and retention. This extension adds container startup, named provider configurations, `hindsight_evidence` for searching and reading supporting sources and knowledge pages, recall guidance, and a skill for importing files and URLs.
 
 Use it when you want OMP to manage a self-hosted Hindsight instance or need to inspect what supports a recalled claim. You do not need it just to connect OMP to an existing Hindsight server.
 
@@ -11,24 +11,26 @@ Use it when you want OMP to manage a self-hosted Hindsight instance or need to i
 ## Requirements and first run
 
 - [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support.
+- Git on `PATH`.
 - Docker running and accessible.
 - A Hindsight-compatible model and its own AI API credentials. Memory processing can incur model-provider charges.
 - A writable installation directory for local configuration, provider selection, and logs.
 
-Install by [cloning the repository](docs/setup.md#install-with-git-clone); it is not published on npm. From the extension root, check:
+Install from Git; the extension is not published on npm:
 
 ```sh
 omp --version
 docker version
+omp install https://github.com/Razunter/hindsight-omp-extra.git
 ```
 
-Follow [first-run setup](docs/setup.md) to configure the container, select a provider, and enable OMP’s Hindsight backend. Then launch:
+Follow [first-run setup](docs/setup.md) to configure the installed package, select a provider, and enable OMP’s Hindsight backend. Then start OMP in your project:
 
 ```sh
-omp -e "$PWD"
+omp
 ```
 
-Startup runs in the background; memory may be unavailable until Hindsight is ready. See [persistent loading](docs/setup.md#load-persistently) to avoid passing `-e` each time.
+Installation loads the launcher and bundled skill automatically. Startup runs in the background; memory may be unavailable until Hindsight is ready. [Checkout loading](docs/setup.md#load-persistently) remains an alternative.
 
 ## Use it
 
@@ -60,10 +62,10 @@ The skill uses a scout to distill useful knowledge and queues it through OMP’s
 
 ## Documentation
 
-- [Setup](docs/setup.md) — first run, persistent loading, and stopping the container
-- [Configuration](docs/configuration.md) — provider profiles, bind address, credentials, and image management
-- [Evidence access](docs/evidence.md) — source/page actions, limits, and expandable snapshots
-- [Recall guidance](docs/recall.md) — footer, lesson guidance, and optional nudges
-- [Source ingestion](docs/ingestion.md) — importing files, directories, URLs, and wiki content
+- [Setup](docs/setup.md) covers first run, persistent loading, and stopping the container.
+- [Configuration](docs/configuration.md) covers provider profiles, bind address, credentials, and image management.
+- [Evidence access](docs/evidence.md) covers source/page actions, limits, and expandable snapshots.
+- [Recall guidance](docs/recall.md) covers the footer, lesson guidance, and optional nudges.
+- [Source ingestion](docs/ingestion.md) covers files, directories, URLs, and wiki content.
 - [Architecture](docs/architecture.md)
 - [Changelog](CHANGELOG.md)

@@ -14,41 +14,41 @@ The launcher inspects actual API/dashboard port bindings as well as its managed 
 
 ## When changes apply
 
-Changes to `.env`, the selected profile, or the saved provider selection take effect at the next fresh interactive main OMP process. If managed settings differ, the launcher stops/removes the old container and creates its replacement with the same named data volume. Editing a file does not immediately restart Docker; `/new` and `/reload` do not apply it. Comments or edits that leave the effective configuration unchanged do not require replacement.
+Changes to `.env`, the selected profile, or the saved provider selection take effect at the next fresh interactive main OMP process. If managed settings differ, the launcher stops and removes the old container, then creates a replacement with the same named data volume. File edits do not immediately restart Docker. `/new` and `/reload` do not apply them. Comments or edits that leave the effective configuration unchanged do not require replacement.
 
 The container keeps running after OMP exits (`--restart unless-stopped`). Stopping OMP does not stop Hindsight. See [stopping the container](setup.md#stop-the-container).
 
 ## Shared infrastructure
 
-The extension root `.env` supplies defaults; `providers/<selected-name>.env` overrides them. Every variable in the validated merged configuration is forwarded to the container, regardless of prefix, including empty values and launcher settings. This exposes all credentials in those files to the container; include only values intended for Hindsight. The host process environment is not forwarded wholesale. `HINDSIGHT_BIND_ADDRESS` uses the same infrastructure precedence but is optional. These required Docker settings retain process-environment precedence: process environment, selected profile, then base `.env`.
+The extension root `.env` supplies defaults; `providers/<selected-name>.env` overrides them. The launcher forwards every variable in the validated merged configuration to the container, regardless of prefix, including empty values and launcher settings. This exposes all credentials in those files to the container. Include only values intended for Hindsight. The host process environment is not forwarded wholesale. Optional `HINDSIGHT_BIND_ADDRESS` and the required Docker settings below use this precedence: process environment, selected profile, then base `.env`.
 
 - HINDSIGHT_CONTAINER_NAME, HINDSIGHT_IMAGE, HINDSIGHT_VOLUME_NAME
 - HINDSIGHT_WORKER_ID, HINDSIGHT_API_WORKER_MAX_SLOTS
 - HINDSIGHT_API_PORT, HINDSIGHT_UI_PORT
 
-The launcher writes container variables to a temporary environment file inside an owner-only directory, with file permissions `0600`, and passes its path through Docker's `--env-file`. API keys, authorization headers, and credential-bearing proxy URLs stay out of command-line arguments, and container variables do not change the Docker client's environment. The file is removed after creation succeeds or fails; abrupt process termination can leave the owner-only temporary directory behind. Credentials remain container environment values visible to Docker administrators.
+The launcher writes container variables to a temporary environment file with permissions `0600` inside an owner-only directory. It passes the path through Docker's `--env-file`. API keys, authorization headers, and credential-bearing proxy URLs stay out of command-line arguments. Container variables do not change the Docker client's environment. The launcher removes the file after container creation succeeds or fails. Abrupt process termination can leave the owner-only temporary directory behind. Credentials remain container environment values visible to Docker administrators.
 
 Environment values containing line breaks are rejected before Docker work, so a value cannot introduce another env-file entry.
 
 Ports must be 1–65535 and worker slots a positive integer. Paths are relative to the extension root, independent of the project or its model selection. Logs, image-check timestamps and temporary development state remain local.
 
-For native settings, precedence is selected profile over base `.env`; independent process provider/model/key overrides are not used. The combined configuration must contain a supported provider, model, schema boolean, positive concurrency and the appropriate authentication. A profile may omit settings supplied by the base.
+For native settings, the selected profile overrides the base `.env`. Independent process provider/model/key overrides are not used. The combined configuration must contain a supported provider, model, schema boolean, positive concurrency and the appropriate authentication. A profile may omit settings supplied by the base.
 
-If a profile changes the native LLM provider or explicitly changes its endpoint, the base model, API key, endpoint, headers and Codex auth-directory settings are not inherited. Supply that target's model and authentication in its profile. Common defaults and unrelated settings remain intact; a missing target credential fails before any Docker mutation. Launcher-owned worker settings, reconciliation metadata and the mounted Codex home remain authoritative.
+If a profile changes the native LLM provider or explicitly changes its endpoint, it does not inherit the base model, API key, endpoint, headers or Codex auth-directory settings. Supply that target's model and authentication in its profile. Common defaults and unrelated settings remain intact. A missing target credential fails before any Docker mutation. Launcher-owned worker settings, reconciliation metadata and the mounted Codex home remain authoritative.
 
-The merged `HINDSIGHT_API_PORT` is also the container API port (default `8888` when absent); Docker maps the effective host API port to it. The container control-plane port is `HINDSIGHT_CP_PORT` (default `9999`), mapped from the effective host `HINDSIGHT_UI_PORT`. Host process port overrides change publishing, not the forwarded file values. Both host and container ports are validated. Unless explicitly configured, `HINDSIGHT_CP_DATAPLANE_API_URL` points to the container API at its configured port.
+The merged `HINDSIGHT_API_PORT` is also the container API port (default `8888` when absent). Docker maps the effective host API port to it. The container control-plane port is `HINDSIGHT_CP_PORT` (default `9999`), mapped from the effective host `HINDSIGHT_UI_PORT`. Host process port overrides change publishing, not the forwarded file values. Both host and container ports are validated. Unless explicitly configured, `HINDSIGHT_CP_DATAPLANE_API_URL` points to the container API at its configured port.
 
 The launcher allocates 1 GiB of Docker shared memory for PostgreSQL. Startup reconciles this limit along with environment and mounts, recreating stale containers while retaining the named database volume.
 
-For native Codex mounts, reconciliation uses the canonical host-directory identity in the managed environment plus the writable bind mount at the container destination. Docker Desktop translates inspected mount source paths into daemon-side paths, so comparing them directly with the host path would recreate an unchanged container on every launch.
+For native Codex mounts, reconciliation uses the canonical host-directory identity in the managed environment and the writable bind mount at the container destination. Docker Desktop translates inspected mount source paths into daemon-side paths. Comparing them directly with the host path would recreate an unchanged container on every launch.
 
 ## Named provider configurations
 
-Create providers/<name>.env under the extension root. Names contain letters, digits, underscores or hyphens and start with a letter or digit. Files must resolve inside providers/; escaping symlinks are rejected. Provider files and .selected-provider are Git-ignored, as is credentials/ for dedicated local authentication material. Restrict local permissions: profiles contain secrets. Do not commit them.
+Create providers/<name>.env under the extension root. Names contain letters, digits, underscores or hyphens and start with a letter or digit. Files must resolve inside providers/; escaping symlinks are rejected. Provider files, .selected-provider and credentials/ (for dedicated local authentication material) are Git-ignored. Restrict local permissions because profiles contain secrets. Do not commit them.
 
 ### Copy a complete example
 
-The provider templates below live in [examples/](../examples/), outside the active profiles directory. Each supplies all required provider settings; none is selected or loaded automatically. Shared Docker settings and commented native configuration examples live in the root [`.env.example`](../.env.example), used by the [setup guide](setup.md).
+The provider templates below live in [examples/](../examples/), outside the active profiles directory. Each supplies all required provider settings; none is selected or loaded automatically. The root [`.env.example`](../.env.example) contains shared Docker settings and commented native configuration examples. The [setup guide](setup.md) uses this file.
 
 | Template | Target / protocol |
 | --- | --- |
@@ -61,7 +61,7 @@ The provider templates below live in [examples/](../examples/), outside the acti
 | [opencode-zen-messages.env.example](../examples/opencode-zen-messages.env.example) | OpenCode Zen pay-as-you-go Anthropic Messages |
 | [opencode-zen-responses.env.example](../examples/opencode-zen-responses.env.example) | OpenCode Zen pay-as-you-go Responses |
 
-From the extension root, copy just the intended template to a new profile name. The following refuses to overwrite an existing profile and restricts the new file’s permissions:
+From the extension root, copy only the intended template to a new profile name. These commands refuse to overwrite an existing profile and restrict the new file’s permissions:
 
 ```sh
 (
@@ -74,14 +74,14 @@ From the extension root, copy just the intended template to a new profile name. 
 )
 ```
 
-1. Replace every `replace-with-...` model/key value in `providers/primary.env` with your intended model and independently authorized credential. These are literal placeholders, not working credentials or model recommendations. Codex instead needs an existing absolute dedicated auth-directory path and independently authorized file credentials; follow [Native Codex authentication](#native-codex-authentication).
-2. Keep the required [shared infrastructure](#shared-infrastructure) and common defaults in the root `.env`; profiles override only what differs. The complete examples can still be used without base LLM defaults. OpenAI, Anthropic and Responses examples use native default endpoints. For an OpenAI-compatible service, add `HINDSIGHT_API_LLM_BASE_URL=https://your-compatible-endpoint.example/v1` to the OpenAI profile and use that service's own model/key. Zen templates already bind the required protocol endpoint; use a bare model ID, without `opencode/`.
-3. Keep `STRICT_SCHEMA` as `true` or `false` and `MAX_CONCURRENT` as a positive integer suited to your model/image and quota. The templates using `true` require a model/endpoint that supports strict structured output; use `false` for JSON-object-only services. Choose a model meeting [Hindsight's output and schema requirements](https://hindsight.vectorize.io/developer/models#model-requirements), or lower its retain output budget as documented there.
-4. In OMP, run `/hindsight-provider` and select `primary` (or your chosen filename without `.env`). This only saves the name. Exit and launch a fresh OMP process to apply it when container reconciliation is authorized; `/new` and `/reload` do not apply or retry it.
+1. Replace every `replace-with-...` model/key value in `providers/primary.env` with your intended model and independently authorized credential. These are literal placeholders, not working credentials or model recommendations. Codex instead needs an existing absolute dedicated auth-directory path and independently authorized file credentials. Follow [Native Codex authentication](#native-codex-authentication).
+2. Keep the required [shared infrastructure](#shared-infrastructure) and common defaults in the root `.env`; profiles override only what differs. The complete examples also work without base LLM defaults. OpenAI, Anthropic and Responses examples use native default endpoints. For an OpenAI-compatible service, add `HINDSIGHT_API_LLM_BASE_URL=https://your-compatible-endpoint.example/v1` to the OpenAI profile and use that service's own model/key. Zen templates already set the required protocol endpoint. Use a bare model ID, without `opencode/`.
+3. Keep `STRICT_SCHEMA` as `true` or `false` and `MAX_CONCURRENT` as a positive integer suited to your model/image and quota. Templates using `true` require a model/endpoint that supports strict structured output. Use `false` for JSON-object-only services. Choose a model meeting [Hindsight's output and schema requirements](https://hindsight.vectorize.io/developer/models#model-requirements), or lower its retain output budget as documented there.
+4. In OMP, run `/hindsight-provider` and select `primary` (or your chosen filename without `.env`). This only saves the name. When container reconciliation is authorized, exit and launch a fresh OMP process to apply it. `/new` and `/reload` do not apply or retry it.
 
 Never source these files or put shell credential references in them: the launcher reads literal values. Do not copy all examples into active profiles, reuse OMP tokens, or commit populated profiles. Setup remains operator-owned; copying a template does not authorize login, inference or credential migration.
 
-These templates use native providers openai, anthropic, deepseek, openai-responses and openai-codex. Provider, model, schema boolean and positive concurrency are required after combining the base and selected profile; key-based providers additionally require their own API key. BASE_URL is optional for native defaults; Zen templates set an explicit gateway endpoint. DEFAULT_HEADERS, when present, is a JSON object with string values, for example:
+These templates use native providers openai, anthropic, deepseek, openai-responses and openai-codex. The combined base and selected profile must supply a provider, model, schema boolean and positive concurrency. Key-based providers also require their own API key. BASE_URL is optional for native defaults; Zen templates set an explicit gateway endpoint. DEFAULT_HEADERS, when present, is a JSON object with string values, for example:
 
 ```dotenv
 HINDSIGHT_API_LLM_DEFAULT_HEADERS='{"User-Agent":"omp-hindsight"}'
@@ -101,7 +101,7 @@ The template uses the current [`deepseek-flash` model](https://api-docs.deepseek
 
 ### Native Codex authentication
 
-Use an independently authorized dedicated host directory, not a copy of OMP tokens or another runtime’s rotating credentials. Configure native file storage (cli_auth_credentials_store = "file") and perform the installed Codex CLI’s login flow with CODEX_HOME pointing to that dedicated directory. Hindsight’s current [setup documentation](https://hindsight.vectorize.io/developer/models) shows codex auth login; verify syntax for your installed CLI. Login is an operator step, never performed by this extension.
+Use an independently authorized dedicated host directory, not a copy of OMP tokens or another runtime’s rotating credentials. Configure native file storage (cli_auth_credentials_store = "file"). Run the installed Codex CLI’s login flow with CODEX_HOME pointing to that directory. Hindsight’s current [setup documentation](https://hindsight.vectorize.io/developer/models) shows codex auth login; verify syntax for your installed CLI. The operator must log in; this extension never does.
 
 A Codex profile uses:
 
@@ -113,11 +113,11 @@ HINDSIGHT_API_LLM_MAX_CONCURRENT=3
 HINDSIGHT_OMP_CODEX_AUTH_DIR=/absolute/dedicated/hindsight-codex
 ```
 
-No static LLM key is required. `HINDSIGHT_OMP_CODEX_AUTH_DIR` is forwarded as file metadata, but Hindsight uses the mounted container path, not that host path. The launcher mounts the whole directory read-write at /home/hindsight/.codex and sets HINDSIGHT_API_LLM_CODEX_HOME to that container path; do not set the native container home in the profile. Directory paths containing colons cannot be represented by the existing Docker volume syntax and are rejected.
+No static LLM key is required. `HINDSIGHT_OMP_CODEX_AUTH_DIR` is forwarded as file metadata, but Hindsight uses the mounted container path, not the host path. The launcher mounts the whole directory read-write at /home/hindsight/.codex and sets HINDSIGHT_API_LLM_CODEX_HOME to that path. Do not set the native container home in the profile. The existing Docker volume syntax cannot represent directory paths containing colons, so they are rejected.
 
 Local checks require a readable/writable/searchable directory and a regular, readable auth.json containing nonempty native tokens.access_token and tokens.refresh_token strings. The mount cannot contain OMP’s default or PI_CODING_AGENT_DIR agent storage, including symlinked storage roots. This does not prove token provenance: independently authorize it and leave Hindsight as the sole refresh owner. The extension does not refresh, copy, display or edit tokens.
 
-The whole directory—not just auth.json—is necessary for native refresh locks, sibling temporary files and atomic replacement. Container-user permissions must allow reading and persisting credentials; host access checks cannot prove the Docker container UID can write or that a token/model is accepted remotely. Confirm these separately against an authorized image and account. The directory is preserved on recreation, and changing its host path forces reconciliation. Switching back to a key-based profile removes the Codex mount and native auth-home setting.
+Native refresh locks, sibling temporary files and atomic replacement require the whole directory, not just auth.json. Container-user permissions must allow reading and persisting credentials. Host access checks cannot prove the Docker container UID can write or that a token/model is accepted remotely. Confirm these separately against an authorized image and account. Recreation preserves the directory; changing its host path forces reconciliation. Switching back to a key-based profile removes the Codex mount and native auth-home setting.
 
 
 ### OpenCode Zen protocol choices
@@ -135,21 +135,21 @@ The Anthropic SDK appends `/v1/messages`, so its base excludes `/v1`. OpenCode d
 
 ## Selection and startup timing
 
-Run /hindsight-provider to choose a complete named configuration using the stock OMP selection dialog. Only contained names are listed, never credentials. The command atomically saves just the name in .selected-provider; it does not pull, stop or recreate Docker, edit profiles or validate remote authentication. Cancellation, a disappearing profile or a failed write preserves the previous saved choice. The confirmation states that application waits for the next fresh OMP process.
+Run /hindsight-provider to choose a complete named configuration in the stock OMP selection dialog. The dialog lists only contained names, never credentials. The command atomically saves just the name in .selected-provider. It does not pull, stop or recreate Docker, edit profiles or validate remote authentication. Cancellation, a disappearing profile or a failed write preserves the previous saved choice. The confirmation states that application waits for the next fresh OMP process.
 
-The saved record is shared across projects, independent of their model and Hindsight connection settings. You can also write just the chosen name manually (for example primary for providers/primary.env). Missing selection, invalid native settings or missing local auth reports an actionable error before Docker work, with no fallback. An empty/missing profiles directory reports setup guidance instead of opening an empty dialog.
+The saved record is shared across projects, independent of their model and Hindsight connection settings. You can also write just the chosen name manually (for example primary for providers/primary.env). If selection is missing, native settings are invalid or local auth is missing, the extension reports an actionable error before Docker work, with no fallback. If the profiles directory is empty or missing, it reports setup guidance instead of opening an empty dialog.
 
 The process makes its decision once, before asynchronous startup, even when validation or Docker fails. New sessions, /new and /reload do not apply a changed selection or retry startup. Exit OMP and launch a fresh process to apply it. Subagents and noninteractive sessions do not read configuration or reconcile the shared container.
 
 Docker reconciliation runs in the background, so a slow image pull does not block OMP or exceed its 30-second extension-handler deadline. A final notification reports readiness or failure after reconciliation and owned-image cleanup finish. Hindsight memory may be unavailable until the container is ready. Docker command timeouts remain bounded; exiting OMP before completion can interrupt reconciliation.
 
-Reconciliation compares presence and value of managed fields: removing an explicit native setting forces replacement, while unrelated image environment values are ignored. A launcher-owned list of configured keys tracks removals across fresh processes. Replacement reuses HINDSIGHT_VOLUME_NAME. The existing image-check interval and pull-failure policy are retained. Concurrent fresh-process startups can race over the shared container; cross-process locking is outside scope.
+Reconciliation compares the presence and value of managed fields. Removing an explicit native setting forces replacement; unrelated image environment values are ignored. A launcher-owned list of configured keys tracks removals across fresh processes. Replacement reuses HINDSIGHT_VOLUME_NAME. The existing image-check interval and pull-failure policy are retained. Concurrent fresh-process startups can race over the shared container; cross-process locking is outside scope.
 
 ### Docker image hygiene
 
-The launcher never builds images or globally prunes Docker. Before its explicit pull it records existing image IDs; afterwards it targets only the superseded image if now untagged, plus any image that this pull newly downloaded. Cleanup runs after reconciliation, including failed startup. It removes a candidate only when no running or stopped container uses it and no unrelated tag owns it, using image rm --no-prune without force. A newly downloaded image still used by the managed container stays installed. Preexisting cached images and unrelated legacy artifacts are preserved. Container creation uses --pull never so no implicit download bypasses this ownership check.
+The launcher never builds images or globally prunes Docker. Before an explicit pull, it records existing image IDs. After the pull, cleanup targets only the superseded image if now untagged, plus any image newly downloaded by this pull. Cleanup runs after reconciliation, including failed startup. It uses image rm --no-prune without force and removes a candidate only if no running or stopped container uses it and no unrelated tag owns it. A newly downloaded image still used by the managed container stays installed. Preexisting cached images and unrelated legacy artifacts are preserved. Container creation uses --pull never, preventing implicit downloads from bypassing this ownership check.
 
-If Docker refuses inspection/removal, reconciliation reports an error and logs the cleanup failure rather than claiming success; operator intervention may be needed. Automatic pulls retain the daily interval, but a missing target image is fetched even within that interval. Tests and TUI verification stage an executable fake Docker and synthetic state; they do not build, pull or remove real images.
+If Docker refuses inspection/removal, reconciliation reports an error and logs the cleanup failure rather than claiming success. Operator intervention may be needed. Automatic pulls retain the daily interval, but a missing target image is fetched even within that interval. Tests and TUI verification use an executable fake Docker and synthetic state; they do not build, pull or remove real images.
 
 ## Migration from the old root provider tuple
 
