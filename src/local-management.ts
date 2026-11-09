@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { BASE_LABEL, CONFIG_LABEL, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, cudaUsable, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeUnusedImage, runManagedContainer, type ContainerInfo, type ImageInfo } from "./docker";
+import { BASE_LABEL, CONFIG_LABEL, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, cudaUsable, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, type ContainerInfo, type ImageInfo } from "./docker";
 import { initialState, pidAlive, readState, releaseLease, takeLease, updateState, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 
@@ -76,6 +76,37 @@ function localModels(settings: HindsightSettings): (typeof LOCAL_MODELS)[number]
 
 function builtFor(image: ImageInfo, installationId: string, base: string): boolean {
     return image.labels[INSTALLATION_LABEL] === installationId && image.labels[DERIVATIVE_LABEL] === "cuda" && image.labels[BASE_LABEL] === base;
+}
+
+/** The tag of this installation's CUDA derivative of an upstream digest. */
+const derivativeTag = (digest: string) => `${CUDA_REPOSITORY}:${digest.slice(7, 19)}`;
+const digestOf = (base: string) => base.slice(base.indexOf("@") + 1);
+
+/**
+ * After a healthy cutover, remove superseded images: owned downloads and CUDA derivatives that are neither the active
+ * image, a live operation's candidate nor of the active upstream release, plus the previously active image. Everything is
+ * revalidated per image just before deletion; returns the problems and the images that are no longer cached.
+ */
+async function removeSupersededImages(previousImage: string | undefined): Promise<{ problems: string[]; gone: string[] }> {
+    const ids = new Set([...(readState()?.owned ?? []).map(entry => entry.imageId), ...(previousImage ? [previousImage] : [])]);
+    const problems: string[] = [], gone: string[] = [];
+    for (const id of ids) {
+        const state = readState();
+        const active = state?.active;
+        if (!active) break;
+        const operation = state.operation && pidAlive(state.operation.pid) ? state.operation : undefined;
+        const entry = state.owned?.find(owned => owned.imageId === id);
+        if (id === active.imageId || id === operation?.candidateImageId || (entry && active.upstream.digests.includes(digestOf(entry.base)))) continue;
+        const ownTag = entry?.kind === "derivative" ? derivativeTag(digestOf(entry.base)) : undefined;
+        const result = await removeImage(id, image =>
+            image.tags.some(tag => tag !== ownTag) ||
+            image.digests.some(digest => active.upstream.digests.includes(digest)) ||
+            (entry?.kind === "derivative" && !builtFor(image, state.installationId, entry.base)) ||
+            (entry?.kind === "download" && !image.digests.includes(digestOf(entry.base))));
+        if (result === "gone") gone.push(id);
+        if (result === "failed") problems.push(`the superseded image ${id.slice(7, 19)} could not be inspected or removed`);
+    }
+    return { problems, gone };
 }
 
 async function startup(ui: UI): Promise<void> {
@@ -329,7 +360,7 @@ async function planTarget(state: ManagementState, settings: HindsightSettings, u
     if (digests.length === 0) return undefined;
     const base = `${repository}@${digests[0]}`;
     if (settings.gpu) {
-        const reference = `${CUDA_REPOSITORY}:${digests[0].slice(7, 19)}`;
+        const reference = derivativeTag(digests[0]);
         const derivative = await inspectImage(reference);
         const reusable = derivative && builtFor(derivative, state.installationId, base) &&
             state.owned?.some(entry => entry.kind === "derivative" && entry.imageId === derivative.id);
@@ -509,7 +540,6 @@ async function applyApproved(plan: ApprovedPlan, lease: string, installationId: 
             ...state,
             active: { mode, provider: settings.provider, configDigest: settings.configDigest, upstream: { reference: settings.image, digests: target.digests }, imageId, appliedAt: new Date().toISOString() },
             failure: undefined,
-            cleanupFailure: undefined,
             check: applied ? { attemptedAt: state.check!.attemptedAt, outcome: "current" } : state.check,
         };
     });
@@ -521,12 +551,15 @@ async function applyApproved(plan: ApprovedPlan, lease: string, installationId: 
     if (target.kind === "download" && !PINNED.test(settings.image) && (await docker(["tag", imageId, settings.image])).exitCode !== 0) {
         problems.push(`${settings.image} could not be tagged to the new image`);
     }
-    if (previousImage && previousImage !== imageId && !await removeUnusedImage(previousImage)) {
-        problems.push(`the previous image ${previousImage.slice(7, 19)} could not be removed`);
-    }
-    if (problems.length === 0) return { level: "info", message: ready };
+    const superseded = await removeSupersededImages(previousImage);
+    problems.push(...superseded.problems);
     const message = problems.join("; ");
-    log("Cleanup after a healthy cutover failed:", message);
-    await updateState(state => state && { ...state, cleanupFailure: { message, at: new Date().toISOString() } });
-    return { level: "warning", message: `${ready}. Cleanup needs attention: ${message}.` };
+    if (message) log("Cleanup after a healthy cutover failed:", message);
+    // Ownership of images that are gone is dropped; a kept or failed image stays recorded for a later cleanup.
+    await updateState(state => state && {
+        ...state,
+        owned: state.owned?.filter(entry => !superseded.gone.includes(entry.imageId)),
+        cleanupFailure: message ? { message, at: new Date().toISOString() } : undefined,
+    });
+    return message ? { level: "warning", message: `${ready}. Cleanup needs attention: ${message}.` } : { level: "info", message: ready };
 }

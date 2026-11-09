@@ -68,16 +68,19 @@ export async function inspectImage(reference: string): Promise<ImageInfo | undef
 }
 
 /**
- * Remove an image only when it has no tags and no container, running or stopped, uses it. Never forced and
- * never prunes parents, so another tag or container wins a concurrent race. False means removal failed.
+ * Remove image `id` by ID unless `protect` claims it or a container, running or stopped, uses it. Never forced and never
+ * prunes parents, so a tag or container added after this check makes Docker refuse. "gone" means it is no longer cached.
  */
-export async function removeUnusedImage(id: string): Promise<boolean> {
-    const image = await inspectImage(id);
-    if (!image || image.tags.length > 0) return true;
+export async function removeImage(id: string, protect: (image: ImageInfo) => boolean): Promise<"gone" | "kept" | "failed"> {
+    let image: ImageInfo | undefined;
+    try { image = await inspectImage(id); }
+    catch { return "failed"; }
+    if (!image) return "gone";
+    if (protect(image)) return "kept";
     const users = await docker(["ps", "--all", "--quiet", "--filter", "ancestor=" + id]);
-    if (users.exitCode !== 0) return false;
-    if (users.stdout.trim()) return true;
-    return (await docker(["image", "rm", "--no-prune", id])).exitCode === 0;
+    if (users.exitCode !== 0) return "failed";
+    if (users.stdout.trim()) return "kept";
+    return (await docker(["image", "rm", "--no-prune", id])).exitCode === 0 ? "gone" : "failed";
 }
 
 const isDigest = (value: unknown): value is string => typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
