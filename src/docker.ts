@@ -74,7 +74,9 @@ export async function inspectImage(reference: string): Promise<ImageInfo | undef
     }
     const image = JSON.parse(result.stdout);
     if (!/^sha256:[a-f0-9]{64}$/.test(image.Id) || !Array.isArray(image.RepoDigests ?? []) || !Array.isArray(image.RepoTags ?? [])) throw new Error("Invalid image metadata");
-    return { id: image.Id, tags: image.RepoTags ?? [], digests: (image.RepoDigests ?? []).map((entry: string) => entry.slice(entry.indexOf("@") + 1)), labels: image.Config?.Labels ?? {} };
+    // The containerd image store lists a digest-pulled image's `repo@sha256:...` reference in RepoTags; it is not a tag.
+    const tags = (image.RepoTags ?? []).filter((entry: string) => !entry.includes("@"));
+    return { id: image.Id, tags, digests: (image.RepoDigests ?? []).map((entry: string) => entry.slice(entry.indexOf("@") + 1)), labels: image.Config?.Labels ?? {} };
 }
 
 /**

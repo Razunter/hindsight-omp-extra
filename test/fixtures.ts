@@ -154,7 +154,8 @@ case "image": {
     const id = findImage(args.at(-1));
     if (id && args[1] === "inspect" && state.imageInspectFails?.includes(id)) { code = 1; err = "permission denied while trying to connect to the Docker daemon socket"; break; }
     if (!id) { code = 1; err = "Error: No such image: " + args.at(-1); break; }
-    if (args[1] === "inspect") out = JSON.stringify({ Id: id, RepoTags: state.images[id].tags, RepoDigests: state.images[id].digests ?? [], Config: { Labels: state.images[id].labels ?? null } });
+    // Like Docker's containerd image store, a digest-pulled image also lists its repo@digest reference in RepoTags.
+    if (args[1] === "inspect") out = JSON.stringify({ Id: id, RepoTags: [...state.images[id].tags, ...(state.images[id].digests ?? []).filter(digest => digest.includes("@"))], RepoDigests: state.images[id].digests ?? [], Config: { Labels: state.images[id].labels ?? null } });
     else if (args[1] === "rm" && !args.includes("--force") && !state.imageRemoveFails && state.images[id].tags.length <= 1 && !Object.values(state.containers).some(container => container.image === id)) delete state.images[id];
     else code = 1;
     break;
