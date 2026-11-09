@@ -249,7 +249,7 @@ test("startup starts a stopped approved runtime without preparing anything", () 
     const state = f.state(); state.containers["fixture-hindsight"].running = false; f.setState(state);
     const before = f.state().calls.length;
     expect(f.run().notifications.at(-1)?.level).toBe("info");
-    expect(f.state().calls.slice(before).filter(call => !["version", "image", "container"].includes(call[0]))).toEqual([["start", "fixture-hindsight"]]);
+    expect(f.state().calls.slice(before).filter(call => !["version", "image", "container", "buildx"].includes(call[0]))).toEqual([["start", "fixture-hindsight"]]);
     expect(f.container()!.running).toBe(true);
 });
 

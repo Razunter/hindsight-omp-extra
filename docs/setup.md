@@ -78,6 +78,8 @@ docker pull ghcr.io/vectorize-io/hindsight:latest
 
 Approval binds the cached image ID shown in the confirmation; a tag that moves later is not followed. A different Hindsight version may migrate the reused database, and replacing the image does not roll the database back. A named volume is not a backup.
 
+With CPU management on, the extension tells you when the configured image's registry digest has moved: a fresh interactive start checks at most once every 24 hours, and `/hindsight` → **Check for updates** checks immediately. Checks read registry metadata through Docker Buildx, download nothing and change nothing; **Status** shows the last result. See [update checks](configuration.md#update-checks).
+
 Include only values intended for Hindsight. The validated merged configuration is forwarded to the container, including credentials and variables without a `HINDSIGHT_` prefix. Your AI provider may receive content for memory processing; self-hosting the database does not make remote inference offline.
 
 For a fresh setup, save the profile name without launching OMP first:

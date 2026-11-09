@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { CONFIG_LABEL, INSTALLATION_LABEL, docker, dockerAvailable, inspectContainer, inspectImage, runManagedContainer, type ContainerInfo } from "./docker";
-import { initialState, pidAlive, readState, releaseLease, takeLease, updateState, type ManagementState } from "./management-state";
+import { CONFIG_LABEL, INSTALLATION_LABEL, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, runManagedContainer, type ContainerInfo } from "./docker";
+import { initialState, pidAlive, readState, releaseLease, takeLease, updateState, type ManagementState, type UpdateCheck } from "./management-state";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 
 // Reload replaces modules, not this process-lifetime startup decision.
@@ -9,7 +9,8 @@ const startupKey = Symbol.for("hindsight-omp.startup-roots");
 const processState = globalThis as typeof globalThis & { [startupKey]?: Set<string> };
 const startupRoots = processState[startupKey] ??= new Set<string>();
 
-const MENU = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration" } as const;
+const MENU = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration", check: "Check for updates" } as const;
+const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 type UI = ExtensionContext["ui"];
 type Outcome = { level: "info" | "warning" | "error"; message: string };
@@ -18,7 +19,7 @@ interface ApprovedPlan { settings: HindsightSettings; imageId: string; digests: 
 
 export function registerLocalManagement(pi: ExtensionAPI): void {
     pi.registerCommand("hindsight", {
-        description: "Local Hindsight management: status, Off/CPU mode, provider configuration and apply",
+        description: "Local Hindsight management: status, Off/CPU mode, provider configuration, apply and update checks",
         handler: async (_args, ctx) => {
             if (ctx.hasUI !== true) return;
             try { await openMenu(ctx.ui); }
@@ -74,11 +75,72 @@ async function startup(ui: UI): Promise<void> {
         return;
     }
     const lease = await takeLease("recover");
-    if (!lease) {
-        ui.notify("Hindsight: another OMP process is managing the local runtime; startup recovery skipped.", "info");
+    if (!lease) ui.notify("Hindsight: another OMP process is managing the local runtime; startup recovery skipped.", "info");
+    void (async () => {
+        if (lease) await runOperation(ui, lease, () => recover(settings));
+        const claimed = await claimCheck(true);
+        if (claimed !== undefined) await checkForUpdates(ui, settings.image, claimed, true);
+    })().catch(error => ui.notify(visible(error), "error"));
+}
+
+/** Claim the shared update-check slot under the lock. Background claims honour the 24-hour interval; failed attempts count too. */
+async function claimCheck(background: boolean): Promise<number | undefined> {
+    const now = Date.now();
+    const claimed = await updateState(state => {
+        if (!state || state.mode === "off") return undefined;
+        const since = now - (state.check?.attemptedAt ?? -Infinity);
+        if (background && since >= 0 && since < CHECK_INTERVAL_MS) return undefined;
+        return { ...state, check: { attemptedAt: now } };
+    });
+    return claimed && now;
+}
+
+/** Compare the configured upstream reference's registry digests with the approved runtime's. Never prepares or applies anything. */
+async function checkForUpdates(ui: UI, reference: string, claimed: number, background: boolean): Promise<void> {
+    const found = await inspectUpstream(reference);
+    const pinned = /@(sha256:[a-f0-9]{64})$/.exec(reference)?.[1];
+    const known = readState()?.active?.upstream.digests ?? [];
+    let result: Omit<UpdateCheck, "attemptedAt">;
+    if (found === "unsupported") {
+        result = { outcome: "unsupported", message: "update checks need Docker Buildx (docker buildx imagetools), which is not available" };
+    } else if (!found || (pinned && pinned !== found.digest && pinned !== found.indexDigest)) {
+        log("Update check failed: the registry query failed or returned unusable metadata");
+        result = { outcome: "failed", message: `could not read registry metadata for ${reference}; see the extension's hindsight.log` };
+    } else if (known.includes(found.digest) || (found.indexDigest !== undefined && known.includes(found.indexDigest))) {
+        result = { outcome: "current" };
+    } else {
+        result = { outcome: "available", available: { reference, ...found } };
+    }
+    // A newer claim (another process or a later manual check) owns the record.
+    const recorded = await updateState(state => state?.check?.attemptedAt === claimed ? { ...state, check: { attemptedAt: claimed, ...result } } : undefined);
+    if (!recorded || (background && result.outcome === "current")) return;
+    ui.notify("Hindsight: " + describeCheck({ attemptedAt: claimed, ...result }), result.outcome === "failed" || result.outcome === "unsupported" ? "warning" : "info");
+}
+
+function describeCheck(check: UpdateCheck): string {
+    if (check.outcome === "current") return "the approved runtime matches the configured upstream image.";
+    if (check.outcome === "available") {
+        const { reference, digest, indexDigest } = check.available!;
+        return `update available for ${reference}: platform manifest ${digest}${indexDigest ? `, index ${indexDigest}` : ""}. Nothing was downloaded or changed.`;
+    }
+    if (check.outcome) return `update check ${check.outcome}: ${check.message}.`;
+    return "update check started without a recorded result.";
+}
+
+async function checkNow(ui: UI): Promise<void> {
+    if (readState()?.mode !== "cpu") {
+        ui.notify("Hindsight: local management is Off; choose Mode, then CPU, before checking for updates.", "warning");
         return;
     }
-    void runOperation(ui, lease, () => recover(settings));
+    const { settings, error } = resolveSettings();
+    if (!settings) {
+        ui.notify(error!, "error");
+        return;
+    }
+    const claimed = await claimCheck(false);
+    if (claimed === undefined) return;
+    ui.notify(`Hindsight: checking ${settings.image} for updates in the background.`, "info");
+    void checkForUpdates(ui, settings.image, claimed, false).catch(error => ui.notify(visible(error), "error"));
 }
 
 /** Run lifecycle work after the handler returns; the outcome is reported before the lease is released. */
@@ -159,6 +221,7 @@ async function openMenu(ui: UI): Promise<void> {
     }
     if (choice === MENU.provider) await selectProvider(ui);
     if (choice === MENU.apply) await apply(ui);
+    if (choice === MENU.check) await checkNow(ui);
 }
 
 function showStatus(ui: UI): void {
@@ -178,6 +241,7 @@ function showStatus(ui: UI): void {
         lines.push("Management is Off: Docker was not inspected and the service is not managed.");
     }
     if (state?.failure) lines.push(`Last failure (${state.failure.stage}, ${state.failure.at}): ${state.failure.message}`);
+    lines.push(state?.check ? `Last update check (${new Date(state.check.attemptedAt).toISOString()}): ${describeCheck(state.check)}` : "Last update check: none");
     if (state?.operation && pidAlive(state.operation.pid)) lines.push(`In progress: ${state.operation.kind} since ${state.operation.startedAt}`);
     ui.notify(lines.join("\n"), "info");
 }

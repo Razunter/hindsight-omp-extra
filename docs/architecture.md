@@ -30,7 +30,7 @@ Native file-based Codex authentication, where used, has its own independently au
 
 Local Hindsight management is the extension's optional ownership of a local Hindsight container's lifecycle. Evidence, recall guidance and ingestion register independently of it and work against whatever server OMP's native connection points to. Management is Off by default, including for installations that predate it; Off does no Docker or provider-file work.
 
-One installation-wide state file holds the requested mode and the last approved runtime, separate from provider and credential files. Approval binds a concrete cached image ID and configuration identity. Work runs in the background under an installation-wide lease and is revalidated before cutover, so another process, Off, a provider edit or a moved tag cannot widen an approval. A runtime becomes active only after API and database readiness. See the [lifecycle reference](configuration.md#local-management-lifecycle).
+One installation-wide state file holds the requested mode, the last approved runtime and the last update check, separate from provider and credential files. Approval binds a concrete cached image ID and configuration identity. Work runs in the background under an installation-wide lease and is revalidated before cutover, so another process, Off, a provider edit or a moved tag cannot widen an approval. A runtime becomes active only after API and database readiness. Update checks compare registry manifest digests of the configured upstream reference with those of the approved image, record the exact available target and authorize nothing. See the [lifecycle reference](configuration.md#local-management-lifecycle).
 
 ## Evidence access is on demand
 

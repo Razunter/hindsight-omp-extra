@@ -43,6 +43,28 @@ export async function inspectImage(reference: string): Promise<ImageInfo | undef
     return { id: image.Id, digests: (image.RepoDigests ?? []).map((entry: string) => entry.slice(entry.indexOf("@") + 1)) };
 }
 
+const isDigest = (value: unknown): value is string => typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
+type Descriptor = { digest?: unknown; platform?: { os?: unknown; architecture?: unknown } };
+const PLATFORM_ARCHITECTURE: Partial<Record<string, string>> = { x64: "amd64", arm64: "arm64" };
+
+/**
+ * Registry manifest digests of `reference` for linux on this host's architecture, read with buildx without
+ * downloading layers. Docker's own credential store authenticates; registry output never leaves this function.
+ * Returns "unsupported" when Buildx is missing and undefined for any other failure.
+ */
+export async function inspectUpstream(reference: string): Promise<{ digest: string; indexDigest?: string } | "unsupported" | undefined> {
+    const result = await docker(["buildx", "imagetools", "inspect", reference, "--format", "{{json .Manifest}}"], 60_000);
+    if (result.exitCode !== 0) return (await docker(["buildx", "version"])).exitCode === 0 ? undefined : "unsupported";
+    try {
+        const manifest: Descriptor & { manifests?: unknown } = JSON.parse(result.stdout);
+        if (!Array.isArray(manifest.manifests)) return isDigest(manifest.digest) ? { digest: manifest.digest } : undefined;
+        const platform = (manifest.manifests as Descriptor[]).find(entry => entry?.platform?.os === "linux" && entry.platform.architecture === PLATFORM_ARCHITECTURE[process.arch]);
+        return isDigest(manifest.digest) && platform && isDigest(platform.digest) ? { digest: platform.digest, indexDigest: manifest.digest } : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 export interface ContainerInfo { id: string; imageId: string; running: boolean; labels: Record<string, string> }
 
 export async function inspectContainer(name: string): Promise<ContainerInfo | undefined> {

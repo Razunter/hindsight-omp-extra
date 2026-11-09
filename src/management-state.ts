@@ -9,6 +9,10 @@ const STALE_LOCK_MS = 60_000;
 
 export type ManagementMode = "off" | "cpu";
 export interface UpstreamIdentity { reference: string; digests: string[] }
+/** Registry manifest digests of a discovered upstream image: `digest` is the host-platform manifest, `indexDigest` its multi-platform index. */
+export interface UpstreamTarget { reference: string; digest: string; indexDigest?: string }
+/** A claimed check without an outcome is still running or was interrupted. */
+export interface UpdateCheck { attemptedAt: number; outcome?: "current" | "available" | "failed" | "unsupported"; available?: UpstreamTarget; message?: string }
 export interface ApprovedRuntime {
     mode: "cpu";
     provider: string;
@@ -25,6 +29,7 @@ export interface ManagementState {
     active?: ApprovedRuntime;
     failure?: { mode: "cpu"; provider: string; stage: "prepare" | "validate" | "cutover" | "readiness"; message: string; at: string };
     operation?: { id: string; pid: number; kind: "apply" | "recover"; startedAt: string; candidateImageId?: string };
+    check?: UpdateCheck;
 }
 
 export function initialState(): ManagementState {

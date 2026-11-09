@@ -137,10 +137,11 @@ The Anthropic SDK appends `/v1/messages`, so its base excludes `/v1`. OpenCode d
 
 `/hindsight` is the single menu for local Hindsight management. It needs an interactive session and works without any local setup.
 
-- **Status** shows the requested mode, the requested provider configuration, the last approved runtime (provider, image ID, upstream reference, time), pending configuration, the last failure and any operation in progress, as separate lines. A requested change is never shown as the active runtime. In Off, status uses only stored state and says Docker was not inspected.
+- **Status** shows the requested mode, the requested provider configuration, the last approved runtime (provider, image ID, upstream reference, time), pending configuration, the last failure, the last update check and any operation in progress, as separate lines. A requested change is never shown as the active runtime. In Off, status uses only stored state and says Docker was not inspected.
 - **Mode** switches between **Off** and **CPU**. Off takes effect immediately for every OMP process of this installation without stopping the container or deleting anything. Choosing CPU records the request and continues to the apply step.
 - **Provider configuration** lists contained profile names, never credentials, and atomically saves just the name in `.selected-provider`. Cancellation, a disappearing profile or a failed write preserves the previous saved choice. An empty or missing profiles directory reports setup guidance instead of opening an empty dialog. With CPU management on, it continues to the apply step.
 - **Apply requested configuration** validates the selected configuration (containment, native settings, Codex auth) before any Docker work. It then looks up the configured image in Docker’s local cache. An uncached image is reported as needing an explicit download, and nothing changes. Otherwise one confirmation shows the provider configuration, the cached image ID, the data volume, whether an existing container is replaced, and a warning when the image differs from the running one.
+- **Check for updates** reads registry metadata for the configured image right away, ignoring the daily interval. It needs CPU management on and a valid configuration; see [update checks](#update-checks).
 
 Mode, approval and runtime state are installation-wide and stored in `.local-management.json` (mode `0600`, written atomically under a short lock). Provider and credential files are never rewritten. A legacy installation without that file is treated as Off and receives one notice.
 
@@ -164,13 +165,23 @@ Only a fresh interactive main OMP process acts on startup, once per process; `/n
 
 A pending configuration is always reported and never applied at startup.
 
+### Update checks
+
+An update check reads the configured `HINDSIGHT_IMAGE` reference's registry manifest with `docker buildx imagetools inspect`. It downloads no image layers, builds nothing, and never touches the container or the approved runtime. Registry authentication is whatever Docker itself is configured with; the extension passes no credentials.
+
+The check records the index digest and the `linux/<host architecture>` manifest digest. The runtime is **current** when either digest is one of the registry digests recorded for the approved image; local tags and image IDs are never compared. Otherwise the result is **available** and names the exact target: reference, platform manifest digest and index digest. A digest-pinned reference stays on its digest: if the registry answers with a different one, the check fails instead of offering it. A **failed** check (registry or network error, unusable metadata) and an **unsupported** one (Docker Buildx is missing) are reported as such, never as current. Registry error output is not shown or logged.
+
+With CPU management on and an approved runtime, a fresh interactive main OMP process checks in the background after startup recovery, at most once per 24 hours across all processes of the installation. The attempt time is claimed before the registry call, so failed and interrupted attempts also wait out the interval. An available update, failure or unsupported result is a nonmodal notification; a current result is quiet. Off, headless sessions, subagents and evidence or recall requests never check.
+
+An available update is information only. It does not approve, download or apply anything, and the requested and active runtimes stay unchanged.
+
 ### Coordination between OMP processes
 
 Each lifecycle operation takes an installation-wide lease. While another live process holds it, a new approval or startup recovery is refused with a message. A lease left by a process that exited authorizes nothing and is cleared by the next operation. Approvals are never stored, so an interrupted operation cannot authorize later work.
 
 ### Images
 
-This version never pulls, builds, removes or prunes images. Containers are created with `--pull never` from the approved image ID. Tests use an executable fake Docker and synthetic state; they do not build, pull or remove real images.
+This version never pulls, builds, removes or prunes images; update checks read registry metadata only. Containers are created with `--pull never` from the approved image ID. Tests use an executable fake Docker and synthetic state; they do not contact a registry or build, pull or remove real images.
 
 ## Migration from the old root provider tuple
 

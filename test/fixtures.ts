@@ -24,12 +24,15 @@ export interface DockerState {
     exitsAfterRun?: boolean;
     sharedVolumeRun?: boolean;
     waitForHandler?: boolean;
-    runReleased?: boolean;
+    released?: boolean;
     outputBytes?: number;
     runEnvironment?: Record<string, string | undefined>;
     envFile?: { path: string; mode: number };
     /** Simulates another process: once a call starting with `when` has been seen more than `skip` times, patch management state or move a tag. */
     mutate?: { when: string; skip?: number; management?: Record<string, unknown>; retag?: { tag: string; image: string } };
+    /** Registry manifests by exact reference, as `buildx imagetools inspect --format '{{json .Manifest}}'` prints them; a missing reference fails. */
+    registry?: Record<string, unknown>;
+    buildxMissing?: boolean;
 }
 export interface StartupResult {
     notifications: { message: string; level: string }[];
@@ -51,8 +54,18 @@ export interface Fixture {
     cleanup(): void;
 }
 
-export const menu = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration" };
+export const menu = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration", check: "Check for updates" };
 export const imageId = "sha256:" + "1".repeat(64);
+/** Registry index digest recorded as the cached image's RepoDigest; its host-platform manifest is `platformDigest`. */
+export const indexDigest = "sha256:" + "a".repeat(64);
+export const platformDigest = "sha256:" + "b".repeat(64);
+export function upstreamIndex(index: string, platform: string) {
+    const manifest = (digest: string, architecture: string) => ({ mediaType: "application/vnd.oci.image.manifest.v1+json", digest, size: 673, platform: { architecture, os: "linux" } });
+    return {
+        schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", digest: index, size: 855,
+        manifests: [manifest("sha256:" + "e".repeat(64), "s390x"), manifest(platform, process.arch === "arm64" ? "arm64" : "amd64"), { ...manifest("sha256:" + "f".repeat(64), "unknown"), platform: { architecture: "unknown", os: "unknown" } }],
+    };
+}
 export const infrastructure = {
     HINDSIGHT_CONTAINER_NAME: "fixture-hindsight",
     HINDSIGHT_IMAGE: "fixture/image:local",
@@ -90,9 +103,21 @@ if (mutation && state.calls.filter(call => call.join(" ").startsWith(mutation.wh
 }
 const findImage = ref => state.images[ref] ? ref : Object.keys(state.images).find(id => state.images[id].tags.includes(ref));
 const findContainer = ref => Object.keys(state.containers).find(name => name === ref || state.containers[name].id === ref);
+if (state.waitForHandler && ["run", "buildx"].includes(args[0])) {
+    const deadline = Date.now() + 1000;
+    while (!fs.existsSync(file + ".handler-returned") && Date.now() < deadline) await Bun.sleep(10);
+    state.released = fs.existsSync(file + ".handler-returned");
+}
 let code = 0, out = "", err = "";
 switch (args[0]) {
 case "version": out = "fixture-server"; break;
+case "buildx": {
+    if (state.buildxMissing) { code = 1; err = "docker: 'buildx' is not a docker command."; break; }
+    if (args[1] === "version") { out = "github.com/docker/buildx fixture"; break; }
+    const manifest = args[1] === "imagetools" && args[2] === "inspect" ? state.registry?.[args[3]] : undefined;
+    if (!manifest) { code = 1; err = "ERROR: failed to authorize: synthetic-registry-secret"; break; }
+    out = JSON.stringify(manifest); break;
+}
 case "image": {
     const id = findImage(args.at(-1));
     if (args[1] !== "inspect" || !id) { code = 1; break; }
@@ -110,11 +135,6 @@ case "rename": { const name = findContainer(args[1]); if (!name || state.contain
 case "rm": { const name = findContainer(args.at(-1)); if (!name || state.containers[name].running) { code = 1; break; } delete state.containers[name]; break; }
 case "volume": if (args[1] === "rm" && args.includes("fixture-data")) state.data = null; else code = 1; break;
 case "run": {
-    if (state.waitForHandler) {
-        const deadline = Date.now() + 1000;
-        while (!fs.existsSync(file + ".handler-returned") && Date.now() < deadline) await Bun.sleep(10);
-        state.runReleased = fs.existsSync(file + ".handler-returned");
-    }
     if (state.outputBytes) {
         const output = Buffer.alloc(state.outputBytes, "x");
         await Bun.write(Bun.stdout, output); await Bun.write(Bun.stderr, output);
@@ -176,14 +196,20 @@ globalThis.fetch = async (input, init) => {
     const healthy = state.health !== "unhealthy";
     return Response.json(healthy ? { status: "healthy", database: "connected" } : { status: "unhealthy", database: "disconnected" }, { status: healthy ? 200 : 503 });
 };
-const operation = () => { try { return JSON.parse(fs.readFileSync(managementFile, "utf8")).operation; } catch { return undefined; } };
-// A lease this process took when the handler returned marks background work; it ends with one outcome notification, then the lease release.
-async function settle() {
-    const lease = operation();
-    if (lease?.pid !== process.pid) return;
+const management = () => { try { return JSON.parse(fs.readFileSync(managementFile, "utf8")); } catch { return undefined; } };
+// Background work started by this step: a lease this process holds ends with one outcome notification, then the lease release;
+// an update check claimed during the step ends with its recorded outcome.
+async function settle(since) {
+    const lease = management()?.operation;
     const reported = notifications.length;
     const deadline = Date.now() + 8000;
-    while (notifications.length === reported || operation()?.id === lease.id || fs.existsSync(import.meta.dir + "/.local-management.lock")) {
+    const busy = () => {
+        const current = management();
+        return (lease?.pid === process.pid && (notifications.length === reported || current?.operation?.id === lease.id))
+            || (current?.check?.attemptedAt >= since && !current.check.outcome)
+            || fs.existsSync(import.meta.dir + "/.local-management.lock");
+    };
+    while (busy()) {
         if (Date.now() > deadline) throw new Error("Background lifecycle operation did not finish");
         await Bun.sleep(10);
     }
@@ -191,7 +217,7 @@ async function settle() {
 const notifications = [], dialogs = [], tools = [], commands = [];
 const steps = JSON.parse(process.env.FIXTURE_STEPS);
 for (let i = 0; i < steps.length; i++) {
-    const step = steps[i];
+    const step = steps[i], since = Date.now();
     if (step.selection !== undefined) fs.writeFileSync(import.meta.dir + "/.selected-provider", step.selection);
     const module = await import("./src/hindsight-omp.ts?reload=" + i);
     const startups = [];
@@ -235,7 +261,7 @@ for (let i = 0; i < steps.length; i++) {
         finally { if (step.failWrite) fs.chmodSync(import.meta.dir, 0o700); }
     }
     fs.writeFileSync(stateFile + ".handler-returned", "returned");
-    await settle();
+    await settle(since);
 }
 console.log(JSON.stringify({ notifications, dialogs, tools, commands }));`;
 
@@ -246,7 +272,11 @@ export function fixture(): Fixture {
     fs.mkdirSync(path.join(root, "bin"));
     const statePath = path.join(root, "docker-state.json");
     const managementPath = path.join(root, ".local-management.json");
-    fs.writeFileSync(statePath, JSON.stringify({ containers: {}, calls: [], runFails: false, data: "preserved-data", images: { [imageId]: { tags: [infrastructure.HINDSIGHT_IMAGE], digests: ["fixture/image@sha256:" + "a".repeat(64)] } } }));
+    fs.writeFileSync(statePath, JSON.stringify({
+        containers: {}, calls: [], runFails: false, data: "preserved-data",
+        images: { [imageId]: { tags: [infrastructure.HINDSIGHT_IMAGE], digests: ["fixture/image@" + indexDigest] } },
+        registry: { [infrastructure.HINDSIGHT_IMAGE]: upstreamIndex(indexDigest, platformDigest) },
+    }));
     fs.writeFileSync(path.join(root, "bin/docker"), fakeDocker, { mode: 0o700 });
     fs.writeFileSync(path.join(root, "driver.ts"), startupDriver);
     function envFile(file: string, values: Record<string, string>) {
