@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { BASE_LABEL, CONFIG_LABEL, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, candidateModelDevices, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, serviceModelDevices, type ContainerInfo, type ImageInfo } from "./docker";
+import { BASE_LABEL, CONFIG_LABEL, CUDA_RECIPE, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, candidateModelDevices, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, serviceModelDevices, type ContainerInfo, type ImageInfo } from "./docker";
 import { initialState, liveOperation, readState, releaseLease, takeLease, updateState, type ApprovedRuntime, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 
@@ -86,12 +86,13 @@ function notOnCuda(models: (typeof LOCAL_MODELS)[number][], devices: Record<stri
     return undefined;
 }
 
+/** Owned by this installation and built from `base`, by any recipe version. */
 function builtFor(image: ImageInfo, installationId: string, base: string): boolean {
-    return image.labels[INSTALLATION_LABEL] === installationId && image.labels[DERIVATIVE_LABEL] === "cuda" && image.labels[BASE_LABEL] === base;
+    return image.labels[INSTALLATION_LABEL] === installationId && image.labels[DERIVATIVE_LABEL]?.startsWith("cuda") === true && image.labels[BASE_LABEL] === base;
 }
 
-/** The tag of this installation's CUDA derivative of an upstream digest. */
-const derivativeTag = (digest: string) => `${CUDA_REPOSITORY}:${digest.slice(7, 19)}`;
+/** The tag of this installation's CUDA derivative of an upstream digest, built by `recipe`. */
+const derivativeTag = (digest: string, recipe: string) => `${CUDA_REPOSITORY}:${digest.slice(7, 19)}-${recipe.slice(5)}`;
 const digestOf = (base: string) => base.slice(base.indexOf("@") + 1);
 
 /**
@@ -112,10 +113,12 @@ async function removeSupersededImages(previousImage: string | undefined): Promis
         }
         const operation = liveOperation(state);
         const entry = state.owned?.find(owned => owned.imageId === id);
-        if (id === active.imageId || id === operation?.candidateImageId || (entry && active.upstream.digests.includes(digestOf(entry.base)))) continue;
-        const ownTag = entry?.kind === "derivative" ? derivativeTag(digestOf(entry.base)) : undefined;
+        if (id === active.imageId || id === operation?.candidateImageId) continue;
+        const sameRelease = entry !== undefined && active.upstream.digests.includes(digestOf(entry.base));
         const result = await removeImage(id, image =>
-            image.tags.some(tag => tag !== ownTag) ||
+            // Current-recipe images of the active release stay for reuse (GPU -> CPU -> GPU); older recipes are superseded.
+            (sameRelease && (entry.kind !== "derivative" || image.labels[DERIVATIVE_LABEL] === CUDA_RECIPE)) ||
+            image.tags.some(tag => entry?.kind !== "derivative" || tag !== derivativeTag(digestOf(entry.base), image.labels[DERIVATIVE_LABEL] ?? "")) ||
             image.digests.some(digest => active.upstream.digests.includes(digest)) ||
             (entry?.kind === "derivative" && !builtFor(image, state.installationId, entry.base)) ||
             (entry?.kind === "download" && !image.digests.includes(digestOf(entry.base))));
@@ -371,9 +374,9 @@ async function planTarget(state: ManagementState, settings: HindsightSettings, u
     if (digests.length === 0) return undefined;
     const base = `${repository}@${digests[0]}`;
     if (settings.gpu) {
-        const reference = derivativeTag(digests[0]);
+        const reference = derivativeTag(digests[0], CUDA_RECIPE);
         const derivative = await inspectImage(reference);
-        const reusable = derivative && builtFor(derivative, state.installationId, base) &&
+        const reusable = derivative && builtFor(derivative, state.installationId, base) && derivative.labels[DERIVATIVE_LABEL] === CUDA_RECIPE &&
             state.owned?.some(entry => entry.kind === "derivative" && entry.imageId === derivative.id);
         return reusable ? { kind: "cached", reference, imageId: derivative.id, digests, base } : { kind: "build", reference, digests, base };
     }

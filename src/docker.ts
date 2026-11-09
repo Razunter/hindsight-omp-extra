@@ -35,6 +35,8 @@ RUN set -e; \\
     if [ -n "$changed" ]; then echo "CUDA PyTorch would change other packages: $changed"; exit 1; fi; \\
     ${PYTHON} -c 'import torch; assert torch.version.cuda, "CUDA-enabled PyTorch wheel was not installed"; print(f"PyTorch CUDA runtime: {torch.version.cuda}")'
 `;
+/** Identifies the recipe a derivative was built with, so a changed recipe rebuilds instead of reusing an old image. */
+export const CUDA_RECIPE = "cuda-" + new Bun.CryptoHasher("sha256").update(CUDA_DOCKERFILE).digest("hex").slice(0, 12);
 
 /**
  * Run a docker command with an abort timeout, draining both pipes.
@@ -170,7 +172,7 @@ export async function buildCudaDerivative(base: string, tag: string, installatio
         return (await docker([
             "build", "--build-arg", `BASE=${base}`, "--tag", tag,
             "--label", `${INSTALLATION_LABEL}=${installationId}`,
-            "--label", `${DERIVATIVE_LABEL}=cuda`,
+            "--label", `${DERIVATIVE_LABEL}=${CUDA_RECIPE}`,
             "--label", `${BASE_LABEL}=${base}`,
             context,
         ], BUILD_TIMEOUT)).exitCode === 0;

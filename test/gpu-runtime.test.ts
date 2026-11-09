@@ -12,7 +12,7 @@ const competitor = { id: "competitor", pid: process.pid, kind: "apply", startedA
 const calls = (f: Fixture, name: string) => f.state().calls.filter(call => call[0] === name);
 const launches = (f: Fixture) => f.state().calls.filter(call => call[0] === "run" && call[1] === "-d").length;
 const validations = (f: Fixture) => f.state().calls.filter(call => call[0] === "run" && call[1] === "--rm").length;
-const derivatives = (f: Fixture) => Object.keys(f.state().images).filter(id => f.state().images[id].labels?.["io.github.razunter.hindsight-omp.derivative"] === "cuda");
+const derivatives = (f: Fixture) => Object.keys(f.state().images).filter(id => f.state().images[id].labels?.["io.github.razunter.hindsight-omp.derivative"]?.startsWith("cuda"));
 const confirmations = (result: { dialogs: { message?: string }[] }) => result.dialogs.filter(dialog => dialog.message !== undefined);
 const host = (f: Fixture, patch: Partial<DockerState>) => f.setState({ ...f.state(), ...patch });
 const chooseGpu = (f: Fixture, step: Record<string, unknown> = {}, overrides?: Record<string, string>) =>
@@ -31,6 +31,19 @@ function gpuRuntime() {
     expect(chooseGpu(f).notifications.at(-1)?.level).toBe("info");
     return { f, active: f.management()!.active };
 }
+
+test("a derivative built by an older CUDA recipe is rebuilt rather than reused, then removed after readiness", () => {
+    const { f } = cpuOnGpuHost();
+    const older = "sha256:" + "4".repeat(64);
+    host(f, { images: { ...f.state().images, [older]: { tags: ["hindsight-omp-cuda:" + "a".repeat(12) + "-000000000000"], labels: { "io.github.razunter.hindsight-omp.installation": f.management()!.installationId, "io.github.razunter.hindsight-omp.derivative": "cuda-000000000000", "io.github.razunter.hindsight-omp.base": base } } } });
+    f.manage({ owned: [{ imageId: older, kind: "derivative", base, recordedAt: "2026-11-01T00:00:00.000Z" }] });
+    expect(chooseGpu(f).notifications.at(-1)?.level).toBe("info");
+    expect(calls(f, "build")).toHaveLength(1);
+    const active = f.management()!.active;
+    expect(active.imageId).not.toBe(older);
+    expect(f.state().images[older]).toBeUndefined();
+    expect(derivatives(f)).toEqual([active.imageId]);
+});
 
 test("GPU is offered but never chosen implicitly, and CPU works on a host without CUDA", () => {
     const f = setup();
@@ -57,8 +70,8 @@ test("choosing GPU builds a CUDA derivative of the approved base and cuts over o
     expect(active).toMatchObject({ mode: "gpu", upstream: { reference: infrastructure.HINDSIGHT_IMAGE, digests: [indexDigest] } });
     expect(derivatives(f)).toEqual([active.imageId]);
     expect(f.state().images[active.imageId]).toEqual({
-        tags: ["hindsight-omp-cuda:" + "a".repeat(12)],
-        labels: { "io.github.razunter.hindsight-omp.installation": f.management()!.installationId, "io.github.razunter.hindsight-omp.derivative": "cuda", "io.github.razunter.hindsight-omp.base": base },
+        tags: [expect.stringMatching(new RegExp("^hindsight-omp-cuda:" + "a".repeat(12) + "-[0-9a-f]{12}$"))],
+        labels: { "io.github.razunter.hindsight-omp.installation": f.management()!.installationId, "io.github.razunter.hindsight-omp.derivative": expect.stringMatching(/^cuda-[0-9a-f]{12}$/), "io.github.razunter.hindsight-omp.base": base },
     });
     expect(f.management()!.owned).toEqual([expect.objectContaining({ imageId: active.imageId, kind: "derivative", base })]);
     expect(f.container()).toMatchObject({ image: active.imageId, running: true, gpus: true, mounts: running.mounts, portBindings: running.portBindings, shmSize: running.shmSize });

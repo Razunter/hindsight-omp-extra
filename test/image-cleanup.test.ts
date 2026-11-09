@@ -26,7 +26,7 @@ function gpuUpdateAvailable() {
 function staleDerivative(f: Fixture): string {
     const id = "sha256:" + "5".repeat(64), base = "fixture/image@sha256:" + "9".repeat(64);
     const state = f.state();
-    state.images[id] = { tags: ["hindsight-omp-cuda:" + "9".repeat(12)], labels: { [INSTALLATION]: f.management()!.installationId, "io.github.razunter.hindsight-omp.derivative": "cuda", "io.github.razunter.hindsight-omp.base": base } };
+    state.images[id] = { tags: ["hindsight-omp-cuda:" + "9".repeat(12) + "-000000000000"], labels: { [INSTALLATION]: f.management()!.installationId, "io.github.razunter.hindsight-omp.derivative": "cuda-000000000000", "io.github.razunter.hindsight-omp.base": base } };
     f.setState(state);
     f.manage({ owned: [...f.management()!.owned, { imageId: id, kind: "derivative", base, recordedAt: "2026-11-01T00:00:00.000Z" }] });
     return id;
