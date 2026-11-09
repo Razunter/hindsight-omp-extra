@@ -5,7 +5,7 @@ const owned: Fixture[] = [];
 function setup() { const f = fixture(); owned.push(f); return f; }
 afterEach(() => { for (const f of owned.splice(0)) f.cleanup(); });
 
-const approve = (f: Fixture) => f.run([{ startup: false, command: true, choices: [menu.apply], confirm: true }]);
+const approve = (f: Fixture) => f.run([{ startup: false, command: true, choices: [menu.update], confirm: true }]);
 
 test.each([false, true])("an approved download starts after the handler returns and reports progress and outcome (download fails: %j)", downloadFails => {
     const f = setup(); f.apply(); discoverUpdate(f);

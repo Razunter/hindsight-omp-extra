@@ -7,14 +7,14 @@ const STATE_FILE = path.join(EXTENSION_ROOT, ".local-management.json");
 const LOCK_FILE = path.join(EXTENSION_ROOT, ".local-management.lock");
 const STALE_LOCK_MS = 60_000;
 
-export type ManagementMode = "off" | "cpu";
+export type ManagementMode = "off" | "cpu" | "gpu";
 export interface UpstreamIdentity { reference: string; digests: string[] }
 /** Registry manifest digests of a discovered upstream image: `digest` is the host-platform manifest, `indexDigest` its multi-platform index. */
 export interface UpstreamTarget { reference: string; digest: string; indexDigest?: string }
 /** A claimed check without an outcome is still running or was interrupted. */
 export interface UpdateCheck { attemptedAt: number; outcome?: "current" | "available" | "failed" | "unsupported"; available?: UpstreamTarget; message?: string }
 export interface ApprovedRuntime {
-    mode: "cpu";
+    mode: "cpu" | "gpu";
     provider: string;
     configDigest: string;
     upstream: UpstreamIdentity;
@@ -27,13 +27,13 @@ export interface ManagementState {
     mode: ManagementMode;
     noticeShown?: boolean;
     active?: ApprovedRuntime;
-    failure?: { mode: "cpu"; provider: string; stage: "prepare" | "validate" | "cutover" | "readiness"; message: string; at: string };
+    failure?: { mode: "cpu" | "gpu"; provider: string; stage: "prepare" | "validate" | "cutover" | "readiness"; message: string; at: string };
     /** Housekeeping after a healthy cutover failed; the runtime itself is ready. */
     cleanupFailure?: { message: string; at: string };
     operation?: { id: string; pid: number; kind: "apply" | "recover"; startedAt: string; candidateImageId?: string };
     check?: UpdateCheck;
-    /** Images this installation downloaded, so later cleanup never claims an image that was already cached. */
-    owned?: { imageId: string; kind: "download"; base: string; recordedAt: string }[];
+    /** Images this installation downloaded or built (`base` is the upstream `repo@digest`), so later cleanup never claims an image that was already cached. */
+    owned?: { imageId: string; kind: "download" | "derivative"; base: string; recordedAt: string }[];
 }
 
 export function initialState(): ManagementState {
@@ -50,7 +50,7 @@ export function readState(): ManagementState | undefined {
     }
     try {
         const state = JSON.parse(text);
-        if (state?.version !== 1 || typeof state.installationId !== "string" || !["off", "cpu"].includes(state.mode)) throw new Error();
+        if (state?.version !== 1 || typeof state.installationId !== "string" || !["off", "cpu", "gpu"].includes(state.mode)) throw new Error();
         return state;
     } catch {
         throw new Error("Hindsight: local management state is invalid; fix or remove .local-management.json");

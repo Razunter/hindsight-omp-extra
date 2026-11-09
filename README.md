@@ -30,7 +30,7 @@ Follow [first-run setup](docs/setup.md) to configure the installed package, sele
 omp
 ```
 
-Installation loads the extension and bundled skill automatically. Local Docker management stays Off, including for existing installations, until you choose CPU in `/hindsight`. [Checkout loading](docs/setup.md#load-persistently) remains an alternative.
+Installation loads the extension and bundled skill automatically. Local Docker management stays Off, including for existing installations, until you choose CPU or GPU in `/hindsight`. [Checkout loading](docs/setup.md#load-persistently) remains an alternative.
 
 ## Use it
 
@@ -56,8 +56,8 @@ The skill uses a scout to distill useful knowledge and queues it through OMP’s
 ## Defaults and limits
 
 - **Local ports:** the launcher binds the API and dashboard to `127.0.0.1`. [`HINDSIGHT_BIND_ADDRESS`](docs/configuration.md#network-binding) overrides both.
-- **Opt-in management:** `/hindsight` shows status, switches local management between Off and CPU, selects the provider configuration, checks for image updates and installs or applies them after one confirmation that names the exact image, in the current OMP process. Off never stops or changes a running container. Existing installations get a one-time notice instead of being opted in.
-- **Approved runtime only:** with CPU management on, a fresh interactive main OMP process starts the last approved container or recreates it from the approved cached image. Edited `.env` or profile files are reported as pending, never applied at startup. Nothing is downloaded automatically: at most once a day, startup reads the configured image's registry metadata and notifies you when it has moved. Headless sessions and subagents never manage Docker. The container keeps running after OMP exits; [stop it explicitly](docs/setup.md#stop-the-container) when you no longer need it.
+- **Opt-in management:** `/hindsight` shows status, switches local management between Off, CPU and GPU, selects the provider configuration, checks for image updates and installs or applies them after one confirmation that names the exact image, in the current OMP process. GPU is never selected for you: it needs the NVIDIA Container Toolkit, builds a CUDA image of about 11 GB after approval, and fails visibly instead of falling back to CPU. Off never stops or changes a running container. Existing installations get a one-time notice instead of being opted in.
+- **Approved runtime only:** with CPU or GPU management on, a fresh interactive main OMP process starts the last approved container or recreates it from the approved cached image. Edited `.env` or profile files are reported as pending, never applied at startup. Nothing is downloaded or built automatically: at most once a day, startup reads the configured image's registry metadata and notifies you when it has moved. Headless sessions and subagents never manage Docker. The container keeps running after OMP exits; [stop it explicitly](docs/setup.md#stop-the-container) when you no longer need it.
 - **Advisory recall:** the retrieval footer is on; mid-run nudges are off. Neither forces a lookup, and improved task results from nudges have not been demonstrated.
 
 ## Documentation

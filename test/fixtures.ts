@@ -11,13 +11,15 @@ export interface Container {
     shmSize: number;
     portBindings: Record<string, { HostIp: string; HostPort: string }[]>;
     labels: Record<string, string>;
+    /** Started with `--gpus all` (a GPU DeviceRequest). */
+    gpus?: boolean;
 }
 export interface DockerState {
     containers: Record<string, Container>;
     calls: string[][];
     runFails: boolean;
     data: string | null;
-    images: Record<string, { tags: string[]; digests?: string[] }>;
+    images: Record<string, { tags: string[]; digests?: string[]; labels?: Record<string, string> }>;
     health?: "healthy" | "unhealthy";
     healthProbes?: string[];
     stopFails?: boolean;
@@ -36,6 +38,15 @@ export interface DockerState {
     /** Registry manifests by exact reference, as `buildx imagetools inspect --format '{{json .Manifest}}'` prints them; a missing reference fails. */
     registry?: Record<string, unknown>;
     buildxMissing?: boolean;
+    /** Host GPU support: "cuda" = driver, toolkit and CUDA PyTorch work; "no-cuda" = GPU visible but torch.cuda unavailable; unset = CPU-only host. */
+    gpu?: "cuda" | "no-cuda";
+    /** Device the managed container's local models log at startup; defaults to cuda for a GPU container on a "cuda" host, else cpu. */
+    modelDevice?: string;
+    /** `docker build` outcome: fails like a dependency conflict, or sleeps before succeeding. */
+    buildFails?: boolean;
+    buildDelayMs?: number;
+    /** Files of the last build context and its build arguments. */
+    buildContext?: { files: string[]; buildArgs: string[] };
 }
 export interface StartupResult {
     notifications: { message: string; level: string }[];
@@ -57,7 +68,7 @@ export interface Fixture {
     cleanup(): void;
 }
 
-export const menu = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration", check: "Check for updates" };
+export const menu = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration", update: "Apply available update", check: "Check for updates" };
 export const imageId = "sha256:" + "1".repeat(64);
 /** Registry index digest recorded as the cached image's RepoDigest; its host-platform manifest is `platformDigest`. */
 export const indexDigest = "sha256:" + "a".repeat(64);
@@ -102,7 +113,7 @@ import path from "node:path";
 const file = process.env.FAKE_DOCKER_STATE;
 const state = JSON.parse(fs.readFileSync(file, "utf8"));
 const args = process.argv.slice(2); state.calls.push(args);
-if (state.waitForHandler && ["run", "buildx", "pull"].includes(args[0])) {
+if (state.waitForHandler && ["run", "buildx", "pull", "build"].includes(args[0])) {
     const deadline = Date.now() + 1000;
     while (!fs.existsSync(file + ".handler-returned") && Date.now() < deadline) await Bun.sleep(10);
     state.released = fs.existsSync(file + ".handler-returned");
@@ -121,7 +132,7 @@ if (mutation && state.calls.filter(call => call.join(" ").startsWith(mutation.wh
 }
 const findImage = ref => state.images[ref] ? ref : Object.keys(state.images).find(id => state.images[id].tags.includes(ref) || (state.images[id].digests ?? []).includes(ref));
 const findContainer = ref => Object.keys(state.containers).find(name => name === ref || state.containers[name].id === ref);
-if (state.outputBytes && ["run", "pull"].includes(args[0])) {
+if (state.outputBytes && ["run", "pull", "build"].includes(args[0])) {
     const output = Buffer.alloc(state.outputBytes, "x");
     await Bun.write(Bun.stdout, output); await Bun.write(Bun.stderr, output);
 }
@@ -138,7 +149,7 @@ case "buildx": {
 case "image": {
     const id = findImage(args.at(-1));
     if (!id) { code = 1; break; }
-    if (args[1] === "inspect") out = JSON.stringify({ Id: id, RepoTags: state.images[id].tags, RepoDigests: state.images[id].digests ?? [] });
+    if (args[1] === "inspect") out = JSON.stringify({ Id: id, RepoTags: state.images[id].tags, RepoDigests: state.images[id].digests ?? [], Config: { Labels: state.images[id].labels ?? null } });
     else if (args[1] === "rm" && !args.includes("--force") && !state.imageRemoveFails && state.images[id].tags.length <= 1 && !Object.values(state.containers).some(container => container.image === id)) delete state.images[id];
     else code = 1;
     break;
@@ -161,7 +172,29 @@ case "container": {
     const name = findContainer(args.at(-1));
     if (args[1] !== "inspect" || !name) { code = 1; break; }
     const container = state.containers[name];
-    out = JSON.stringify({ Id: container.id, Name: "/" + name, Image: container.image, State: { Running: container.running }, Config: { Labels: container.labels } }); break;
+    out = JSON.stringify({ Id: container.id, Name: "/" + name, Image: container.image, State: { Running: container.running }, Config: { Labels: container.labels }, HostConfig: { DeviceRequests: container.gpus ? [{ Driver: "", Count: -1, DeviceIDs: null, Capabilities: [["gpu"]], Options: {} }] : null } }); break;
+}
+case "build": {
+    const value = flag => args.flatMap((arg, i) => arg === flag ? [args[i + 1]] : []);
+    const context = args.at(-1);
+    state.buildContext = { files: fs.readdirSync(context), buildArgs: value("--build-arg") };
+    if (state.buildDelayMs) await Bun.sleep(state.buildDelayMs);
+    const base = value("--build-arg")[0]?.replace(/^BASE=/, "");
+    if (!findImage(base) && state.remote?.[base]) state.images[state.remote[base]] = { tags: [], digests: [base] };
+    if (!findImage(base)) { code = 1; err = "ERROR: failed to resolve " + base + ": synthetic-registry-secret"; break; }
+    if (state.buildFails) { code = 1; err = "x No solution found when resolving dependencies: torch==2.7.1+cu126 conflicts with fixture-package"; break; }
+    const labels = Object.fromEntries(value("--label").map(label => [label.slice(0, label.indexOf("=")), label.slice(label.indexOf("=") + 1)]));
+    const id = "sha256:" + new Bun.CryptoHasher("sha256").update(JSON.stringify(labels)).digest("hex");
+    const tag = value("--tag")[0];
+    for (const image of Object.values(state.images)) image.tags = image.tags.filter(existing => existing !== tag);
+    state.images[id] = { tags: [tag], labels };
+    break;
+}
+case "logs": {
+    const container = state.containers[findContainer(args.at(-1))];
+    if (!container) { code = 1; break; }
+    const device = state.modelDevice ?? (container.gpus && state.gpu === "cuda" ? "cuda" : "cpu");
+    err = "Embeddings: local provider initialized (dim: 384, device: " + device + ")\\nReranker: local provider initialized (device: " + device + ", max_concurrent=4)"; break;
 }
 case "stop": { const name = findContainer(args.at(-1)); if (!name || state.stopFails) { code = 1; break; } state.containers[name].running = false; break; }
 case "start": { const name = findContainer(args.at(-1)); if (!name) { code = 1; break; } state.containers[name].running = true; break; }
@@ -169,6 +202,13 @@ case "rename": { const name = findContainer(args[1]); if (!name || state.contain
 case "rm": { const name = findContainer(args.at(-1)); if (!name || state.containers[name].running) { code = 1; break; } delete state.containers[name]; break; }
 case "volume": if (args[1] === "rm" && args.includes("fixture-data")) state.data = null; else code = 1; break;
 case "run": {
+    if (args[1] === "--rm") {
+        // GPU validation: needs a GPU-capable Docker host and CUDA PyTorch in the image.
+        if (!state.gpu) { code = 125; err = "docker: Error response from daemon: could not select device driver \\"\\" with capabilities: [[gpu]]."; }
+        else if (state.gpu !== "cuda" || !state.images[findImage(args[args.indexOf("--entrypoint") + 2])]?.labels) code = 3;
+        break;
+    }
+    if (args.includes("--gpus") && !state.gpu) { code = 125; break; }
     state.runEnvironment = Object.fromEntries(["PATH", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"].map(key => [key, process.env[key]]));
     const env = [], mounts = [], portBindings = {}, labels = {};
     let name;
@@ -194,7 +234,7 @@ case "run": {
     else if (!image || !name || state.containers[name]) code = 1;
     else {
         const id = state.calls.length.toString(16).padStart(64, "c");
-        state.containers[name] = { id, image, running: !state.exitsAfterRun, env, mounts, portBindings, labels, shmSize: args.includes("--shm-size") ? Number(args[args.indexOf("--shm-size") + 1]) : 67108864 };
+        state.containers[name] = { id, image, running: !state.exitsAfterRun, env, mounts, portBindings, labels, ...(args.includes("--gpus") ? { gpus: true } : {}), shmSize: args.includes("--shm-size") ? Number(args[args.indexOf("--shm-size") + 1]) : 67108864 };
         out = id;
     }
     break;

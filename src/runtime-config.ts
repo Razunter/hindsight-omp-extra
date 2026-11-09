@@ -20,6 +20,8 @@ export type HindsightSettings = {
     uiPort: string;
     bindAddress: string;
     codexAuthDir?: string;
+    /** The container requests all GPUs (`--gpus all`). */
+    gpu: boolean;
     /** Complete container environment, including credentials; only ever written to the 0600 env file. */
     env: Record<string, string>;
     /** Identity of the desired container environment and run shape. */
@@ -65,8 +67,8 @@ export function savedProviderSelection(): string | undefined {
     }
 }
 
-/** Resolve and validate the requested runtime configuration from local files and the process environment. */
-export function resolveSettings(): { settings?: HindsightSettings; error?: string } {
+/** Resolve and validate the requested runtime configuration (`gpu`: GPU mode) from local files and the process environment. */
+export function resolveSettings(gpu = false): { settings?: HindsightSettings; error?: string } {
     const extensionEnv = readEnvFile(HINDSIGHT_ENV_FILE) ?? {};
     let configuration;
     try {
@@ -119,12 +121,12 @@ export function resolveSettings(): { settings?: HindsightSettings; error?: strin
     }
     const shape = {
         containerName, image, volumeName, apiPort, uiPort, bindAddress,
-        codexAuthDir: codexAuthDir ?? null, shmSize: SHM_SIZE_BYTES,
+        codexAuthDir: codexAuthDir ?? null, shmSize: SHM_SIZE_BYTES, ...(gpu ? { gpus: "all" } : {}),
         env: Object.entries(containerEnv).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
     };
     return {
         settings: {
-            provider, containerName: containerName!, image: image!, volumeName: volumeName!, apiPort: apiPort!, uiPort: uiPort!, bindAddress, codexAuthDir,
+            provider, containerName: containerName!, image: image!, volumeName: volumeName!, apiPort: apiPort!, uiPort: uiPort!, bindAddress, codexAuthDir, gpu,
             env: containerEnv,
             configDigest: "sha256:" + createHash("sha256").update(JSON.stringify(shape)).digest("hex"),
         },

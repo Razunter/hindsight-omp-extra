@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { CONFIG_LABEL, INSTALLATION_LABEL, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeUnusedImage, runManagedContainer, type ContainerInfo } from "./docker";
-import { initialState, pidAlive, readState, releaseLease, takeLease, updateState, type ManagementState, type UpdateCheck } from "./management-state";
+import { BASE_LABEL, CONFIG_LABEL, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, cudaUsable, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeUnusedImage, runManagedContainer, type ContainerInfo, type ImageInfo } from "./docker";
+import { initialState, pidAlive, readState, releaseLease, takeLease, updateState, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 
 // Reload replaces modules, not this process-lifetime startup decision.
@@ -9,7 +9,11 @@ const startupKey = Symbol.for("hindsight-omp.startup-roots");
 const processState = globalThis as typeof globalThis & { [startupKey]?: Set<string> };
 const startupRoots = processState[startupKey] ??= new Set<string>();
 
-const MENU = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration", check: "Check for updates" } as const;
+const MENU = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration", update: "Apply available update", check: "Check for updates" } as const;
+const MODE_NAME: Record<ManagementMode, string> = { off: "Off", cpu: "CPU", gpu: "GPU" };
+const CUDA_REPOSITORY = "hindsight-omp-cuda";
+/** Hindsight's local model kinds, as named in its startup log and in its `HINDSIGHT_API_<KEY>_*` settings. */
+const LOCAL_MODELS = [["Embeddings", "EMBEDDINGS"], ["Reranker", "RERANKER"]] as const;
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const PULL_TIMEOUT_MS = 60 * 60 * 1000;
 const PINNED = /@sha256:[a-f0-9]{64}$/;
@@ -17,15 +21,16 @@ const PINNED = /@sha256:[a-f0-9]{64}$/;
 type UI = ExtensionContext["ui"];
 type Outcome = { level: "info" | "warning" | "error"; message: string };
 type FailureStage = NonNullable<ManagementState["failure"]>["stage"];
-/** The image one approval covers: already cached, or downloaded from the registry by the displayed digest. */
-type Target =
-    | { kind: "cached"; imageId: string; digests: string[] }
-    | { kind: "download"; pull: string; digests: string[] };
+/**
+ * The image one approval covers: already cached, downloaded from the registry by the displayed digest, or (GPU) a CUDA
+ * derivative built from the upstream `base`. `reference` names the image to revalidate; `digests` are the upstream's.
+ */
+type Target = { reference: string; digests: string[]; base?: string } & ({ kind: "cached"; imageId: string } | { kind: "download" } | { kind: "build" });
 interface ApprovedPlan { settings: HindsightSettings; target: Target }
 
 export function registerLocalManagement(pi: ExtensionAPI): void {
     pi.registerCommand("hindsight", {
-        description: "Local Hindsight management: status, Off/CPU mode, provider configuration, apply and update checks",
+        description: "Local Hindsight management: status, Off/CPU/GPU mode, provider configuration, apply, updates and update checks",
         handler: async (_args, ctx) => {
             if (ctx.hasUI !== true) return;
             try { await openMenu(ctx.ui); }
@@ -59,7 +64,18 @@ function matchesApproved(container: ContainerInfo, state: ManagementState): bool
     return active !== undefined &&
         container.labels[INSTALLATION_LABEL] === state.installationId &&
         container.labels[CONFIG_LABEL] === active.configDigest &&
-        container.imageId === active.imageId;
+        container.imageId === active.imageId &&
+        container.gpu === (active.mode === "gpu");
+}
+
+/** Local models GPU mode can accelerate: provider unset or `local`, and not forced to CPU by the owner. */
+function localModels(settings: HindsightSettings): (typeof LOCAL_MODELS)[number][] {
+    return LOCAL_MODELS.filter(([, key]) => [undefined, "", "local"].includes(settings.env[`HINDSIGHT_API_${key}_PROVIDER`]) &&
+        !/^(true|1|yes)$/i.test(settings.env[`HINDSIGHT_API_${key}_LOCAL_FORCE_CPU`] ?? ""));
+}
+
+function builtFor(image: ImageInfo, installationId: string, base: string): boolean {
+    return image.labels[INSTALLATION_LABEL] === installationId && image.labels[DERIVATIVE_LABEL] === "cuda" && image.labels[BASE_LABEL] === base;
 }
 
 async function startup(ui: UI): Promise<void> {
@@ -72,10 +88,10 @@ async function startup(ui: UI): Promise<void> {
     }
     if (state.mode === "off") return;
     if (!state.active) {
-        ui.notify("Hindsight: CPU management is requested but no runtime has been approved yet; open /hindsight and apply it.", "warning");
+        ui.notify(`Hindsight: ${MODE_NAME[state.mode]} management is requested but no runtime has been approved yet; open /hindsight and apply it.`, "warning");
         return;
     }
-    const { settings, error } = resolveSettings();
+    const { settings, error } = resolveSettings(state.mode === "gpu");
     if (!settings) {
         ui.notify(error!, "error");
         return;
@@ -127,18 +143,19 @@ function describeCheck(check: UpdateCheck): string {
     if (check.outcome === "current") return "the approved runtime matches the configured upstream image.";
     if (check.outcome === "available") {
         const { reference, digest, indexDigest } = check.available!;
-        return `update available for ${reference}: platform manifest ${digest}${indexDigest ? `, index ${indexDigest}` : ""}. Nothing was downloaded or changed; choose Apply requested configuration in /hindsight to review it.`;
+        return `update available for ${reference}: platform manifest ${digest}${indexDigest ? `, index ${indexDigest}` : ""}. Nothing was downloaded, built or changed; choose ${MENU.update} in /hindsight to review it.`;
     }
     if (check.outcome) return `update check ${check.outcome}: ${check.message}.`;
     return "update check started without a recorded result.";
 }
 
 async function checkNow(ui: UI): Promise<void> {
-    if (readState()?.mode !== "cpu") {
-        ui.notify("Hindsight: local management is Off; choose Mode, then CPU, before checking for updates.", "warning");
+    const mode = readState()?.mode ?? "off";
+    if (mode === "off") {
+        ui.notify("Hindsight: local management is Off; choose Mode, then CPU or GPU, before checking for updates.", "warning");
         return;
     }
-    const { settings, error } = resolveSettings();
+    const { settings, error } = resolveSettings(mode === "gpu");
     if (!settings) {
         ui.notify(error!, "error");
         return;
@@ -167,7 +184,7 @@ async function recover(settings: HindsightSettings): Promise<Outcome> {
     const off: Outcome = { level: "info", message: "Hindsight: local management was turned Off; startup recovery stopped." };
     if (!await dockerAvailable()) return { level: "error", message: "Hindsight: Docker is not reachable; the managed runtime was not recovered." };
     const state = readState();
-    if (state?.mode !== "cpu" || !state.active) return off;
+    if (!state || state.mode === "off" || !state.active) return off;
     const name = settings.containerName;
     const pending = isPending(state, settings);
     const pendingNote = " The requested configuration differs from the approved runtime and was not applied; apply it from /hindsight.";
@@ -182,9 +199,9 @@ async function recover(settings: HindsightSettings): Promise<Outcome> {
     }
     if (!container && pending) return { level: "warning", message: "Hindsight: the managed container is missing and was not recreated." + pendingNote };
     if (!container && !await inspectImage(state.active.imageId)) {
-        return { level: "warning", message: "Hindsight: the approved image is no longer cached, so the missing container was not recreated; choose Apply requested configuration in /hindsight to approve downloading it again." };
+        return { level: "warning", message: `Hindsight: the approved image is no longer cached, so the missing container was not recreated; choose ${MENU.apply} in /hindsight to approve ${state.active.mode === "gpu" ? "building" : "downloading"} it again.` };
     }
-    if (readState()?.mode !== "cpu") return off;
+    if ((readState()?.mode ?? "off") === "off") return off;
     const started = container
         ? (await docker(["start", name])).exitCode === 0
         : await runManagedContainer(settings, state.active.imageId, state.installationId);
@@ -193,24 +210,42 @@ async function recover(settings: HindsightSettings): Promise<Outcome> {
         return { level: "error", message: "Hindsight: could not start the approved runtime; see the extension's hindsight.log" };
     }
     if (pending) return { level: "warning", message: "Hindsight: started the last approved runtime." + pendingNote };
-    return await waitUntilReady(settings)
-        ? { level: "info", message: `Hindsight: managed runtime ready (API :${settings.apiPort}, UI :${settings.uiPort})` }
-        : { level: "error", message: "Hindsight: the approved runtime started but did not report a healthy API and database." };
+    const problem = await readinessProblem(settings);
+    return problem
+        ? { level: "error", message: `Hindsight: the approved runtime started but ${problem}.` }
+        : { level: "info", message: `Hindsight: managed runtime ready (API :${settings.apiPort}, UI :${settings.uiPort})` };
 }
 
-async function waitUntilReady(settings: HindsightSettings): Promise<boolean> {
+/**
+ * Undefined once the API and database are healthy and, in GPU mode, every applicable local model logged that it
+ * initialized on CUDA; otherwise what failed. A model on another device fails at once; a missing log line is awaited.
+ */
+async function readinessProblem(settings: HindsightSettings): Promise<string | undefined> {
     const host = settings.bindAddress === "0.0.0.0" ? "127.0.0.1" : settings.bindAddress === "::" ? "::1" : settings.bindAddress;
     const url = `http://${host.includes(":") ? `[${host}]` : host}:${settings.apiPort}/health`;
     const seconds = Number(Bun.env.HINDSIGHT_OMP_READINESS_TIMEOUT_SECONDS);
     const deadline = Date.now() + (Number.isFinite(seconds) && seconds > 0 ? seconds : 300) * 1000;
+    const models = settings.gpu ? localModels(settings) : [];
+    let problem = "did not report a healthy API and database";
     for (;;) {
+        let healthy = false;
         try {
             const health = await (await fetch(url, { signal: AbortSignal.timeout(5_000) })).json();
-            if (health?.status === "healthy" && health?.database === "connected") return true;
+            healthy = health?.status === "healthy" && health?.database === "connected";
         } catch {
             // Not accepting connections yet.
         }
-        if (!(await inspectContainer(settings.containerName))?.running || Date.now() >= deadline) return false;
+        if (healthy) {
+            if (models.length === 0) return undefined;
+            const logs = await docker(["logs", settings.containerName], 30_000);
+            const output = logs.exitCode === 0 ? logs.stdout + logs.stderr : "";
+            const devices = models.map(([model]) => [model, [...output.matchAll(new RegExp(`${model}: local provider initialized \\([^)]*device: (\\w+)`, "g"))].at(-1)?.[1]] as const);
+            if (devices.every(([, device]) => device === "cuda")) return undefined;
+            const elsewhere = devices.find(([, device]) => device !== undefined && device !== "cuda");
+            if (elsewhere) return `reported a healthy API and database, but its local ${elsewhere[0].toLowerCase()} model runs on ${elsewhere[1]}, not CUDA`;
+            problem = "reported a healthy API and database, but its local models never reported a CUDA device";
+        }
+        if (!(await inspectContainer(settings.containerName))?.running || Date.now() >= deadline) return problem;
         await Bun.sleep(500);
     }
 }
@@ -219,18 +254,19 @@ async function openMenu(ui: UI): Promise<void> {
     const choice = await ui.select("Hindsight local management", Object.values(MENU));
     if (choice === MENU.status) showStatus(ui);
     if (choice === MENU.mode) {
-        const mode = await ui.select("Local Hindsight management mode", ["Off", "CPU"]);
+        const mode = await ui.select("Local Hindsight management mode", ["Off", "CPU", "GPU"]);
         if (mode === "Off") {
             await updateState(state => ({ ...(state ?? initialState()), mode: "off" }));
             ui.notify("Hindsight: local management is Off. The running container, its data and configuration were left unchanged.", "info");
         }
-        if (mode === "CPU") {
-            await updateState(state => ({ ...(state ?? initialState()), mode: "cpu" }));
-            await apply(ui);
+        if (mode === "CPU" || mode === "GPU") {
+            await updateState(state => ({ ...(state ?? initialState()), mode: mode === "CPU" ? "cpu" : "gpu" }));
+            await apply(ui, false);
         }
     }
     if (choice === MENU.provider) await selectProvider(ui);
-    if (choice === MENU.apply) await apply(ui);
+    if (choice === MENU.apply) await apply(ui, false);
+    if (choice === MENU.update) await apply(ui, true);
     if (choice === MENU.check) await checkNow(ui);
 }
 
@@ -238,19 +274,20 @@ function showStatus(ui: UI): void {
     const state = readState();
     const active = state?.active;
     const lines = [
-        `Requested mode: ${state?.mode === "cpu" ? "CPU" : "Off"}`,
+        `Requested mode: ${MODE_NAME[state?.mode ?? "off"]}`,
         `Requested provider configuration: ${savedProviderSelection() || "none"}`,
-        active
-            ? `Last approved runtime: CPU, provider ${active.provider}, image ${active.imageId.slice(7, 19)} from ${active.upstream.reference}, applied ${active.appliedAt}`
-            : "Last approved runtime: none",
+        !active ? "Last approved runtime: none"
+            : active.mode === "gpu"
+            ? `Last approved runtime: GPU, provider ${active.provider}, CUDA image ${active.imageId.slice(7, 19)} built from ${active.upstream.reference} (${active.upstream.digests[0]}), applied ${active.appliedAt}`
+            : `Last approved runtime: CPU, provider ${active.provider}, image ${active.imageId.slice(7, 19)} from ${active.upstream.reference}, applied ${active.appliedAt}`,
     ];
-    if (state?.mode === "cpu") {
-        const { settings, error } = resolveSettings();
+    if (state && state.mode !== "off") {
+        const { settings, error } = resolveSettings(state.mode === "gpu");
         lines.push(!settings ? `Pending: the requested configuration is invalid. ${error}` : isPending(state, settings) ? "Pending: the requested configuration has not been applied" : "Pending: none");
     } else {
         lines.push("Management is Off: Docker was not inspected and the service is not managed.");
     }
-    if (state?.failure) lines.push(`Last failure (${state.failure.stage}, ${state.failure.at}): ${state.failure.message}`);
+    if (state?.failure) lines.push(`Last failure (${MODE_NAME[state.failure.mode]} ${state.failure.stage}, ${state.failure.at}): ${state.failure.message}`);
     if (state?.cleanupFailure) lines.push(`Cleanup after the last healthy cutover failed (${state.cleanupFailure.at}): ${state.cleanupFailure.message}`);
     lines.push(state?.check ? `Last update check (${new Date(state.check.attemptedAt).toISOString()}): ${describeCheck(state.check)}` : "Last update check: none");
     if (state?.operation && pidAlive(state.operation.pid)) lines.push(`In progress: ${state.operation.kind} since ${state.operation.startedAt}`);
@@ -270,47 +307,70 @@ async function selectProvider(ui: UI): Promise<void> {
         return;
     }
     saveProviderSelection(selected);
-    if (readState()?.mode === "cpu") await apply(ui);
+    if ((readState()?.mode ?? "off") !== "off") await apply(ui, false);
     else ui.notify(`Hindsight: selected ${selected}. Local management is Off, so no runtime was changed.`, "info");
 }
 
 /**
- * The image the requested configuration needs: a recorded upstream update first, then the cached image, then a
- * fresh download of the approved digest when its image left the cache. Undefined means no target is known yet.
+ * The image the requested configuration needs. An update targets the upstream digests the last check recorded; otherwise
+ * the active runtime's upstream digests, or for a first installation the cached configured image or the checked target.
+ * GPU mode reuses this installation's CUDA derivative of that base or builds one. Undefined means no target is known yet.
  */
-async function planTarget(state: ManagementState, settings: HindsightSettings): Promise<Target | undefined> {
-    const cached = await inspectImage(settings.image);
-    const known = state.active?.upstream.digests ?? [];
-    const available = state.check?.available;
-    const update = available?.reference === settings.image ? [available.digest, ...(available.indexDigest ? [available.indexDigest] : [])] : [];
+async function planTarget(state: ManagementState, settings: HindsightSettings, update: boolean): Promise<Target | undefined> {
     const repository = settings.image.replace(PINNED, "").replace(/:[^/:]+$/, "");
-    if (update.length > 0 && !update.some(digest => known.includes(digest) || cached?.digests.includes(digest))) {
-        return { kind: "download", pull: `${repository}@${update[0]}`, digests: update };
+    const available = state.check?.available?.reference === settings.image ? state.check.available : undefined;
+    const offered = available ? [available.digest, ...(available.indexDigest ? [available.indexDigest] : [])] : [];
+    let digests = update ? offered : state.active?.upstream.reference === settings.image ? state.active.upstream.digests : [];
+    if (digests.length === 0 && !update) {
+        const cached = await inspectImage(settings.image);
+        if (cached && !settings.gpu) return { kind: "cached", reference: settings.image, imageId: cached.id, digests: cached.digests };
+        digests = cached?.digests.length ? cached.digests : offered;
     }
-    if (cached) return { kind: "cached", imageId: cached.id, digests: cached.digests };
-    if (state.active?.upstream.reference === settings.image && known.length > 0) return { kind: "download", pull: `${repository}@${known[0]}`, digests: known };
-    return undefined;
+    if (digests.length === 0) return undefined;
+    const base = `${repository}@${digests[0]}`;
+    if (settings.gpu) {
+        const reference = `${CUDA_REPOSITORY}:${digests[0].slice(7, 19)}`;
+        const derivative = await inspectImage(reference);
+        const reusable = derivative && builtFor(derivative, state.installationId, base) &&
+            state.owned?.some(entry => entry.kind === "derivative" && entry.imageId === derivative.id);
+        return reusable ? { kind: "cached", reference, imageId: derivative.id, digests, base } : { kind: "build", reference, digests, base };
+    }
+    for (const digest of digests) {
+        const cached = await inspectImage(`${repository}@${digest}`);
+        if (cached) return { kind: "cached", reference: `${repository}@${digest}`, imageId: cached.id, digests };
+    }
+    return { kind: "download", reference: base, digests };
 }
 
-/** Plan the CPU runtime, ask for one approval covering preparation and cutover, then run both in the background. */
-async function apply(ui: UI): Promise<void> {
+/** Plan the CPU or GPU runtime, ask for one approval covering preparation and cutover, then run both in the background. */
+async function apply(ui: UI, update: boolean): Promise<void> {
     const state = readState();
-    if (state?.mode !== "cpu") {
-        ui.notify("Hindsight: local management is Off; choose Mode, then CPU, first.", "warning");
+    if (!state || state.mode === "off") {
+        ui.notify("Hindsight: local management is Off; choose Mode, then CPU or GPU, first.", "warning");
         return;
     }
-    const { settings, error } = resolveSettings();
+    const gpu = state.mode === "gpu";
+    const { settings, error } = resolveSettings(gpu);
     if (!settings) {
         ui.notify(error!, "error");
+        return;
+    }
+    const models = localModels(settings);
+    if (gpu && models.length === 0) {
+        ui.notify("Hindsight: GPU mode accelerates only local embedding and reranker models, and the configuration runs none on the GPU (both providers are remote or forced to CPU). Nothing was built or changed; choose CPU or configure a local model.", "error");
         return;
     }
     if (!await dockerAvailable()) {
         ui.notify("Hindsight: Docker is not reachable; nothing was changed.", "error");
         return;
     }
-    const target = await planTarget(state, settings);
+    const target = await planTarget(state, settings, update);
+    if (!target && update) {
+        ui.notify(`Hindsight: no update is recorded for ${settings.image}; choose ${MENU.check} first. Nothing was changed.`, "info");
+        return;
+    }
     if (!target) {
-        ui.notify(`Hindsight: ${settings.image} is not cached and its registry target is not known yet; nothing was changed. When the check reports the target, choose Apply requested configuration to approve the download.`, "info");
+        ui.notify(`Hindsight: ${settings.image} is not cached and its registry target is not known yet; nothing was changed. When the check reports the target, choose ${MENU.apply} to approve the ${gpu ? "build" : "download"}.`, "info");
         await startCheck(ui, settings);
         return;
     }
@@ -320,71 +380,92 @@ async function apply(ui: UI): Promise<void> {
         ui.notify("Hindsight: the approved runtime already matches the requested configuration; nothing to apply.", "info");
         return;
     }
-    const versionChanges = target.kind === "cached"
-        ? (container?.imageId ?? state.active?.imageId ?? target.imageId) !== target.imageId
-        : (container !== undefined || state.active !== undefined) && !target.digests.some(digest => state.active?.upstream.digests.includes(digest));
+    const runningImage = container?.imageId ?? state.active?.imageId;
+    const sameRelease = state.active?.upstream.digests.some(digest => target.digests.includes(digest)) || (target.kind === "cached" && runningImage === target.imageId);
+    const mode = MODE_NAME[state.mode];
     const plan = [
         `Hindsight provider configuration: ${settings.provider}`,
-        target.kind === "cached"
-            ? `Image: ${settings.image}, cached as ${target.imageId.slice(7, 19)}. No download or build.`
-            : `Image: downloads ${target.pull} for ${settings.image} in the background; the download size is not known in advance. The current service keeps running while it downloads.`,
+        target.kind === "download"
+            ? `Image: downloads ${target.reference} for ${settings.image} in the background; the download size is not known in advance. The current service keeps running while it downloads.`
+            : target.kind === "build"
+            ? `Image: builds the CUDA derivative ${target.reference} from ${target.base} in the background, replacing only its PyTorch wheel with the CUDA build of the same version (about 11 GB on disk; the base is downloaded first if it is not cached). The current service keeps running during the build and GPU validation.`
+            : gpu
+            ? `Image: reuses this installation's CUDA derivative ${target.reference} (${target.imageId.slice(7, 19)}) of ${target.base}. No download or build.`
+            : `Image: ${settings.image}, cached as ${target.imageId.slice(7, 19)}. No download or build.`,
+        ...(gpu ? [`GPU: needs the NVIDIA driver and NVIDIA Container Toolkit. The container gets --gpus all, and the local ${models.map(([model]) => model.toLowerCase()).join(" and ")} model${models.length > 1 ? "s" : ""} must run on CUDA. Any failure keeps the current service; there is no CPU fallback.`] : []),
         container
             ? `Shared service: container ${name} keeps running until cutover, is stopped gracefully (up to 75 seconds) and replaced.`
             : `Shared service: creates container ${name}.`,
         `Data: reuses volume ${settings.volumeName}${settings.codexAuthDir ? " and the Codex credential directory" : ""}, the same ports, bind address and worker identity.`,
-        ...(versionChanges ? ["Warning: a different Hindsight version may migrate the reused database; replacing the image does not roll the database back."] : []),
+        ...(runningImage !== undefined && !sameRelease ? ["Warning: a different Hindsight version may migrate the reused database; replacing the image does not roll the database back."] : []),
     ];
-    const title = target.kind === "cached" ? "Apply the Hindsight CPU runtime?" : "Download and apply the Hindsight CPU runtime?";
-    if (!await ui.confirm(title, plan.join("\n"))) return;
+    const verb = target.kind === "cached" ? "Apply" : target.kind === "download" ? "Download and apply" : "Build and apply";
+    if (!await ui.confirm(`${verb} the Hindsight ${mode} runtime?`, plan.join("\n"))) return;
     const lease = await takeLease("apply", target.kind === "cached" ? target.imageId : undefined);
     if (!lease) {
         ui.notify("Hindsight: another OMP process is changing the local runtime; nothing was applied. Try again when it finishes.", "warning");
         return;
     }
     ui.notify(target.kind === "cached"
-        ? "Hindsight: applying the approved CPU runtime in the background."
-        : `Hindsight: preparing ${target.pull} in the background; the current service keeps running until cutover.`, "info");
-    void runOperation(ui, lease, () => applyApproved({ settings, target }, lease));
+        ? `Hindsight: applying the approved ${mode} runtime in the background.`
+        : target.kind === "download"
+        ? `Hindsight: preparing ${target.reference} in the background; the current service keeps running until cutover.`
+        : `Hindsight: building the CUDA image from ${target.base} in the background; the current service keeps running until cutover.`, "info");
+    void runOperation(ui, lease, () => applyApproved({ settings, target }, lease, state.installationId));
 }
 
-async function applyApproved(plan: ApprovedPlan, lease: string): Promise<Outcome> {
+async function applyApproved(plan: ApprovedPlan, lease: string, installationId: string): Promise<Outcome> {
     const { settings, target } = plan;
+    const mode = settings.gpu ? "gpu" : "cpu";
+    const keepGpu = settings.gpu ? " GPU stays requested; no CPU fallback was applied." : "";
     const fail = async (stage: FailureStage, message: string, level: Outcome["level"] = "error"): Promise<Outcome> => {
-        await updateState(state => state && { ...state, failure: { mode: "cpu", provider: settings.provider, stage, message, at: new Date().toISOString() } });
+        await updateState(state => state && { ...state, failure: { mode, provider: settings.provider, stage, message, at: new Date().toISOString() } });
         return { level, message };
     };
+    const own = (imageId: string, kind: "download" | "derivative", base: string) => updateState(state => state && {
+        ...state, owned: [...(state.owned ?? []).filter(owned => owned.imageId !== imageId), { imageId, kind, base, recordedAt: new Date().toISOString() }],
+    });
     let imageId: string;
     if (target.kind === "cached") {
         imageId = target.imageId;
-    } else {
-        const present = await inspectImage(target.pull);
-        if (!present && (await docker(["pull", target.pull], PULL_TIMEOUT_MS)).exitCode !== 0) {
+    } else if (target.kind === "download") {
+        const present = await inspectImage(target.reference);
+        if (!present && (await docker(["pull", target.reference], PULL_TIMEOUT_MS)).exitCode !== 0) {
             // Registry errors can echo credentials or tokens, so neither stdout nor stderr is logged or shown.
-            log("docker pull failed for", target.pull);
-            return fail("prepare", `Hindsight: downloading ${target.pull} failed; nothing was replaced and the current service keeps running. Check Docker's registry access and apply again.`);
+            log("docker pull failed for", target.reference);
+            return fail("prepare", `Hindsight: downloading ${target.reference} failed; nothing was replaced and the current service keeps running. Check Docker's registry access and apply again.`);
         }
-        const pulled = present ?? await inspectImage(target.pull);
-        if (!pulled) return fail("prepare", `Hindsight: ${target.pull} is not available after the download; nothing was replaced.`);
+        const pulled = present ?? await inspectImage(target.reference);
+        if (!pulled) return fail("prepare", `Hindsight: ${target.reference} is not available after the download; nothing was replaced.`);
         imageId = pulled.id;
-        if (!present) {
-            const entry = { imageId, kind: "download" as const, base: target.pull, recordedAt: new Date().toISOString() };
-            await updateState(state => state && { ...state, owned: [...(state.owned ?? []).filter(owned => owned.imageId !== imageId), entry] });
+        if (!present) await own(imageId, "download", target.reference);
+    } else {
+        if (!await buildCudaDerivative(target.base!, target.reference, installationId)) {
+            log("docker build failed for", target.base);
+            return fail("prepare", `Hindsight: building the CUDA image from ${target.base} failed (base download, a CUDA PyTorch wheel for its torch version, a dependency change or the CUDA check); nothing was replaced and the current service keeps running.${keepGpu} See "GPU runtime" in docs/configuration.md to rerun the build by hand.`);
         }
+        const built = await inspectImage(target.reference);
+        if (!built || !builtFor(built, installationId, target.base!)) return fail("prepare", `Hindsight: ${target.reference} is not this installation's CUDA image after the build; nothing was replaced.${keepGpu}`);
+        imageId = built.id;
+        await own(imageId, "derivative", target.base!);
+    }
+    if (settings.gpu && !await cudaUsable(imageId)) {
+        log("GPU validation failed for", imageId);
+        return fail("validate", `Hindsight: the CUDA image could not use a GPU in Docker (check the NVIDIA driver, the NVIDIA Container Toolkit and docker run --gpus all); nothing was replaced and the current service keeps running.${keepGpu}`);
     }
 
     // Revalidate under the lock: the approval covers exactly this lease, mode, configuration and image.
-    const current = resolveSettings().settings;
-    const prepared = await inspectImage(target.kind === "cached" ? settings.image : target.pull);
+    const current = resolveSettings(settings.gpu).settings;
+    const prepared = await inspectImage(target.reference);
     let changed: string | undefined;
-    let installationId = "";
     await updateState(state => {
         changed = state?.operation?.id !== lease ? "another process took over local management"
-            : state.mode !== "cpu" ? "local management was turned Off"
+            : state.mode === "off" ? "local management was turned Off"
+            : state.mode !== mode ? "the requested mode changed after approval"
             : current?.provider !== settings.provider || current.configDigest !== settings.configDigest ? "the provider configuration changed after approval"
             : prepared?.id !== imageId ? "the image changed after approval"
             : undefined;
         if (changed) return undefined;
-        installationId = state!.installationId;
         return { ...state!, operation: { ...state!.operation!, candidateImageId: imageId } };
     });
     if (changed) return fail("validate", `Hindsight: nothing was replaced because ${changed}; review /hindsight and apply again.`, "warning");
@@ -412,11 +493,12 @@ async function applyApproved(plan: ApprovedPlan, lease: string): Promise<Outcome
             ? "Hindsight: the new container could not be created; the previous container was restored."
             : `Hindsight: the new container could not be created and the previous container ${previous} could not be restored; restore it manually.`);
     }
-    if (!await waitUntilReady(settings)) {
+    const problem = await readinessProblem(settings);
+    if (problem) {
         await docker(["stop", "--time", "75", name], 90_000);
-        return fail("readiness", `Hindsight: the new container ${name} did not report a healthy API and database and was stopped.` + (previous
+        return fail("readiness", `Hindsight: the new container ${name} ${problem} and was stopped.` + (previous
             ? ` The previous container is preserved as ${previous} and both images are kept; the database may already have been migrated, so restoring it is a manual decision.`
-            : ""));
+            : "") + keepGpu);
     }
     let previousImage: string | undefined;
     await updateState(state => {
@@ -425,14 +507,14 @@ async function applyApproved(plan: ApprovedPlan, lease: string): Promise<Outcome
         const applied = state.check?.available && target.digests.includes(state.check.available.digest);
         return {
             ...state,
-            active: { mode: "cpu", provider: settings.provider, configDigest: settings.configDigest, upstream: { reference: settings.image, digests: target.digests }, imageId, appliedAt: new Date().toISOString() },
+            active: { mode, provider: settings.provider, configDigest: settings.configDigest, upstream: { reference: settings.image, digests: target.digests }, imageId, appliedAt: new Date().toISOString() },
             failure: undefined,
             cleanupFailure: undefined,
             check: applied ? { attemptedAt: state.check!.attemptedAt, outcome: "current" } : state.check,
         };
     });
 
-    const ready = `Hindsight: CPU runtime ready (API :${settings.apiPort}, UI :${settings.uiPort})`;
+    const ready = `Hindsight: ${MODE_NAME[mode]} runtime ready (API :${settings.apiPort}, UI :${settings.uiPort})`;
     const problems: string[] = [];
     if (previous && (await docker(["rm", previous])).exitCode !== 0) problems.push(`the previous container ${previous} could not be removed`);
     // Moving the configured tag leaves the superseded image untagged, which is what makes it removable.

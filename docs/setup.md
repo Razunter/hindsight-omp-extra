@@ -18,7 +18,7 @@ docker version
 
 Docker must report an accessible server, not just a client version. OMP 18.16.0 and Bun 1.4.4 have been exercised; no minimum-version or cross-platform compatibility matrix has been established.
 
-Local management controls one shared container across projects. If you already run Hindsight, inspect its container and volume names first. Applying CPU management to an existing container with the configured name replaces it after your confirmation. Keep its volume name to preserve the database.
+Local management controls one shared container across projects. If you already run Hindsight, inspect its container and volume names first. Applying CPU or GPU management to an existing container with the configured name replaces it after your confirmation. Keep its volume name to preserve the database.
 
 ## Install from Git
 
@@ -74,7 +74,9 @@ The image example follows Hindsight’s [official Docker installation](https://h
 
 Approval binds the exact image shown in the confirmation: a cached image ID or a `repository@digest` download. A tag that moves later is not followed. A different Hindsight version may migrate the reused database, and replacing the image does not roll the database back. A named volume is not a backup.
 
-With CPU management on, the extension tells you when the configured image's registry digest has moved: a fresh interactive start checks at most once every 24 hours, and `/hindsight` → **Check for updates** checks immediately. Checks read registry metadata through Docker Buildx, download nothing and change nothing; **Status** shows the last result. To install an available update, choose **Apply requested configuration** and approve it. See [update checks](configuration.md#update-checks) and [installing and updating](configuration.md#installing-and-updating-a-cpu-runtime).
+With CPU or GPU management on, the extension tells you when the configured image's registry digest has moved: a fresh interactive start checks at most once every 24 hours, and `/hindsight` → **Check for updates** checks immediately. Checks read registry metadata through Docker Buildx, download nothing and change nothing; **Status** shows the last result. To install an available update, choose **Apply available update** and approve it; in GPU mode this rebuilds the CUDA image. See [update checks](configuration.md#update-checks) and [installing and updating](configuration.md#installing-and-updating-a-cpu-runtime).
+
+For GPU inference of the local embedding and reranker models, install the NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) yourself, then choose `/hindsight` → **Mode** → **GPU**. The confirmation names the upstream `repository@digest` the CUDA image is built from (about 11 GB on disk). The current service keeps running during the build and validation; any failure leaves it running and GPU visibly requested, with no CPU fallback. See [GPU runtime](configuration.md#gpu-runtime).
 
 Include only values intended for Hindsight. The validated merged configuration is forwarded to the container, including credentials and variables without a `HINDSIGHT_` prefix. Your AI provider may receive content for memory processing; self-hosting the database does not make remote inference offline.
 
@@ -89,7 +91,7 @@ For a fresh setup, save the profile name without launching OMP first:
 )
 ```
 
-This refuses to overwrite an existing selection. For later switches, use `/hindsight` and choose **Provider configuration** in interactive OMP. It lists names, not credentials. With CPU management on, it then offers to apply the new configuration.
+This refuses to overwrite an existing selection. For later switches, use `/hindsight` and choose **Provider configuration** in interactive OMP. It lists names, not credentials. With CPU or GPU management on, it then offers to apply the new configuration.
 
 ## 3. Enable OMP’s native Hindsight backend
 
@@ -163,7 +165,7 @@ Restart OMP after deployment. Extension package settings arrays replace rather t
 
 ## Apply configuration changes
 
-Editing `.env`, a provider profile, or `.selected-provider` does not restart the container. With CPU management on, the change is pending: run `/hindsight` → **Apply requested configuration**, check the confirmation and approve it. The replacement reuses the named data volume and applies in the current OMP process. Startup never applies a pending change: it can start the stopped approved container, but does not recreate a missing one, and reports what needs applying.
+Editing `.env`, a provider profile, or `.selected-provider` does not restart the container. With CPU or GPU management on, the change is pending: run `/hindsight` → **Apply requested configuration**, check the confirmation and approve it. The replacement reuses the named data volume and applies in the current OMP process. Startup never applies a pending change: it can start the stopped approved container, but does not recreate a missing one, and reports what needs applying.
 
 The same rule applies to `HINDSIGHT_BIND_ADDRESS`: an already-running container keeps its old bindings until you apply the change.
 
@@ -187,7 +189,7 @@ The container does not stop itself when OMP exits. With the example container na
 docker stop hindsight-omp
 ```
 
-Use your configured `HINDSIGHT_CONTAINER_NAME` if different. This stops the container without deleting its named data volume. With CPU management on, the next fresh interactive OMP launch starts the approved container again; choose **Off** in `/hindsight` first to keep it stopped. The container uses Docker’s `unless-stopped` restart policy; closing OMP is not an instruction to stop Docker.
+Use your configured `HINDSIGHT_CONTAINER_NAME` if different. This stops the container without deleting its named data volume. With CPU or GPU management on, the next fresh interactive OMP launch starts the approved container again; choose **Off** in `/hindsight` first to keep it stopped. The container uses Docker’s `unless-stopped` restart policy; closing OMP is not an instruction to stop Docker.
 
 ## Development checks
 

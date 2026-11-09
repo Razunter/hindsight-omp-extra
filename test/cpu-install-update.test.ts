@@ -12,7 +12,8 @@ const competitor = { id: "competitor", pid: process.pid, kind: "apply", startedA
 const calls = (f: Fixture, ...names: string[]) => f.state().calls.filter(call => names.includes(call[0]));
 const cutover = (f: Fixture) => calls(f, "stop", "rename", "run", "rm", "tag").length;
 const approve = (f: Fixture, step: Record<string, unknown> = {}, overrides?: Record<string, string>) =>
-    f.run([{ startup: false, command: true, choices: [menu.apply], confirm: true, ...step }], overrides);
+    f.run([{ startup: false, command: true, choices: [menu.update], confirm: true, ...step }], overrides);
+const applyRequested = { choices: [menu.apply] };
 const confirmations = (result: { dialogs: { message?: string }[] }) => result.dialogs.filter(dialog => dialog.message !== undefined);
 const status = (f: Fixture) => f.run([{ startup: false, command: true, choices: [menu.status] }]).notifications.at(-1)!.message;
 
@@ -26,12 +27,12 @@ test("a first installation discovers the registry target, then downloads it only
     const f = setup();
     const state = f.state(); state.images = {}; state.remote = { ["fixture/image@" + platformDigest]: imageId }; f.setState(state);
     f.manage({ mode: "cpu" });
-    const discovery = approve(f);
+    const discovery = approve(f, applyRequested);
     expect(confirmations(discovery)).toEqual([]);
     expect(calls(f, "pull", "run")).toEqual([]);
     expect(f.management()!.check).toMatchObject({ outcome: "available", available: { digest: platformDigest, indexDigest } });
 
-    const result = approve(f);
+    const result = approve(f, applyRequested);
     expect(confirmations(result)).toHaveLength(1);
     expect(confirmations(result)[0].message).toContain("fixture/image@" + platformDigest);
     expect(result.notifications.at(-1)?.level).toBe("info");
@@ -179,11 +180,38 @@ test("a missing approved image is downloaded again by its approved digest only t
     expect(f.run().notifications.at(-1)?.level).toBe("warning");
     expect(calls(f, "pull")).toEqual([]);
 
-    const result = approve(f);
+    const result = approve(f, applyRequested);
     expect(confirmations(result)[0].message).toContain("fixture/image@" + indexDigest);
     expect(confirmations(result)[0].message).not.toMatch(/migrate/);
     expect(result.notifications.at(-1)?.level).toBe("info");
     expect(calls(f, "pull")).toEqual([["pull", "fixture/image@" + indexDigest]]);
     expect(f.container()).toMatchObject({ image: imageId, running: true });
     expect(f.management()!.active).toMatchObject({ imageId, upstream: active.upstream });
+});
+
+test("a provider change applies on the approved image while an update is pending, and the update stays offered", () => {
+    const { f, running } = updateAvailable();
+    f.envFile("providers/secondary.env", { ...profile, HINDSIGHT_API_LLM_MODEL: "secondary-model" });
+    const result = f.run([{ startup: false, command: true, choices: [menu.provider, "secondary"], confirm: true }]);
+    expect(confirmations(result)).toHaveLength(1);
+    expect(confirmations(result)[0].message).not.toContain(update.pull);
+    expect(confirmations(result)[0].message).not.toMatch(/migrate/);
+    expect(result.notifications.at(-1)?.level).toBe("info");
+    expect(calls(f, "pull")).toEqual([]);
+    expect(f.container()).toMatchObject({ image: imageId, running: true, mounts: running.mounts });
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_MODEL).toBe("secondary-model");
+    expect(f.management()).toMatchObject({ active: { provider: "secondary", imageId }, check: { outcome: "available" } });
+
+    expect(approve(f).notifications.at(-1)?.level).toBe("info");
+    expect(f.container()).toMatchObject({ image: update.imageId, running: true });
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_MODEL).toBe("secondary-model");
+});
+
+test("the update action without a recorded update changes nothing", () => {
+    const f = setup(); f.apply();
+    const running = f.container(); const before = f.state().calls.length;
+    const result = approve(f);
+    expect(confirmations(result)).toEqual([]);
+    expect(f.state().calls.slice(before).filter(call => ["pull", "build", "stop", "run"].includes(call[0]))).toEqual([]);
+    expect(f.container()).toEqual(running);
 });

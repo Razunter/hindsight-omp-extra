@@ -6,6 +6,30 @@ import { SHM_SIZE_BYTES, type HindsightSettings } from "./runtime-config";
 const DOCKER_TIMEOUT = 8_000;
 export const INSTALLATION_LABEL = "io.github.razunter.hindsight-omp.installation";
 export const CONFIG_LABEL = "io.github.razunter.hindsight-omp.config";
+export const DERIVATIVE_LABEL = "io.github.razunter.hindsight-omp.derivative";
+export const BASE_LABEL = "io.github.razunter.hindsight-omp.base";
+const BUILD_TIMEOUT = 2 * 60 * 60 * 1000;
+const PYTHON = "/app/api/.venv/bin/python";
+
+/**
+ * Adapted from Hindsight's docker/docker-compose/cuda/Dockerfile: the CUDA wheel of the base's own torch version
+ * replaces the CPU wheel, and the build fails instead of letting the resolver change any other installed package.
+ */
+const CUDA_DOCKERFILE = `ARG BASE
+FROM \${BASE}
+ARG PYTORCH_CUDA_FLAVOR=cu126
+ARG PYTORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126
+RUN set -e; \\
+    TORCH_BASE_VERSION=$(${PYTHON} -c 'import torch; print(torch.__version__.split("+", 1)[0])'); \\
+    uv pip freeze --python ${PYTHON} | grep -v '^torch==' | sort > /tmp/hindsight-before; \\
+    uv pip install --python ${PYTHON} --no-cache --index "$PYTORCH_CUDA_INDEX" "torch==\${TORCH_BASE_VERSION}+\${PYTORCH_CUDA_FLAVOR}"; \\
+    uv pip check --python ${PYTHON}; \\
+    uv pip freeze --python ${PYTHON} | sort > /tmp/hindsight-after; \\
+    changed=$(comm -23 /tmp/hindsight-before /tmp/hindsight-after); \\
+    rm /tmp/hindsight-before /tmp/hindsight-after; \\
+    if [ -n "$changed" ]; then echo "CUDA PyTorch would change other packages: $changed"; exit 1; fi; \\
+    ${PYTHON} -c 'import torch; assert torch.version.cuda, "CUDA-enabled PyTorch wheel was not installed"; print(f"PyTorch CUDA runtime: {torch.version.cuda}")'
+`;
 
 /**
  * Run a docker command with an abort timeout, draining both pipes.
@@ -32,7 +56,7 @@ export async function dockerAvailable(): Promise<boolean> {
     return (await docker(["version", "--format", "{{.Server.Version}}"], 5_000)).exitCode === 0;
 }
 
-export interface ImageInfo { id: string; tags: string[]; digests: string[] }
+export interface ImageInfo { id: string; tags: string[]; digests: string[]; labels: Record<string, string> }
 
 /** Locally cached image metadata; registry digests come from RepoDigests, never from the image ID. */
 export async function inspectImage(reference: string): Promise<ImageInfo | undefined> {
@@ -40,7 +64,7 @@ export async function inspectImage(reference: string): Promise<ImageInfo | undef
     if (result.exitCode !== 0) return undefined;
     const image = JSON.parse(result.stdout);
     if (!/^sha256:[a-f0-9]{64}$/.test(image.Id) || !Array.isArray(image.RepoDigests ?? []) || !Array.isArray(image.RepoTags ?? [])) throw new Error("Invalid image metadata");
-    return { id: image.Id, tags: image.RepoTags ?? [], digests: (image.RepoDigests ?? []).map((entry: string) => entry.slice(entry.indexOf("@") + 1)) };
+    return { id: image.Id, tags: image.RepoTags ?? [], digests: (image.RepoDigests ?? []).map((entry: string) => entry.slice(entry.indexOf("@") + 1)), labels: image.Config?.Labels ?? {} };
 }
 
 /**
@@ -78,13 +102,14 @@ export async function inspectUpstream(reference: string): Promise<{ digest: stri
     }
 }
 
-export interface ContainerInfo { id: string; imageId: string; running: boolean; labels: Record<string, string> }
+export interface ContainerInfo { id: string; imageId: string; running: boolean; labels: Record<string, string>; gpu: boolean }
 
 export async function inspectContainer(name: string): Promise<ContainerInfo | undefined> {
     const result = await docker(["container", "inspect", "--format", "{{json .}}", name]);
     if (result.exitCode !== 0) return undefined;
     const container = JSON.parse(result.stdout);
-    return { id: String(container.Id), imageId: String(container.Image), running: container.State?.Running === true, labels: container.Config?.Labels ?? {} };
+    const gpu = (container.HostConfig?.DeviceRequests ?? []).some((request: { Capabilities?: string[][] }) => request.Capabilities?.some(set => set.includes("gpu")));
+    return { id: String(container.Id), imageId: String(container.Image), running: container.State?.Running === true, labels: container.Config?.Labels ?? {}, gpu };
 }
 
 /** Create and start the managed container from an image ID; credentials travel only through a 0600 env file. */
@@ -99,6 +124,7 @@ export async function runManagedContainer(settings: HindsightSettings, imageId: 
             "--name", settings.containerName,
             "--restart", "unless-stopped",
             "--shm-size", String(SHM_SIZE_BYTES),
+            ...(settings.gpu ? ["--gpus", "all"] : []),
             "--label", `${INSTALLATION_LABEL}=${installationId}`,
             "--label", `${CONFIG_LABEL}=${settings.configDigest}`,
             "-p", `${bindAddress}:${settings.apiPort}:${settings.env.HINDSIGHT_API_PORT ?? "8888"}`,
@@ -112,4 +138,30 @@ export async function runManagedContainer(settings: HindsightSettings, imageId: 
     } finally {
         fs.rmSync(environmentDirectory, { recursive: true, force: true });
     }
+}
+
+/**
+ * Build the CUDA derivative of the immutable upstream `base` (`repo@digest`) from a context holding only the
+ * generated Dockerfile, so no provider file, credential or agent state can reach a layer or build argument.
+ * Build output is drained but never logged: it can echo registry errors.
+ */
+export async function buildCudaDerivative(base: string, tag: string, installationId: string): Promise<boolean> {
+    const context = fs.mkdtempSync(path.join(tmpdir(), "hindsight-cuda-"));
+    try {
+        fs.writeFileSync(path.join(context, "Dockerfile"), CUDA_DOCKERFILE);
+        return (await docker([
+            "build", "--build-arg", `BASE=${base}`, "--tag", tag,
+            "--label", `${INSTALLATION_LABEL}=${installationId}`,
+            "--label", `${DERIVATIVE_LABEL}=cuda`,
+            "--label", `${BASE_LABEL}=${base}`,
+            context,
+        ], BUILD_TIMEOUT)).exitCode === 0;
+    } finally {
+        fs.rmSync(context, { recursive: true, force: true });
+    }
+}
+
+/** True when a throwaway container of `imageId` gets a GPU and its PyTorch sees CUDA; driver visibility alone is not enough. */
+export async function cudaUsable(imageId: string): Promise<boolean> {
+    return (await docker(["run", "--rm", "--pull", "never", "--gpus", "all", "--entrypoint", PYTHON, imageId, "-c", "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 3)"], 5 * 60_000)).exitCode === 0;
 }
