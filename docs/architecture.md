@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md)
 
-hindsight-omp-extra adds deployment and evidence access to OMP's native Hindsight integration. It is an extension, not a replacement memory engine or a separate OMP build.
+hindsight-omp-extra adds evidence access and optional local deployment to OMP's native Hindsight integration. It is an extension, not a replacement memory engine or a separate OMP build.
 
 ## Ownership
 
@@ -10,7 +10,7 @@ hindsight-omp-extra adds deployment and evidence access to OMP's native Hindsigh
 | --- | --- |
 | OMP | Native `retain`, `recall`, `reflect`, and `learn` tools; memory backend selection; transcript capture; project scoping; shared Auto-Learn; session artifact storage |
 | Hindsight | Retained documents, extracted facts, observations, synthesized knowledge pages, and memory processing with its configured AI provider |
-| This extension | Docker reconciliation, named provider selection, source/page evidence search and read, recall/lesson guidance, and the user-invoked ingestion skill |
+| This extension | Source/page evidence search and read, recall/lesson guidance, the user-invoked ingestion skill, and opt-in local Hindsight management with named provider selection |
 
 A **supporting source** is retained material or underlying facts supporting a recalled claim. It can be unavailable even when the claim remains recallable. A **knowledge page** is synthesized knowledge, not original-source evidence.
 
@@ -20,11 +20,17 @@ A **supporting source** is retained material or underlying facts supporting a re
 
 A named Hindsight provider configuration binds the inference provider, model, endpoint, credentials, and structured-output requirements. It is distinct from OMP’s chat-model choice and from the connection OMP uses to reach Hindsight.
 
-The extension uses OMP’s command registration and selection UI without changing OMP core. One saved selection is shared across projects because one shared container is managed. Selection takes effect only in a fresh interactive main OMP process, not during `/new` or `/reload`.
+The extension uses OMP's command registration and selection UI without changing OMP core. One saved selection is shared across projects because one shared container is managed. With CPU management on, a new selection is applied in the current process after one confirmation; it is never applied implicitly at startup.
 
 Authentication belongs to Hindsight’s native adapters. There is no OMP credential gateway or inference proxy. Copying OMP’s rotating credentials would create competing refresh owners and is not supported.
 
 Native file-based Codex authentication, where used, has its own independently authorized persistent writable directory. Hindsight owns refresh. See [provider configuration](configuration.md).
+
+## Local Hindsight management is opt-in
+
+Local Hindsight management is the extension's optional ownership of a local Hindsight container's lifecycle. Evidence, recall guidance and ingestion register independently of it and work against whatever server OMP's native connection points to. Management is Off by default, including for installations that predate it; Off does no Docker or provider-file work.
+
+One installation-wide state file holds the requested mode and the last approved runtime, separate from provider and credential files. Approval binds a concrete cached image ID and configuration identity. Work runs in the background under an installation-wide lease and is revalidated before cutover, so another process, Off, a provider edit or a moved tag cannot widen an approval. A runtime becomes active only after API and database readiness. See the [lifecycle reference](configuration.md#local-management-lifecycle).
 
 ## Evidence access is on demand
 

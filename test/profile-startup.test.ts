@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
-import { fixture, infrastructure, nativeEnv, profile, type Fixture } from "./fixtures";
+import { fixture, infrastructure, menu, nativeEnv, profile, type Fixture } from "./fixtures";
 
 const owned: Fixture[] = [];
 function setup() { const f = fixture(); owned.push(f); return f; }
@@ -9,11 +9,13 @@ afterEach(() => { for (const f of owned.splice(0)) f.cleanup(); });
 
 test("API and dashboard publishing defaults to IPv4 loopback", () => {
     const f = setup();
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    expect(f.state().container!.portBindings).toEqual({
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(f.container()!.portBindings).toEqual({
         "18888/tcp": [{ HostIp: "127.0.0.1", HostPort: "18888" }],
         "9999/tcp": [{ HostIp: "127.0.0.1", HostPort: "19999" }],
     });
+    expect(f.container()!.shmSize).toBe(1073741824);
+    expect(f.state().healthProbes).toEqual(["127.0.0.1:18888"]);
 });
 
 test.each(["base", "profile", "process"])("bind address follows infrastructure precedence from %s", source => {
@@ -21,112 +23,88 @@ test.each(["base", "profile", "process"])("bind address follows infrastructure p
     f.envFile(".env", { ...infrastructure, HINDSIGHT_BIND_ADDRESS: "127.0.0.2" });
     if (source !== "base") f.envFile("providers/primary.env", { ...profile, HINDSIGHT_BIND_ADDRESS: "0.0.0.0" });
     const overrides = source === "process" ? { HINDSIGHT_BIND_ADDRESS: "::1" } : {};
-    expect(f.run([{}], overrides).notifications.at(-1)?.level).toBe("info");
+    expect(f.apply(overrides).notifications.at(-1)?.level).toBe("info");
     const address = source === "base" ? "127.0.0.2" : source === "profile" ? "0.0.0.0" : "::1";
-    expect(f.state().container!.portBindings).toEqual({
+    expect(f.container()!.portBindings).toEqual({
         "18888/tcp": [{ HostIp: address, HostPort: "18888" }],
         "9999/tcp": [{ HostIp: address, HostPort: "19999" }],
     });
 });
 
+test.each([["0.0.0.0", "127.0.0.1:18888"], ["::", "[::1]:18888"]])("readiness for wildcard bind %s probes loopback", (address, probe) => {
+    const f = setup();
+    f.envFile(".env", { ...infrastructure, HINDSIGHT_BIND_ADDRESS: address });
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(f.state().healthProbes).toEqual([probe]);
+});
+
 test.each(["", "localhost", "127.0.0.1:8888", "300.0.0.1", "[::1]"])("invalid bind address %j leaves Docker untouched", address => {
     const f = setup();
     f.envFile(".env", { ...infrastructure, HINDSIGHT_BIND_ADDRESS: address });
-    expect(f.run().notifications.at(-1)?.level).toBe("error");
+    expect(f.apply().notifications.at(-1)?.level).toBe("error");
     expect(f.state().calls).toEqual([]);
 });
 
-test.each(["18888/tcp", "9999/tcp"])("wider publishing on %s is corrected once without losing persistent data", port => {
-    const f = setup();
-    f.run();
-    const legacy = f.state();
-    legacy.container!.portBindings[port][0].HostIp = "";
-    f.setState(legacy);
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    expect(f.state().container!.portBindings).toEqual({
-        "18888/tcp": [{ HostIp: "127.0.0.1", HostPort: "18888" }],
-        "9999/tcp": [{ HostIp: "127.0.0.1", HostPort: "19999" }],
-    });
-    expect(f.state().data).toBe("preserved-data");
-    const runs = f.state().calls.filter(call => call[0] === "run").length;
-    f.run();
-    expect(f.state().calls.filter(call => call[0] === "run")).toHaveLength(runs);
-});
-
-test("changing and removing a bind override reconciles both published ports", () => {
+test("changing and removing a bind override is applied through approval on the same volume", () => {
     const f = setup();
     for (const address of ["127.0.0.1", "0.0.0.0", "127.0.0.1"]) {
         f.envFile(".env", address === "127.0.0.1" ? infrastructure : { ...infrastructure, HINDSIGHT_BIND_ADDRESS: address });
-        expect(f.run().notifications.at(-1)?.level).toBe("info");
-        expect(Object.values(f.state().container!.portBindings).map(bindings => bindings[0].HostIp)).toEqual([address, address]);
+        expect(f.apply().notifications.at(-1)?.level).toBe("info");
+        expect(Object.values(f.container()!.portBindings).map(bindings => bindings[0].HostIp)).toEqual([address, address]);
         expect(f.state().data).toBe("preserved-data");
     }
     expect(f.state().calls.filter(call => call[0] === "run")).toHaveLength(3);
+    expect(f.state().sharedVolumeRun).toBeUndefined();
 });
 
-test("legacy shared-memory limit is replaced without losing persistent data", () => {
-    const f = setup();
-    f.run();
-    const legacy = f.state();
-    legacy.container!.shmSize = 67108864;
-    f.setState(legacy);
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    const corrected = f.state();
-    expect(corrected.container!.shmSize).toBe(1073741824);
-    expect(corrected.data).toBe("preserved-data");
-    const runCount = corrected.calls.filter(call => call[0] === "run").length;
-    f.run();
-    expect(f.state().calls.filter(call => call[0] === "run").length).toBe(runCount);
-});
-
-test("arbitrary base and profile variables reconcile additions, overrides and removals", () => {
+test("arbitrary base and profile variables apply additions, overrides and removals", () => {
     const f = setup();
     f.envFile(".env", { ...infrastructure, OLLAMA_API_KEY: "synthetic-base-key", CUSTOM_EMPTY: "", CUSTOM_LITERAL: "a=b $HOME" });
     f.envFile("providers/primary.env", { ...profile, OLLAMA_API_KEY: "synthetic-selected-key", CUSTOM_PROFILE: "selected" });
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    const applied = nativeEnv(f.state());
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    const applied = nativeEnv(f.container());
     expect(applied.OLLAMA_API_KEY).toBe("synthetic-selected-key");
     expect(applied.CUSTOM_EMPTY).toBe("");
     expect(applied.CUSTOM_LITERAL).toBe("a=b $HOME");
     expect(applied.CUSTOM_PROFILE).toBe("selected");
     f.envFile("providers/primary.env", profile);
-    f.run();
-    expect(nativeEnv(f.state()).OLLAMA_API_KEY).toBe("synthetic-base-key");
-    expect(nativeEnv(f.state()).CUSTOM_PROFILE).toBeUndefined();
+    f.apply();
+    expect(nativeEnv(f.container()).OLLAMA_API_KEY).toBe("synthetic-base-key");
+    expect(nativeEnv(f.container()).CUSTOM_PROFILE).toBeUndefined();
     f.envFile(".env", infrastructure);
-    f.run();
-    expect(nativeEnv(f.state()).OLLAMA_API_KEY).toBeUndefined();
-    expect(nativeEnv(f.state()).CUSTOM_EMPTY).toBeUndefined();
-    expect(nativeEnv(f.state()).CUSTOM_LITERAL).toBeUndefined();
+    f.apply();
+    expect(nativeEnv(f.container()).OLLAMA_API_KEY).toBeUndefined();
+    expect(nativeEnv(f.container()).CUSTOM_EMPTY).toBeUndefined();
+    expect(nativeEnv(f.container()).CUSTOM_LITERAL).toBeUndefined();
     expect(f.state().data).toBe("preserved-data");
 });
 
 test.each([{ HINDSIGHT_API_PORT: "0" }, { HINDSIGHT_API_PORT: "invalid" }, { HINDSIGHT_CP_PORT: "65536" }])("invalid container ports cannot be hidden by valid host overrides: %j", invalid => {
     const f = setup();
     f.envFile(".env", { ...infrastructure, ...invalid });
-    expect(f.run([{}], { HINDSIGHT_API_PORT: "18889", HINDSIGHT_UI_PORT: "19998" }).notifications.at(-1)?.level).toBe("error");
-    expect(f.state().container).toBeNull();
+    expect(f.apply({ HINDSIGHT_API_PORT: "18889", HINDSIGHT_UI_PORT: "19998" }).notifications.at(-1)?.level).toBe("error");
     expect(f.state().calls).toEqual([]);
 });
 
 test("selected native settings cannot borrow legacy provider or credentials", () => {
     const f = setup();
     f.envFile(".env", { ...infrastructure, ...profile, HINDSIGHT_API_LLM_PROVIDER: "anthropic", HINDSIGHT_API_LLM_BASE_URL: "https://legacy.invalid", OLLAMA_API_KEY: "synthetic-legacy-key" });
-    const result = f.run([{}], { HINDSIGHT_API_LLM_MODEL: "legacy-model", HINDSIGHT_API_LLM_API_KEY: "legacy-key", HINDSIGHT_API_PORT: "18889" });
-    expect(result.notifications.at(-1).level).toBe("info");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_PROVIDER).toBe("openai");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_MODEL).toBe("fixture-model");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_API_KEY).toBe("synthetic-profile-key");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_BASE_URL).toBeUndefined();
-    expect(nativeEnv(f.state()).HINDSIGHT_OMP_API_PORT).toBe("18889");
+    const result = f.apply({ HINDSIGHT_API_LLM_MODEL: "legacy-model", HINDSIGHT_API_LLM_API_KEY: "legacy-key", HINDSIGHT_API_PORT: "18889" });
+    expect(result.notifications.at(-1)?.level).toBe("info");
+    const applied = nativeEnv(f.container());
+    expect(applied.HINDSIGHT_API_LLM_PROVIDER).toBe("openai");
+    expect(applied.HINDSIGHT_API_LLM_MODEL).toBe("fixture-model");
+    expect(applied.HINDSIGHT_API_LLM_API_KEY).toBe("synthetic-profile-key");
+    expect(applied.HINDSIGHT_API_LLM_BASE_URL).toBeUndefined();
+    expect(f.container()!.portBindings["18888/tcp"][0].HostPort).toBe("18889");
 });
 
 test("base defaults and selected overrides combine, including unrelated native settings", () => {
     const f = setup();
     f.envFile(".env", { ...infrastructure, ...profile, HINDSIGHT_API_LLM_REASONING_EFFORT: "low", HINDSIGHT_API_EMBEDDINGS_MODEL: "base-embeddings", HINDSIGHT_API_LOG_LEVEL: "warning" });
     f.envFile("providers/primary.env", { HINDSIGHT_API_LLM_MODEL: "selected-model", HINDSIGHT_API_LOG_LEVEL: "debug", HINDSIGHT_API_PORT: "18890" });
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    const applied = nativeEnv(f.state());
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    const applied = nativeEnv(f.container());
     expect(applied.HINDSIGHT_API_LLM_PROVIDER).toBe("openai");
     expect(applied.HINDSIGHT_API_LLM_MODEL).toBe("selected-model");
     expect(applied.HINDSIGHT_API_LLM_API_KEY).toBe("synthetic-profile-key");
@@ -135,11 +113,11 @@ test("base defaults and selected overrides combine, including unrelated native s
     expect(applied.HINDSIGHT_API_LLM_REASONING_EFFORT).toBe("low");
     expect(applied.HINDSIGHT_API_EMBEDDINGS_MODEL).toBe("base-embeddings");
     expect(applied.HINDSIGHT_API_LOG_LEVEL).toBe("debug");
-    expect(applied.HINDSIGHT_OMP_API_PORT).toBe("18890");
+    expect(f.container()!.portBindings["18890/tcp"][0].HostPort).toBe("18890");
     f.envFile(".env", { ...infrastructure, ...profile });
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_EMBEDDINGS_MODEL).toBeUndefined();
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_REASONING_EFFORT).toBeUndefined();
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(nativeEnv(f.container()).HINDSIGHT_API_EMBEDDINGS_MODEL).toBeUndefined();
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_REASONING_EFFORT).toBeUndefined();
     expect(f.state().data).toBe("preserved-data");
 });
 
@@ -147,17 +125,17 @@ test("switching providers retains common defaults but cannot inherit the old mod
     const f = setup();
     f.envFile(".env", { ...infrastructure, ...profile, HINDSIGHT_API_LLM_BASE_URL: "https://legacy.invalid", HINDSIGHT_API_LLM_DEFAULT_HEADERS: '{"Authorization":"synthetic-old-header"}' });
     f.envFile("providers/primary.env", { HINDSIGHT_API_LLM_PROVIDER: "anthropic", HINDSIGHT_API_LLM_MODEL: "selected-model", HINDSIGHT_API_LLM_API_KEY: "synthetic-new-key" });
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_STRICT_SCHEMA).toBe("true");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_MAX_CONCURRENT).toBe("3");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_BASE_URL).toBeUndefined();
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_DEFAULT_HEADERS).toBeUndefined();
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_STRICT_SCHEMA).toBe("true");
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_MAX_CONCURRENT).toBe("3");
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_BASE_URL).toBeUndefined();
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_DEFAULT_HEADERS).toBeUndefined();
     f.envFile("providers/primary.env", { HINDSIGHT_API_LLM_PROVIDER: "anthropic", HINDSIGHT_API_LLM_MODEL: "selected-model" });
     const before = f.state();
-    expect(f.run().notifications.at(-1)?.level).toBe("error");
+    expect(f.apply().notifications.at(-1)?.level).toBe("error");
     expect(f.state()).toEqual(before);
     f.envFile("providers/primary.env", { HINDSIGHT_API_LLM_PROVIDER: "anthropic", HINDSIGHT_API_LLM_API_KEY: "synthetic-new-key" });
-    expect(f.run().notifications.at(-1)?.level).toBe("error");
+    expect(f.apply().notifications.at(-1)?.level).toBe("error");
     expect(f.state()).toEqual(before);
 });
 
@@ -165,29 +143,31 @@ test("changing service endpoint cannot send inherited credentials to the new ser
     const f = setup();
     f.envFile(".env", { ...infrastructure, ...profile, HINDSIGHT_API_LLM_BASE_URL: "https://old-service.invalid/v1", HINDSIGHT_API_LLM_DEFAULT_HEADERS: '{"Authorization":"synthetic-old-header"}' });
     f.envFile("providers/primary.env", { HINDSIGHT_API_LLM_BASE_URL: "https://new-service.invalid/v1", HINDSIGHT_API_LLM_MODEL: "selected-model" });
-    expect(f.run().notifications.at(-1)?.level).toBe("error");
+    expect(f.apply().notifications.at(-1)?.level).toBe("error");
     expect(f.state().calls).toEqual([]);
     f.envFile("providers/primary.env", { HINDSIGHT_API_LLM_BASE_URL: "https://new-service.invalid/v1", HINDSIGHT_API_LLM_MODEL: "selected-model", HINDSIGHT_API_LLM_API_KEY: "synthetic-new-key" });
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_API_KEY).toBe("synthetic-new-key");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_BASE_URL).toBe("https://new-service.invalid/v1");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_DEFAULT_HEADERS).toBeUndefined();
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_API_KEY).toBe("synthetic-new-key");
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_BASE_URL).toBe("https://new-service.invalid/v1");
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_DEFAULT_HEADERS).toBeUndefined();
 });
 
 test("a selected-profile read failure cannot silently apply base-only configuration", () => {
     const f = setup();
     f.envFile(".env", { ...infrastructure, ...profile });
+    f.apply();
+    f.envFile("providers/primary.env", { ...profile, HINDSIGHT_API_LLM_MODEL: "changed-model" });
+    const before = f.state().calls.length;
     const result = f.run([{ failProfileRead: true }]);
     expect(result.notifications.at(-1)?.level).toBe("error");
     expect(JSON.stringify(result)).not.toContain("synthetic-sensitive");
-    expect(f.state().calls).toEqual([]);
+    expect(f.state().calls).toHaveLength(before);
 });
 
 test.each(["../outside", "/tmp/outside", "missing", "", "bad/name"])("invalid selection %j leaves Docker untouched", name => {
     const f = setup(); f.select(name);
     f.envFile(".env", { ...infrastructure, ...profile, HINDSIGHT_API_LLM_BASE_URL: "https://legacy.invalid", OLLAMA_API_KEY: "synthetic-legacy-key" });
-    const result = f.run();
-    expect(result.notifications.at(-1).level).toBe("error");
+    expect(f.apply().notifications.at(-1)?.level).toBe("error");
     expect(f.state().calls).toEqual([]);
 });
 
@@ -197,20 +177,9 @@ test("escaping profile symlinks fail without Docker work", () => {
     fs.writeFileSync(path.join(f.root, "outside.env"), "HINDSIGHT_API_LLM_PROVIDER=openai");
     fs.symlinkSync("../outside.env", path.join(f.root, "providers/escape.env"));
     f.select("escape");
-    expect(f.run().notifications.at(-1).level).toBe("error");
+    expect(f.apply().notifications.at(-1)?.level).toBe("error");
     expect(f.state().calls).toEqual([]);
 });
-
-test("eligible startup makes one process-lifetime decision across reimports", () => {
-    const f = setup(); f.envFile("providers/other.env", { ...profile, HINDSIGHT_API_LLM_MODEL: "other-model" });
-    const result = f.run([{ kind: "subagent" }, { hasUI: false }, {}, { selection: "other" }]);
-    expect(result.notifications.at(-1)?.level).toBe("info");
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_MODEL).toBe("fixture-model");
-    expect(f.state().calls.filter((a: string[]) => a[0] === "version")).toHaveLength(1);
-    f.run();
-    expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_MODEL).toBe("other-model");
-});
-
 
 test.each([
     { HINDSIGHT_API_LLM_API_KEY: "" },
@@ -226,78 +195,48 @@ test.each([
     { HINDSIGHT_API_LLM_PROVIDER: "opencode-go", HINDSIGHT_API_LLM_MODEL: "opencode-go/deepseek-v4-flash", HINDSIGHT_API_LLM_BASE_URL: "https://opencode.ai/zen/go/v1" },
 ])("invalid native settings fail locally without secret disclosure: %j", invalid => {
     const f = setup(); f.envFile("providers/primary.env", { ...profile, ...invalid });
-    const result = f.run();
+    const result = f.apply();
     expect(result.notifications.at(-1)?.level).toBe("error");
     expect(JSON.stringify(result)).not.toContain("synthetic-sensitive");
     expect(JSON.stringify(result)).not.toContain("synthetic-profile-key");
     expect(f.state().calls).toEqual([]);
 });
 
-test("removed managed fields recreate; image-only environment does not", () => {
+test("adding, changing and removing reasoning effort is applied without deleting data", () => {
     const f = setup();
-    f.envFile("providers/primary.env", { ...profile, HINDSIGHT_API_LLM_BASE_URL: "https://compatible.invalid/v1", HINDSIGHT_API_LLM_DEFAULT_HEADERS: '{"X-Test":"old"}' });
-    f.run();
-    const old = f.state(); old.container!.env.push("IMAGE_ONLY=unrelated"); f.setState(old);
-    f.run();
-    expect(f.state().calls.filter(a => a[0] === "rm")).toEqual([]);
-    f.envFile("providers/primary.env", profile); f.run();
-    expect(f.state().calls.filter(a => a[0] === "rm")).toEqual([["rm", "-f", "fixture-hindsight"]]);
-    const applied = nativeEnv(f.state());
-    expect(applied.HINDSIGHT_API_LLM_BASE_URL).toBeUndefined();
-    expect(applied.HINDSIGHT_API_LLM_DEFAULT_HEADERS).toBeUndefined();
-    expect(f.state().container!.mounts).toEqual([{ Source: "fixture-data", Destination: "/home/hindsight/.pg0", RW: true }]);
-    expect(f.state().data).toBe("preserved-data");
-});
-
-test("adding, changing and removing reasoning effort reconciles the container without deleting data", () => {
-    const f = setup();
-    f.run();
-    for (const [index, effort] of ["low", "high", undefined].entries()) {
+    f.apply();
+    for (const effort of ["low", "high", undefined]) {
         f.envFile("providers/primary.env", effort === undefined ? profile : { ...profile, HINDSIGHT_API_LLM_REASONING_EFFORT: effort });
-        expect(f.run().notifications.at(-1)?.level).toBe("info");
-        expect(f.state().calls.filter(args => args[0] === "rm")).toHaveLength(index + 1);
-        expect(nativeEnv(f.state()).HINDSIGHT_API_LLM_REASONING_EFFORT).toBe(effort);
+        expect(f.apply().notifications.at(-1)?.level).toBe("info");
+        expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_REASONING_EFFORT).toBe(effort);
         expect(f.state().data).toBe("preserved-data");
     }
+    expect(f.state().calls.filter(call => call[0] === "run")).toHaveLength(4);
 });
 
-test("pull failure keeps existing policy and does not advance image stamp", () => {
-    const f = setup(); const state = f.state(); state.pullFails = true; f.setState(state);
-    expect(f.run().notifications.at(-1)?.level).toBe("info");
-    expect(fs.existsSync(path.join(f.root, ".last-image-check"))).toBe(false);
-    state.pullFails = false; state.container = f.state().container; f.setState(state);
-    f.run();
-    const stamp = fs.readFileSync(path.join(f.root, ".last-image-check"), "utf8");
-    f.run();
-    expect(fs.readFileSync(path.join(f.root, ".last-image-check"), "utf8")).toBe(stamp);
-    expect(f.state().calls.filter(a => a[0] === "pull")).toHaveLength(1);
-});
-
-test("missing selection is not retried on same-process reload", () => {
-    const f = setup(); fs.unlinkSync(path.join(f.root, ".selected-provider"));
+test("missing selection at startup is reported once and not retried on same-process reload", () => {
+    const f = setup(); f.apply();
+    const state = f.state(); state.containers["fixture-hindsight"].running = false; f.setState(state);
+    fs.unlinkSync(path.join(f.root, ".selected-provider"));
+    const before = f.state().calls.length;
     const result = f.run([{}, { selection: "primary" }]);
     expect(result.notifications.map(n => n.level)).toEqual(["error"]);
-    expect(f.state().calls).toEqual([]);
+    expect(f.state().calls).toHaveLength(before);
     expect(f.run().notifications.at(-1)?.level).toBe("info");
-});
-
-test("subagents and noninteractive sessions do not resolve configuration or invoke Docker", () => {
-    const f = setup(); fs.unlinkSync(path.join(f.root, ".selected-provider"));
-    expect(f.run([{ kind: "subagent" }, { hasUI: false }]).notifications).toEqual([]);
-    expect(f.state().calls).toEqual([]);
+    expect(f.container()!.running).toBe(true);
 });
 
 test.each(["\n", "\r"])("line break %j cannot inject container variables or replace the existing container", separator => {
     const f = setup();
-    f.run();
+    f.apply();
     const before = f.state();
-    expect(f.run([{}], { HINDSIGHT_WORKER_ID: "worker" + separator + "INJECTED=unexpected" }).notifications.at(-1)?.level).toBe("error");
+    expect(f.apply({ HINDSIGHT_WORKER_ID: "worker" + separator + "INJECTED=unexpected" }).notifications.at(-1)?.level).toBe("error");
     expect(f.state()).toEqual(before);
 });
 
-test.each(["create", "recreate"])("Docker %s receives credentials without exposing them in arguments", operation => {
+test.each(["create", "replace"])("Docker %s receives credentials without exposing them in arguments", operation => {
     const f = setup();
-    if (operation === "recreate") f.run();
+    if (operation === "replace") f.apply();
     const secrets = {
         HINDSIGHT_API_LLM_API_KEY: "synthetic-key=with spaces $HOME",
         HINDSIGHT_API_LLM_DEFAULT_HEADERS: '{"Authorization":"Bearer synthetic-header"}',
@@ -306,9 +245,10 @@ test.each(["create", "recreate"])("Docker %s receives credentials without exposi
     const containerControls = { PATH: "/container-only/bin", DOCKER_HOST: "unix:///container.sock", DOCKER_CONTEXT: "container-context", DOCKER_CONFIG: "/container/.docker" };
     const hostControls = { DOCKER_HOST: "unix:///host.sock", DOCKER_CONTEXT: "host-context", DOCKER_CONFIG: "/host/.docker" };
     f.envFile("providers/primary.env", { ...profile, ...secrets, ...containerControls, CUSTOM_EMPTY: "", CUSTOM_LITERAL: "a=b $HOME" });
-    expect(f.run([{}], { ...hostControls, HINDSIGHT_API_LLM_API_KEY: "synthetic-ambient-key", UNRELATED_HOST_SECRET: "synthetic-unrelated-secret" }).notifications.at(-1)?.level).toBe("info");
+    const result = f.apply({ ...hostControls, HINDSIGHT_API_LLM_API_KEY: "synthetic-ambient-key", UNRELATED_HOST_SECRET: "synthetic-unrelated-secret" });
+    expect(result.notifications.at(-1)?.level).toBe("info");
     const state = f.state();
-    const applied = nativeEnv(state);
+    const applied = nativeEnv(f.container());
     for (const [key, value] of Object.entries(secrets)) expect(applied[key]).toBe(value);
     for (const [key, value] of Object.entries(containerControls)) expect(applied[key]).toBe(value);
     expect(state.runEnvironment).toEqual({ ...hostControls, PATH: path.join(f.root, "bin") + ":" + process.env.PATH });
@@ -317,15 +257,23 @@ test.each(["create", "recreate"])("Docker %s receives credentials without exposi
     expect(applied.CUSTOM_EMPTY).toBe("");
     expect(applied.CUSTOM_LITERAL).toBe("a=b $HOME");
     expect(applied.UNRELATED_HOST_SECRET).toBeUndefined();
-    const argumentsText = state.calls.filter(call => call[0] === "run").at(-1)!.join("\0");
-    for (const value of Object.values(secrets)) expect(argumentsText).not.toContain(value);
+    const visible = JSON.stringify([state.calls, result, f.management()]);
+    for (const value of Object.values(secrets)) expect(visible).not.toContain(value);
 });
 
-test("transport failure cannot echo profile credentials to logs or UI", () => {
+test("transport failure cannot echo profile credentials to logs, UI or management state", () => {
     const f = setup(); const state = f.state(); state.runFails = true; f.setState(state);
-    const result = f.run();
+    const result = f.apply();
     expect(result.notifications.at(-1)?.level).toBe("error");
     expect(JSON.stringify(result)).not.toContain("synthetic-profile-key");
+    expect(JSON.stringify(f.management())).not.toContain("synthetic-profile-key");
     expect(fs.readFileSync(path.join(f.root, "hindsight.log"), "utf8")).not.toContain("synthetic-profile-key");
     expect(fs.existsSync(path.dirname(f.state().envFile!.path))).toBe(false);
+});
+
+test("the menu Apply action in Off mode does no Docker work", () => {
+    const f = setup();
+    const result = f.run([{ startup: false, command: true, choices: [menu.apply], confirm: true }]);
+    expect(result.notifications.at(-1)?.level).toBe("warning");
+    expect(f.state().calls).toEqual([]);
 });

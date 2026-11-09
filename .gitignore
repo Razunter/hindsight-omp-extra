@@ -2,6 +2,7 @@
 .env
 hindsight.log
 .last-image-check
+.local-management.*
 .tmp/
 providers/
 .selected-provider

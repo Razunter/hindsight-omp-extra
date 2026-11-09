@@ -2,7 +2,9 @@
 
 [Back to the README](../README.md) · [Full configuration reference](configuration.md)
 
-Requires a writable installation directory, [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support, [Bun](https://bun.sh/), Git on `PATH`, Docker, and a Hindsight-compatible AI credential and model. Commands use a POSIX shell and run from the extension root unless stated otherwise.
+Requires a writable installation directory, [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support, [Bun](https://bun.sh/), Git on `PATH`, and a Hindsight-compatible AI credential and model. Local Docker management additionally needs Docker. Commands use a POSIX shell and run from the extension root unless stated otherwise.
+
+Evidence access and recall guidance work with any Hindsight server OMP is connected to. To use an existing server without local management, install the extension, skip steps 2 and 4, and configure OMP's native Hindsight connection in step 3. Local management stays Off until you choose CPU in `/hindsight`.
 
 OMP supplies the extension's runtime imports; no separate dependency installation or build is needed to load its source.
 
@@ -16,7 +18,7 @@ docker version
 
 Docker must report an accessible server, not just a client version. OMP 18.16.0 and Bun 1.4.4 have been exercised; no minimum-version or cross-platform compatibility matrix has been established.
 
-The launcher manages one shared container across projects. If you already run Hindsight, inspect its container and volume names first. Targeting an existing container authorizes reconciliation, including replacement when settings differ. Keep its volume name to preserve the database. To connect OMP to an existing server without this launcher, use OMP’s native Hindsight configuration.
+Local management controls one shared container across projects. If you already run Hindsight, inspect its container and volume names first. Applying CPU management to an existing container with the configured name replaces it after your confirmation. Keep its volume name to preserve the database.
 
 ## Install from Git
 
@@ -43,7 +45,7 @@ The **extension root** is the installed package or clone, containing `package.js
 
 For a clone in a named profile or custom agent directory, use that extensions directory instead. [Configure the package directory](#load-persistently) so OMP also discovers the bundled skill.
 
-The launcher stores `.env`, `providers/`, `.selected-provider`, optional `credentials/`, and logs in the extension root. These files are Git-ignored in a clone. Keep the directory writable and back up local files before reinstalling, upgrading, replacing, or removing the package. Keep the same Docker volume name when restoring configuration.
+The launcher stores `.env`, `providers/`, `.selected-provider`, `.local-management.json`, optional `credentials/`, and logs in the extension root. These files are Git-ignored in a clone. Keep the directory writable and back up local files before reinstalling, upgrading, replacing, or removing the package. Keep the same Docker volume name when restoring configuration.
 
 ## 2. Create local configuration
 
@@ -68,7 +70,13 @@ Edit these files before launching:
 - **`.env`:** choose the Docker container, named volume, image, worker settings, and API/dashboard ports. The example uses `hindsight-omp`, `hindsight-omp-data`, and ports `8888`/`9999`; change them if occupied. Both published ports bind to `127.0.0.1` by default. [Changing the bind address](configuration.md#network-binding) is explicit.
 - **`providers/primary.env`:** replace the model and API-key placeholders with values authorized for Hindsight. Never copy OMP tokens or put shell variable references in this file: values are literal, not interpolated. For another provider, use the appropriate [provider template](configuration.md#copy-a-complete-example) instead.
 
-The image example follows Hindsight’s [official Docker installation](https://hindsight.vectorize.io/developer/installation) and uses the rolling `latest` tag. For reproducible deployments, choose a tag or digest verified with your provider. The launcher checks for updates at most daily on fresh startup; a newly pulled image can replace the container. Back up the database before upgrading. A named volume is not a backup.
+The image example follows Hindsight’s [official Docker installation](https://hindsight.vectorize.io/developer/installation) and uses the rolling `latest` tag. For reproducible deployments, choose a tag or digest verified with your provider. Local management uses only an image already in Docker’s local cache and never downloads one, so pull it yourself before opting in:
+
+```sh
+docker pull ghcr.io/vectorize-io/hindsight:latest
+```
+
+Approval binds the cached image ID shown in the confirmation; a tag that moves later is not followed. A different Hindsight version may migrate the reused database, and replacing the image does not roll the database back. A named volume is not a backup.
 
 Include only values intended for Hindsight. The validated merged configuration is forwarded to the container, including credentials and variables without a `HINDSIGHT_` prefix. Your AI provider may receive content for memory processing; self-hosting the database does not make remote inference offline.
 
@@ -83,7 +91,7 @@ For a fresh setup, save the profile name without launching OMP first:
 )
 ```
 
-This refuses to overwrite an existing selection. For later switches, use `/hindsight-provider` in interactive OMP. It lists names, not credentials, and saves the choice for the next fresh process.
+This refuses to overwrite an existing selection. For later switches, use `/hindsight` and choose **Provider configuration** in interactive OMP. It lists names, not credentials. With CPU management on, it then offers to apply the new configuration.
 
 ## 3. Enable OMP’s native Hindsight backend
 
@@ -112,9 +120,9 @@ Match `apiUrl` to the host API address and port you configured. OMP’s `HINDSIG
 
 The extension does not enable this backend or edit OMP settings. Native OMP owns recall, retention, project scoping, and Auto-Learn. The `per-project` example separates banks by project identity; it is not a server authorization boundary, and projects with the same normalized basename can share a bank.
 
-## 4. Launch and verify
+## 4. Opt in and verify
 
-Start a fresh interactive OMP process from the project whose memories you want to use:
+Start an interactive OMP process from the project whose memories you want to use:
 
 ```sh
 omp
@@ -122,23 +130,17 @@ omp
 
 For a clone not yet [loaded persistently](#load-persistently), use `omp -e /absolute/path/to/hindsight-omp-extra` instead. Pass the package directory so the ingestion skill loads too.
 
-The extension downloads the configured Hindsight Docker image if it is not already cached, then creates and starts the container. **The first launch can be slow** while the image downloads and Hindsight initializes. Docker setup runs in the background, so OMP stays usable while you wait.
+Run `/hindsight`, choose **Mode**, then **CPU**. The extension validates the selected provider configuration, finds the cached image and shows one confirmation with the provider configuration, image ID, data volume and whether an existing container is replaced. Declining changes nothing; CPU stays requested and **Status** shows it as pending.
 
-With the example ports, successful container reconciliation reports:
+After you confirm, the cutover runs in the background, so OMP stays usable. An existing container keeps running until cutover, is stopped gracefully (up to 75 seconds) and set aside, and the new container starts on the same volume. Success is reported only after Hindsight’s `/health` endpoint reports a healthy API and a connected database. With the example ports:
 
 ```text
-Hindsight: container ready (API :8888, UI :9999)
+Hindsight: CPU runtime ready (API :8888, UI :9999)
 ```
 
-That notification establishes container startup, not API readiness or provider authentication. In another terminal, check the API once it has initialized (requires `curl`):
+That notification does not prove provider authentication; provider rejection or model incompatibility can still appear in the container’s Docker logs. The [Hindsight dashboard](http://127.0.0.1:9999) uses the example UI port. For errors, run `/hindsight` → **Status** and inspect `hindsight.log` in the extension root.
 
-```sh
-curl --fail http://127.0.0.1:8888/health
-```
-
-The [Hindsight dashboard](http://127.0.0.1:9999) uses the example UI port. For errors, inspect `hindsight.log` in the extension root and the managed container’s Docker logs. Provider rejection, model incompatibility, or incomplete initialization can occur after the launcher reports container readiness.
-
-The launcher starts only from an interactive main session. Headless OMP processes and subagents can use the evidence tool but do not start or reconcile Docker. Keep the server running before using those modes.
+Only interactive main sessions manage the container. Headless OMP processes and subagents can use the evidence tool but never start or change Docker. Keep the server running before using those modes.
 
 For an ingestion trial from the extension directory, follow [source ingestion](ingestion.md) and run:
 
@@ -163,11 +165,21 @@ Restart OMP after deployment. Extension package settings arrays replace rather t
 
 ## Apply configuration changes
 
-Editing `.env`, a provider profile, or `.selected-provider` does not restart the container. The next fresh interactive main OMP launch reads them and recreates the container if managed settings changed, reusing the named data volume. `/new` and `/reload` neither apply a changed selection nor retry failed startup.
+Editing `.env`, a provider profile, or `.selected-provider` does not restart the container. With CPU management on, the change is pending: run `/hindsight` → **Apply requested configuration**, check the confirmation and approve it. The replacement reuses the named data volume and applies in the current OMP process. Startup never applies a pending change: it can start the stopped approved container, but does not recreate a missing one, and reports what needs applying.
 
-The same fresh-process rule applies to `HINDSIGHT_BIND_ADDRESS`: older all-interface bindings are corrected on the next launch. Until that reconciliation has run, an already-running container retains its old bindings.
+The same rule applies to `HINDSIGHT_BIND_ADDRESS`: an already-running container keeps its old bindings until you apply the change.
 
 Recall-footer and nudge settings are different: they are ordinary live OMP settings, documented in [recall guidance](recall.md).
+
+## Upgrade from an earlier version
+
+Earlier versions managed Docker automatically. Local management is now Off for existing installations too. On the first interactive start after upgrading, OMP shows one notice; nothing is stopped, deleted or rewritten, and your container, database, provider files, saved selection and credentials stay as they are. Evidence keeps using OMP’s native connection.
+
+To keep using local management, run `/hindsight` → **Mode** → **CPU** and confirm. The first approval adopts the existing container with the configured name: it is stopped gracefully and replaced by a labelled container on the same volume. Automatic image pulls and the `.last-image-check` file are no longer used; you can delete that file. The old `/hindsight-provider` command is replaced by `/hindsight` → **Provider configuration**.
+
+## Local management Off
+
+Choosing **Mode** → **Off** takes effect immediately for every OMP process of this installation. It does not stop the container or delete images, volumes, provider files or credentials. Later startups do no Docker work, and **Status** reports only stored state.
 
 ## Stop the container
 
@@ -177,7 +189,7 @@ The container does not stop itself when OMP exits. With the example container na
 docker stop hindsight-omp
 ```
 
-Use your configured `HINDSIGHT_CONTAINER_NAME` if different. This stops the container without deleting its named data volume. The next eligible fresh OMP launch can start it again. The container uses Docker’s `unless-stopped` restart policy; closing OMP is not an instruction to stop Docker.
+Use your configured `HINDSIGHT_CONTAINER_NAME` if different. This stops the container without deleting its named data volume. With CPU management on, the next fresh interactive OMP launch starts the approved container again; choose **Off** in `/hindsight` first to keep it stopped. The container uses Docker’s `unless-stopped` restart policy; closing OMP is not an instruction to stop Docker.
 
 ## Development checks
 

@@ -1,10 +1,10 @@
 # hindsight-omp-extra
 
-An [OMP](https://github.com/can1357/oh-my-pi) extension for running [Hindsight](https://hindsight.vectorize.io/) in Docker and inspecting the sources behind recalled knowledge.
+An [OMP](https://github.com/can1357/oh-my-pi) extension for inspecting the sources behind recalled [Hindsight](https://hindsight.vectorize.io/) knowledge and, optionally, running Hindsight in Docker.
 
-OMP already provides Hindsight memory tools and automatic recall and retention. This extension adds container startup, named provider configurations, `hindsight_evidence` for searching and reading supporting sources and knowledge pages, recall guidance, and a skill for importing files and URLs.
+OMP already provides Hindsight memory tools and automatic recall and retention. This extension adds `hindsight_evidence` for searching and reading supporting sources and knowledge pages, recall guidance, a skill for importing files and URLs, and opt-in local Docker management with named provider configurations.
 
-Use it when you want OMP to manage a self-hosted Hindsight instance or need to inspect what supports a recalled claim. You do not need it just to connect OMP to an existing Hindsight server.
+Use it when you need to inspect what supports a recalled claim, or when you want OMP to manage a self-hosted Hindsight container. Evidence works with any Hindsight server OMP is connected to; local management is Off until you choose it.
 
 **Status:** vibe-coded experiment. **Licence:** [MIT](LICENSE).
 
@@ -12,7 +12,7 @@ Use it when you want OMP to manage a self-hosted Hindsight instance or need to i
 
 - [OMP](https://github.com/can1357/oh-my-pi) with native Hindsight support.
 - Git on `PATH`.
-- Docker running and accessible.
+- Docker running and accessible, only if you opt in to local management.
 - A Hindsight-compatible model and its own AI API credentials. Memory processing can incur model-provider charges.
 - A writable installation directory for local configuration, provider selection, and logs.
 
@@ -30,7 +30,7 @@ Follow [first-run setup](docs/setup.md) to configure the installed package, sele
 omp
 ```
 
-Installation loads the launcher and bundled skill automatically. Startup runs in the background; memory may be unavailable until Hindsight is ready. [Checkout loading](docs/setup.md#load-persistently) remains an alternative.
+Installation loads the extension and bundled skill automatically. Local Docker management stays Off, including for existing installations, until you choose CPU in `/hindsight`. [Checkout loading](docs/setup.md#load-persistently) remains an alternative.
 
 ## Use it
 
@@ -56,14 +56,14 @@ The skill uses a scout to distill useful knowledge and queues it through OMP’s
 ## Defaults and limits
 
 - **Local ports:** the launcher binds the API and dashboard to `127.0.0.1`. [`HINDSIGHT_BIND_ADDRESS`](docs/configuration.md#network-binding) overrides both.
-- **Interactive startup only:** the launcher reconciles Docker once per fresh interactive main OMP process. Headless sessions and subagents need an already-running server. The container keeps running after OMP exits; [stop it explicitly](docs/setup.md#stop-the-container) when you no longer need it.
-- **Configuration changes wait for launch:** edits to `.env` or the selected provider profile take effect on the next fresh OMP launch. Changed managed settings cause container recreation with the same named data volume. Provider switches also require a fresh process; `/new` and `/reload` do not apply these changes.
+- **Opt-in management:** `/hindsight` shows status, switches local management between Off and CPU, selects the provider configuration and applies changes after one confirmation, in the current OMP process. Off never stops or changes a running container. Existing installations get a one-time notice instead of being opted in.
+- **Approved runtime only:** with CPU management on, a fresh interactive main OMP process starts the last approved container or recreates it from the approved cached image. Edited `.env` or profile files are reported as pending, never applied at startup. Nothing is downloaded automatically. Headless sessions and subagents never manage Docker. The container keeps running after OMP exits; [stop it explicitly](docs/setup.md#stop-the-container) when you no longer need it.
 - **Advisory recall:** the retrieval footer is on; mid-run nudges are off. Neither forces a lookup, and improved task results from nudges have not been demonstrated.
 
 ## Documentation
 
-- [Setup](docs/setup.md) covers first run, persistent loading, and stopping the container.
-- [Configuration](docs/configuration.md) covers provider profiles, bind address, credentials, and image management.
+- [Setup](docs/setup.md) covers first run, opting in to local management, upgrading, persistent loading, and stopping the container.
+- [Configuration](docs/configuration.md) covers provider profiles, bind address, credentials, and the local management lifecycle.
 - [Evidence access](docs/evidence.md) covers source/page actions, limits, and expandable snapshots.
 - [Recall guidance](docs/recall.md) covers the footer, lesson guidance, and optional nudges.
 - [Source ingestion](docs/ingestion.md) covers files, directories, URLs, and wiki content.
