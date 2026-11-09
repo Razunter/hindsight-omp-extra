@@ -138,6 +138,51 @@ test.each([
     expect(f.management()).toMatchObject({ ...management, active, failure: { stage: "validate" }, owned: [{ imageId: update.imageId, kind: "download" }] });
 });
 
+test("Off chosen while the download confirmation is open downloads nothing", () => {
+    const { f, running, active } = updateAvailable();
+    const before = cutover(f);
+    expect(approve(f, { afterConfirm: { mode: "off" } }).notifications.at(-1)?.level).toBe("warning");
+    expect(calls(f, "pull")).toEqual([]);
+    expect(cutover(f)).toBe(before);
+    expect(f.container()).toEqual(running);
+    expect(f.state().images[update.imageId]).toBeUndefined();
+    expect(f.management()).toMatchObject({ mode: "off", active, failure: { stage: "validate" } });
+});
+
+test.each([
+    ["while the confirmation is open", "confirm"],
+    ["during the download", "pull"],
+])("an update another process completes %s voids this approval", (_name, when) => {
+    const { f, running, active } = updateAvailable();
+    const competing = { ...active, imageId: "sha256:" + "9".repeat(64), appliedAt: "2026-11-09T12:00:00.000Z" };
+    if (when === "pull") { const state = f.state(); state.mutate = { when, management: { active: competing } }; f.setState(state); }
+    const before = cutover(f);
+    const result = approve(f, when === "confirm" ? { afterConfirm: { active: competing } } : {});
+    expect(result.notifications.at(-1)?.level).toBe("warning");
+    expect(result.notifications.at(-1)?.message).toContain("another process applied a runtime");
+    expect(calls(f, "pull")).toHaveLength(when === "pull" ? 1 : 0);
+    expect(cutover(f)).toBe(before);
+    expect(f.container()).toEqual(running);
+    expect(f.management()).toMatchObject({ active: competing, failure: { stage: "validate" } });
+});
+
+test("an update image already cached without its digest is never owned, so a later cleanup keeps it", () => {
+    const { f, active } = updateAvailable();
+    const state = f.state(); state.images[update.imageId] = { tags: [] }; state.health = "unhealthy"; f.setState(state);
+    expect(approve(f, {}, { HINDSIGHT_OMP_READINESS_TIMEOUT_SECONDS: "1" }).notifications.at(-1)?.level).toBe("error");
+    expect(f.state().images[update.imageId].digests).toEqual([update.pull]);
+    expect(f.management()!.owned).toBeUndefined();
+
+    // The owner discards the preserved previous container and reapplies the approved runtime: a healthy cutover, which runs cleanup.
+    const healthy = f.state(); delete healthy.health;
+    for (const name of Object.keys(healthy.containers)) if (name.startsWith("fixture-hindsight-previous-")) delete healthy.containers[name];
+    f.setState(healthy);
+    expect(approve(f, applyRequested).notifications.at(-1)?.level).toBe("info");
+    expect(f.management()!.active.imageId).toBe(active.imageId);
+    expect(f.state().images[update.imageId]).toBeDefined();
+    expect(calls(f, "image").filter(call => call[1] === "rm")).toEqual([]);
+});
+
 test("a failing download keeps the service and approved runtime and exposes no registry output", () => {
     const { f, running, active } = updateAvailable();
     const before = cutover(f);

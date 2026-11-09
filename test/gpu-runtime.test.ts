@@ -69,6 +69,10 @@ test("choosing GPU builds a CUDA derivative of the approved base and cuts over o
     const order = f.state().calls.slice(before).map(call => call.slice(0, 2).join(" "));
     expect(order.indexOf("build --build-arg")).toBeLessThan(order.indexOf("run --rm"));
     expect(order.indexOf("run --rm")).toBeLessThan(order.indexOf("stop --time"));
+    const probe = f.state().calls.find(call => call[0] === "run" && call[1] === "--rm")!;
+    expect(probe).toContain("--env-file");
+    expect(probe.filter(arg => arg === "-v" || arg === "-p")).toEqual([]);
+    expect(probe.slice(-2)).toEqual(["embeddings", "reranker"]);
     expect(f.state().buildContext).toEqual({ files: ["Dockerfile"], buildArgs: ["BASE=" + base] });
     expect(JSON.stringify(f.state().calls)).not.toContain(profile.HINDSIGHT_API_LLM_API_KEY);
     expect(status(f)).toContain(active.imageId.slice(7, 19));
@@ -119,6 +123,7 @@ test("an approved update rebuilds the CUDA image from the new upstream base", ()
 test.each([
     ["a CPU-only Docker host", {}],
     ["a GPU host whose image cannot use CUDA", { gpu: "no-cuda" as const }],
+    ["a GPU host whose models fail inference, such as a missing Triton compiler", { gpu: "cuda" as const, inferenceFails: ["validation" as const] }],
 ])("%s fails GPU validation before cutover and never falls back to CPU", (_name, patch) => {
     const f = setup(); f.apply();
     const running = f.container(); const active = f.management()!.active;
@@ -174,6 +179,10 @@ test("a GPU-only local reranker is verified alone, and the owner's provider sett
     expect(chooseGpu(f).notifications.at(-1)?.level).toBe("info");
     expect(nativeEnv(f.container()).HINDSIGHT_API_EMBEDDINGS_PROVIDER).toBe("openai");
     expect(f.container()).toMatchObject({ gpus: true, running: true });
+    const check = calls(f, "exec").at(-1)!;
+    expect(check.slice(0, 2)).toEqual(["exec", "fixture-hindsight"]);
+    expect(check.slice(-1)).toEqual(["reranker"]);
+    expect(JSON.stringify(calls(f, "exec"))).not.toContain(profile.HINDSIGHT_API_LLM_API_KEY);
 });
 
 test("a container without the approved GPU request is not adopted on startup", () => {
@@ -185,10 +194,14 @@ test("a container without the approved GPU request is not adopted on startup", (
     expect(f.container()!.running).toBe(false);
 });
 
-test("a visible GPU with models still on CPU fails readiness and preserves the previous container", () => {
-    const { f, active } = cpuOnGpuHost({ modelDevice: "cpu" });
+test.each([
+    ["models still on CPU", { modelDevice: "cpu" }, "ran on cpu, not CUDA"],
+    ["models that initialized on CUDA but fail inference", { inferenceFails: ["service" as const] }, "failed a CUDA inference check"],
+])("a visible GPU with %s fails readiness and preserves the previous container", (_name, patch, reason) => {
+    const { f, active } = cpuOnGpuHost(patch);
     const result = chooseGpu(f, {}, { HINDSIGHT_OMP_READINESS_TIMEOUT_SECONDS: "1" });
     expect(result.notifications.at(-1)?.level).toBe("error");
+    expect(result.notifications.at(-1)?.message).toContain(reason);
     const containers = f.state().containers;
     const previous = Object.keys(containers).find(name => name.startsWith("fixture-hindsight-previous-"))!;
     expect(result.notifications.at(-1)?.message).toContain(previous);
@@ -209,6 +222,16 @@ test("declining a GPU build builds and restarts nothing and keeps GPU visibly re
     expect(f.container()).toEqual(running);
     expect(f.management()).toMatchObject({ mode: "gpu", active });
     expect(f.run().notifications.at(-1)?.level).toBe("warning");
+});
+
+test("Off chosen while the build confirmation is open builds nothing", () => {
+    const { f, running, active } = cpuOnGpuHost();
+    const result = chooseGpu(f, { afterConfirm: { mode: "off" } });
+    expect(result.notifications.at(-1)?.level).toBe("warning");
+    expect(calls(f, "build")).toEqual([]);
+    expect(validations(f)).toBe(0);
+    expect(f.container()).toEqual(running);
+    expect(f.management()).toMatchObject({ mode: "off", active, failure: { stage: "validate" } });
 });
 
 test.each([

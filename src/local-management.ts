@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { BASE_LABEL, CONFIG_LABEL, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, cudaUsable, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, type ContainerInfo, type ImageInfo } from "./docker";
-import { initialState, liveOperation, readState, releaseLease, takeLease, updateState, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
+import { BASE_LABEL, CONFIG_LABEL, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, candidateModelDevices, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, serviceModelDevices, type ContainerInfo, type ImageInfo } from "./docker";
+import { initialState, liveOperation, readState, releaseLease, takeLease, updateState, type ApprovedRuntime, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 
 // Reload replaces modules, not this process-lifetime startup decision.
@@ -12,7 +12,7 @@ const startupRoots = processState[startupKey] ??= new Set<string>();
 const MENU = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration", update: "Apply available update", check: "Check for updates" } as const;
 const MODE_NAME: Record<ManagementMode, string> = { off: "Off", cpu: "CPU", gpu: "GPU" };
 const CUDA_REPOSITORY = "hindsight-omp-cuda";
-/** Hindsight's local model kinds, as named in its startup log and in its `HINDSIGHT_API_<KEY>_*` settings. */
+/** Hindsight's local model kinds: display name and the `<KEY>` of their `HINDSIGHT_API_<KEY>_*` settings. */
 const LOCAL_MODELS = [["Embeddings", "EMBEDDINGS"], ["Reranker", "RERANKER"]] as const;
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const PULL_TIMEOUT_MS = 60 * 60 * 1000;
@@ -74,6 +74,18 @@ function localModels(settings: HindsightSettings): (typeof LOCAL_MODELS)[number]
         !/^(true|1|yes)$/i.test(settings.env[`HINDSIGHT_API_${key}_LOCAL_FORCE_CPU`] ?? ""));
 }
 
+/** Undefined when the probe ran every local model on CUDA; otherwise what failed. */
+function notOnCuda(models: (typeof LOCAL_MODELS)[number][], devices: Record<string, unknown> | undefined): string | undefined {
+    if (!devices) return "its local models failed a CUDA inference check";
+    for (const [model, key] of models) {
+        const ran = devices[key.toLowerCase()];
+        if (Array.isArray(ran) && ran.length > 0 && ran.every(device => device === "cuda")) continue;
+        const where = Array.isArray(ran) && ran.length > 0 ? ran.map(device => typeof device === "string" ? device : "an undetermined device").join(", ") : "an undetermined device";
+        return `its local ${model.toLowerCase()} model ran on ${where}, not CUDA`;
+    }
+    return undefined;
+}
+
 function builtFor(image: ImageInfo, installationId: string, base: string): boolean {
     return image.labels[INSTALLATION_LABEL] === installationId && image.labels[DERIVATIVE_LABEL] === "cuda" && image.labels[BASE_LABEL] === base;
 }
@@ -94,6 +106,10 @@ async function removeSupersededImages(previousImage: string | undefined): Promis
         const state = readState();
         const active = state?.active;
         if (!active) break;
+        if (state.mode === "off") {
+            problems.push("superseded images were kept because local management was turned Off");
+            break;
+        }
         const operation = liveOperation(state);
         const entry = state.owned?.find(owned => owned.imageId === id);
         if (id === active.imageId || id === operation?.candidateImageId || (entry && active.upstream.digests.includes(digestOf(entry.base)))) continue;
@@ -248,8 +264,8 @@ async function recover(settings: HindsightSettings): Promise<Outcome> {
 }
 
 /**
- * Undefined once the API and database are healthy and, in GPU mode, every applicable local model logged that it
- * initialized on CUDA; otherwise what failed. A model on another device fails at once; a missing log line is awaited.
+ * Undefined once the API and database are healthy and, in GPU mode, every applicable local model ran one inference on
+ * CUDA inside the container; otherwise what failed. The inference check runs once, after the API is healthy.
  */
 async function readinessProblem(settings: HindsightSettings): Promise<string | undefined> {
     const host = settings.bindAddress === "0.0.0.0" ? "127.0.0.1" : settings.bindAddress === "::" ? "::1" : settings.bindAddress;
@@ -257,7 +273,6 @@ async function readinessProblem(settings: HindsightSettings): Promise<string | u
     const seconds = Number(Bun.env.HINDSIGHT_OMP_READINESS_TIMEOUT_SECONDS);
     const deadline = Date.now() + (Number.isFinite(seconds) && seconds > 0 ? seconds : 300) * 1000;
     const models = settings.gpu ? localModels(settings) : [];
-    let problem = "did not report a healthy API and database";
     for (;;) {
         let healthy = false;
         try {
@@ -268,15 +283,10 @@ async function readinessProblem(settings: HindsightSettings): Promise<string | u
         }
         if (healthy) {
             if (models.length === 0) return undefined;
-            const logs = await docker(["logs", settings.containerName], 30_000);
-            const output = logs.exitCode === 0 ? logs.stdout + logs.stderr : "";
-            const devices = models.map(([model]) => [model, [...output.matchAll(new RegExp(`${model}: local provider initialized \\([^)]*device: (\\w+)`, "g"))].at(-1)?.[1]] as const);
-            if (devices.every(([, device]) => device === "cuda")) return undefined;
-            const elsewhere = devices.find(([, device]) => device !== undefined && device !== "cuda");
-            if (elsewhere) return `reported a healthy API and database, but its local ${elsewhere[0].toLowerCase()} model runs on ${elsewhere[1]}, not CUDA`;
-            problem = "reported a healthy API and database, but its local models never reported a CUDA device";
+            const problem = notOnCuda(models, await serviceModelDevices(settings.containerName, models.map(([, key]) => key.toLowerCase())));
+            return problem && `reported a healthy API and database, but ${problem}`;
         }
-        if (!(await inspectContainer(settings.containerName))?.running || Date.now() >= deadline) return problem;
+        if (!(await inspectContainer(settings.containerName))?.running || Date.now() >= deadline) return "did not report a healthy API and database";
         await Bun.sleep(500);
     }
 }
@@ -414,7 +424,17 @@ async function apply(ui: UI, update: boolean): Promise<void> {
     const mode = MODE_NAME[state.mode];
     const verb = { cached: "Apply", download: "Download and apply", build: "Build and apply" }[target.kind];
     if (!await ui.confirm(`${verb} the Hindsight ${mode} runtime?`, describePlan(state, settings, target, container))) return;
-    const lease = await takeLease("apply", target.kind === "cached" ? target.imageId : undefined);
+    // Under the lease's lock: a choice made while the confirmation was open (Off, another mode or configuration, or a runtime
+    // another process applied) voids the approval before anything is downloaded or built.
+    const current = resolveSettings(gpu).settings;
+    let changed: string | undefined;
+    const lease = await takeLease("apply", target.kind === "cached" ? target.imageId : undefined, latest => !(changed = approvalChanged(latest, settings, current, state.active)));
+    if (changed) {
+        const message = abandoned(changed);
+        await recordFailure(settings, "validate", message);
+        ui.notify(message, "warning");
+        return;
+    }
     if (!lease) {
         ui.notify("Hindsight: another OMP process is changing the local runtime; nothing was applied. Try again when it finishes.", "warning");
         return;
@@ -424,7 +444,25 @@ async function apply(ui: UI, update: boolean): Promise<void> {
         : target.kind === "download"
         ? `Hindsight: preparing ${target.reference} in the background; the current service keeps running until cutover.`
         : `Hindsight: building the CUDA image from ${target.base} in the background; the current service keeps running until cutover.`, "info");
-    void runOperation(ui, lease, () => applyApproved(settings, target, lease, state.installationId));
+    void runOperation(ui, lease, () => applyApproved(settings, target, lease, state.installationId, state.active));
+}
+
+/**
+ * Why the owner's approval of `approved` no longer covers `state`, or undefined while it does: management is Off, the mode or
+ * provider configuration changed, or another process applied a runtime since the plan snapshotted `active`.
+ */
+function approvalChanged(state: ManagementState, approved: HindsightSettings, current: HindsightSettings | undefined, active: ApprovedRuntime | undefined): string | undefined {
+    return state.mode === "off" ? "local management was turned Off"
+        : state.mode !== (approved.gpu ? "gpu" : "cpu") ? "the requested mode changed after approval"
+        : current?.provider !== approved.provider || current.configDigest !== approved.configDigest ? "the provider configuration changed after approval"
+        : state.active?.imageId !== active?.imageId || state.active?.appliedAt !== active?.appliedAt ? "another process applied a runtime after approval"
+        : undefined;
+}
+
+const abandoned = (reason: string) => `Hindsight: nothing was replaced because ${reason}; review /hindsight and apply again.`;
+
+async function recordFailure(settings: HindsightSettings, stage: FailureStage, message: string): Promise<void> {
+    await updateState(state => state && { ...state, failure: { mode: settings.gpu ? "gpu" : "cpu", provider: settings.provider, stage, message, at: new Date().toISOString() } });
 }
 
 /** The confirmation text: the image work, GPU requirements, shared-service cutover and data the approval covers. */
@@ -458,14 +496,20 @@ async function prepareImage(target: Target, installationId: string): Promise<{ i
     if (target.kind === "cached") return { imageId: target.imageId };
     if (target.kind === "download") {
         const present = await inspectImage(target.reference);
-        if (!present && (await docker(["pull", target.reference], PULL_TIMEOUT_MS)).exitCode !== 0) {
-            // Registry errors can echo credentials or tokens, so neither stdout nor stderr is logged or shown.
-            log("docker pull failed for", target.reference);
-            return { problem: `Hindsight: downloading ${target.reference} failed; nothing was replaced and the current service keeps running. Check Docker's registry access and apply again.` };
+        let cached: string[] | undefined;
+        if (!present) {
+            // A pull can add the digest to an image that was already cached; only an image ID new to Docker is this installation's download.
+            const listed = await docker(["image", "ls", "--all", "--quiet", "--no-trunc"]);
+            cached = listed.exitCode === 0 ? listed.stdout.split("\n").map(line => line.trim()) : undefined;
+            if ((await docker(["pull", target.reference], PULL_TIMEOUT_MS)).exitCode !== 0) {
+                // Registry errors can echo credentials or tokens, so neither stdout nor stderr is logged or shown.
+                log("docker pull failed for", target.reference);
+                return { problem: `Hindsight: downloading ${target.reference} failed; nothing was replaced and the current service keeps running. Check Docker's registry access and apply again.` };
+            }
         }
         const pulled = present ?? await inspectImage(target.reference);
         if (!pulled) return { problem: `Hindsight: ${target.reference} is not available after the download; nothing was replaced.` };
-        if (!present) await own(pulled.id, "download", target.reference);
+        if (cached && !cached.includes(pulled.id)) await own(pulled.id, "download", target.reference);
         return { imageId: pulled.id };
     }
     // Only GPU mode plans a build.
@@ -479,39 +523,38 @@ async function prepareImage(target: Target, installationId: string): Promise<{ i
     return { imageId: built.id };
 }
 
-async function applyApproved(settings: HindsightSettings, target: Target, lease: string, installationId: string): Promise<Outcome> {
+async function applyApproved(settings: HindsightSettings, target: Target, lease: string, installationId: string, approvedActive: ApprovedRuntime | undefined): Promise<Outcome> {
     const mode = settings.gpu ? "gpu" : "cpu";
     const keepGpu = settings.gpu ? KEEP_GPU : "";
     const fail = async (stage: FailureStage, message: string, level: Outcome["level"] = "error"): Promise<Outcome> => {
-        await updateState(state => state && { ...state, failure: { mode, provider: settings.provider, stage, message, at: new Date().toISOString() } });
+        await recordFailure(settings, stage, message);
         return { level, message };
     };
     const prepared = await prepareImage(target, installationId);
     if ("problem" in prepared) return fail("prepare", prepared.problem);
     const { imageId } = prepared;
-    if (settings.gpu && !await cudaUsable(imageId)) {
+    const models = localModels(settings);
+    const gpuProblem = settings.gpu ? notOnCuda(models, await candidateModelDevices(settings, imageId, models.map(([, key]) => key.toLowerCase()))) : undefined;
+    if (gpuProblem) {
         log("GPU validation failed for", imageId);
-        return fail("validate", `Hindsight: the CUDA image could not use a GPU in Docker (check the NVIDIA driver, the NVIDIA Container Toolkit and docker run --gpus all); nothing was replaced and the current service keeps running.${keepGpu}`);
+        return fail("validate", `Hindsight: before cutover, ${gpuProblem} in a throwaway container of the CUDA image (check the NVIDIA driver, the NVIDIA Container Toolkit and docker run --gpus all); nothing was replaced and the current service keeps running.${keepGpu}`);
     }
 
-    // Revalidate under the lock: the approval covers exactly this lease, mode, configuration and image.
+    // Revalidate under the lock just before the first change to the shared service: the approval covers exactly this lease,
+    // mode, configuration, active runtime and image. Once the old container is stopped the handoff is committed.
     const current = resolveSettings(settings.gpu).settings;
     const candidate = await inspectImage(target.reference);
+    const name = settings.containerName;
+    const existing = await inspectContainer(name);
     let changed: string | undefined;
     await updateState(state => {
         changed = state?.operation?.id !== lease ? "another process took over local management"
-            : state.mode === "off" ? "local management was turned Off"
-            : state.mode !== mode ? "the requested mode changed after approval"
-            : current?.provider !== settings.provider || current.configDigest !== settings.configDigest ? "the provider configuration changed after approval"
-            : candidate?.id !== imageId ? "the image changed after approval"
-            : undefined;
+            : approvalChanged(state, settings, current, approvedActive) ?? (candidate?.id !== imageId ? "the image changed after approval" : undefined);
         if (changed) return undefined;
         return { ...state!, operation: { ...state!.operation!, candidateImageId: imageId } };
     });
-    if (changed) return fail("validate", `Hindsight: nothing was replaced because ${changed}; review /hindsight and apply again.`, "warning");
+    if (changed) return fail("validate", abandoned(changed), "warning");
 
-    const name = settings.containerName;
-    const existing = await inspectContainer(name);
     let previous: string | undefined;
     if (existing) {
         if (existing.running && (await docker(["stop", "--time", "75", name], 90_000)).exitCode !== 0) {

@@ -14,11 +14,16 @@ const PYTHON = "/app/api/.venv/bin/python";
 /**
  * Adapted from Hindsight's docker/docker-compose/cuda/Dockerfile: the CUDA wheel of the base's own torch version
  * replaces the CPU wheel, and the build fails instead of letting the resolver change any other installed package.
+ * Unlike the official recipe it also installs a C compiler: on CUDA, PyTorch JIT-compiles Triton kernels for some
+ * local models (ModernBERT rerankers) and otherwise fails with "Failed to find C compiler".
  */
 const CUDA_DOCKERFILE = `ARG BASE
 FROM \${BASE}
 ARG PYTORCH_CUDA_FLAVOR=cu126
 ARG PYTORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+USER hindsight
 RUN set -e; \\
     TORCH_BASE_VERSION=$(${PYTHON} -c 'import torch; print(torch.__version__.split("+", 1)[0])'); \\
     uv pip freeze --python ${PYTHON} | grep -v '^torch==' | sort > /tmp/hindsight-before; \\
@@ -58,10 +63,13 @@ export async function dockerAvailable(): Promise<boolean> {
 
 export interface ImageInfo { id: string; tags: string[]; digests: string[]; labels: Record<string, string> }
 
-/** Locally cached image metadata; registry digests come from RepoDigests, never from the image ID. */
+/** Locally cached image metadata, or undefined when Docker confirms it is not cached; registry digests come from RepoDigests, never from the image ID. */
 export async function inspectImage(reference: string): Promise<ImageInfo | undefined> {
     const result = await docker(["image", "inspect", "--format", "{{json .}}", reference]);
-    if (result.exitCode !== 0) return undefined;
+    if (result.exitCode !== 0) {
+        if (/No such image/i.test(result.stderr)) return undefined;
+        throw new Error("Hindsight: Docker could not inspect a local image; check that Docker is running and accessible");
+    }
     const image = JSON.parse(result.stdout);
     if (!/^sha256:[a-f0-9]{64}$/.test(image.Id) || !Array.isArray(image.RepoDigests ?? []) || !Array.isArray(image.RepoTags ?? [])) throw new Error("Invalid image metadata");
     return { id: image.Id, tags: image.RepoTags ?? [], digests: (image.RepoDigests ?? []).map((entry: string) => entry.slice(entry.indexOf("@") + 1)), labels: image.Config?.Labels ?? {} };
@@ -115,12 +123,21 @@ export async function inspectContainer(name: string): Promise<ContainerInfo | un
     return { id: String(container.Id), imageId: String(container.Image), running: container.State?.Running === true, labels: container.Config?.Labels ?? {}, gpu };
 }
 
-/** Create and start the managed container from an image ID; credentials travel only through a 0600 env file. */
-export async function runManagedContainer(settings: HindsightSettings, imageId: string, installationId: string): Promise<boolean> {
+/** Run `use` with the settings' environment in a 0600 file that is removed afterwards; credentials never travel as arguments. */
+async function withEnvironmentFile<T>(settings: HindsightSettings, use: (file: string) => Promise<T>): Promise<T> {
     const environmentDirectory = fs.mkdtempSync(path.join(tmpdir(), "hindsight-docker-"));
     try {
         const environmentFile = path.join(environmentDirectory, "env");
         fs.writeFileSync(environmentFile, Object.entries(settings.env).map(([key, value]) => `${key}=${value}`).join("\n"), { flag: "wx", mode: 0o600 });
+        return await use(environmentFile);
+    } finally {
+        fs.rmSync(environmentDirectory, { recursive: true, force: true });
+    }
+}
+
+/** Create and start the managed container from an image ID. */
+export async function runManagedContainer(settings: HindsightSettings, imageId: string, installationId: string): Promise<boolean> {
+    return withEnvironmentFile(settings, async environmentFile => {
         const bindAddress = settings.bindAddress.includes(":") ? "[" + settings.bindAddress + "]" : settings.bindAddress;
         const run = await docker([
             "run", "-d", "--pull", "never",
@@ -138,9 +155,7 @@ export async function runManagedContainer(settings: HindsightSettings, imageId: 
             imageId,
         ], 60_000);
         return run.exitCode === 0;
-    } finally {
-        fs.rmSync(environmentDirectory, { recursive: true, force: true });
-    }
+    });
 }
 
 /**
@@ -164,7 +179,54 @@ export async function buildCudaDerivative(base: string, tag: string, installatio
     }
 }
 
-/** True when a throwaway container of `imageId` gets a GPU and its PyTorch sees CUDA; driver visibility alone is not enough. */
-export async function cudaUsable(imageId: string): Promise<boolean> {
-    return (await docker(["run", "--rm", "--pull", "never", "--gpus", "all", "--entrypoint", PYTHON, imageId, "-c", "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 3)"], 5 * 60_000)).exitCode === 0;
+/**
+ * The GPU inference probe, run with the configured environment. For each model kind named in argv ("embeddings",
+ * "reranker"; only applicable local models, so no remote provider is contacted) it builds the provider with Hindsight's
+ * own factory, initializes it and runs one inference. Prints one JSON line: kind -> devices of its local backends, with
+ * Hindsight's split-embeddings and failover-reranker wrappers unwrapped; a backend without a device reports null.
+ */
+const GPU_INFERENCE_PROBE = `
+import asyncio, json, sys
+
+def devices(model):
+    kind = type(model).__name__
+    inner = [model.query, model.passage] if kind == "SplitEmbeddings" else list(model._members) if kind == "MultiCrossEncoder" else None
+    return [device for child in inner for device in devices(child)] if inner is not None else [getattr(model, "_device_type", None)]
+
+async def main():
+    text = "hindsight-omp readiness probe"
+    report = {}
+    if "embeddings" in sys.argv[1:]:
+        from hindsight_api.engine.embeddings import create_embeddings_from_env
+        model = create_embeddings_from_env()
+        await model.initialize()
+        await model.encode([text])
+        report["embeddings"] = devices(model)
+    if "reranker" in sys.argv[1:]:
+        from hindsight_api.engine.cross_encoder import create_cross_encoder_from_env
+        model = create_cross_encoder_from_env()
+        await model.initialize()
+        await model.predict([(text, text)])
+        report["reranker"] = devices(model)
+    print(json.dumps(report))
+
+asyncio.run(main())
+`;
+
+/** Run the probe after `command`; the devices by kind, or undefined when it failed or printed nothing usable. */
+async function probe(command: string[], kinds: string[]): Promise<Record<string, unknown> | undefined> {
+    const result = await docker([...command, "-c", GPU_INFERENCE_PROBE, ...kinds], 5 * 60_000);
+    if (result.exitCode !== 0) return undefined;
+    try { return JSON.parse(result.stdout.trim().split("\n").at(-1)!); }
+    catch { return undefined; }
+}
+
+/** Before cutover: probe a throwaway `--gpus all` container of `imageId` with the configured environment, no volume and no ports. */
+export async function candidateModelDevices(settings: HindsightSettings, imageId: string, kinds: string[]): Promise<Record<string, unknown> | undefined> {
+    return withEnvironmentFile(settings, file => probe(["run", "--rm", "--pull", "never", "--gpus", "all", "--env-file", file, "--entrypoint", PYTHON, imageId], kinds));
+}
+
+/** Readiness: probe inside the running managed container, which already has its configuration and credentials. */
+export async function serviceModelDevices(container: string, kinds: string[]): Promise<Record<string, unknown> | undefined> {
+    return probe(["exec", container, PYTHON], kinds);
 }

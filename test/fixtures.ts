@@ -39,8 +39,12 @@ export interface DockerState {
     buildxMissing?: boolean;
     /** Host GPU support: "cuda" = driver, toolkit and CUDA PyTorch work; "no-cuda" = GPU visible but torch.cuda unavailable; unset = CPU-only host. */
     gpu?: "cuda" | "no-cuda";
-    /** Device the managed container's local models log at startup; defaults to cuda for a GPU container on a "cuda" host, else cpu. */
+    /** Device the managed container's local models initialize and run on; defaults to cuda for a GPU container on a "cuda" host, else cpu. */
     modelDevice?: string;
+    /** Where the GPU inference probe fails although the models initialized: the pre-cutover throwaway container, the running service, or both. */
+    inferenceFails?: ("validation" | "service")[];
+    /** Image IDs whose `docker image inspect` fails like an unreachable daemon instead of reporting absence. */
+    imageInspectFails?: string[];
     /** `docker build` outcome: fails like a dependency conflict, or sleeps before succeeding. */
     buildFails?: boolean;
     buildDelayMs?: number;
@@ -132,7 +136,7 @@ if (mutation && state.calls.filter(call => call.join(" ").startsWith(mutation.wh
 const findImage = ref => state.images[ref] ? ref : Object.keys(state.images).find(id => state.images[id].tags.includes(ref) || (state.images[id].digests ?? []).includes(ref));
 const findContainer = ref => Object.keys(state.containers).find(name => name === ref || state.containers[name].id === ref);
 if (state.outputBytes && ["run", "pull", "build"].includes(args[0])) {
-    const output = Buffer.alloc(state.outputBytes, "x");
+    const output = Buffer.alloc(state.outputBytes, "x\\n");
     await Bun.write(Bun.stdout, output); await Bun.write(Bun.stderr, output);
 }
 let code = 0, out = "", err = "";
@@ -146,8 +150,10 @@ case "buildx": {
     out = JSON.stringify(manifest); break;
 }
 case "image": {
+    if (args[1] === "ls") { out = Object.keys(state.images).join("\\n"); break; }
     const id = findImage(args.at(-1));
-    if (!id) { code = 1; break; }
+    if (id && args[1] === "inspect" && state.imageInspectFails?.includes(id)) { code = 1; err = "permission denied while trying to connect to the Docker daemon socket"; break; }
+    if (!id) { code = 1; err = "Error: No such image: " + args.at(-1); break; }
     if (args[1] === "inspect") out = JSON.stringify({ Id: id, RepoTags: state.images[id].tags, RepoDigests: state.images[id].digests ?? [], Config: { Labels: state.images[id].labels ?? null } });
     else if (args[1] === "rm" && !args.includes("--force") && !state.imageRemoveFails && state.images[id].tags.length <= 1 && !Object.values(state.containers).some(container => container.image === id)) delete state.images[id];
     else code = 1;
@@ -190,10 +196,19 @@ case "build": {
     break;
 }
 case "logs": {
+    // Hindsight's startup log reports where each local model initialized, not whether inference works there.
     const container = state.containers[findContainer(args.at(-1))];
     if (!container) { code = 1; break; }
     const device = state.modelDevice ?? (container.gpus && state.gpu === "cuda" ? "cuda" : "cpu");
     err = "Embeddings: local provider initialized (dim: 384, device: " + device + ")\\nReranker: local provider initialized (device: " + device + ", max_concurrent=4)"; break;
+}
+case "exec": {
+    // The readiness inference probe: one JSON line of device lists for the model kinds after the script.
+    const container = state.containers[findContainer(args[1])];
+    if (!container?.running) { code = 1; err = "Error response from daemon: container is not running"; break; }
+    if (state.inferenceFails?.includes("service")) { code = 1; err = "RuntimeError: Failed to find C compiler. Please specify via CC environment variable"; break; }
+    const device = state.modelDevice ?? (container.gpus && state.gpu === "cuda" ? "cuda" : "cpu");
+    out = JSON.stringify(Object.fromEntries(args.slice(args.indexOf("-c") + 2).map(kind => [kind, [device]]))); break;
 }
 case "stop": { const name = findContainer(args.at(-1)); if (!name) { code = 1; break; } state.containers[name].running = false; break; }
 case "start": { const name = findContainer(args.at(-1)); if (!name) { code = 1; break; } state.containers[name].running = true; break; }
@@ -202,9 +217,15 @@ case "rm": { const name = findContainer(args.at(-1)); if (!name || state.contain
 case "volume": if (args[1] === "rm" && args.includes("fixture-data")) state.data = null; else code = 1; break;
 case "run": {
     if (args[1] === "--rm") {
-        // GPU validation: needs a GPU-capable Docker host and CUDA PyTorch in the image.
+        // Pre-cutover GPU probe: needs a GPU-capable Docker host, CUDA PyTorch in the image and the configuration's 0600 env file.
+        const envFile = args[args.indexOf("--env-file") + 1];
         if (!state.gpu) { code = 125; err = "docker: Error response from daemon: could not select device driver \\"\\" with capabilities: [[gpu]]."; }
-        else if (state.gpu !== "cuda" || !state.images[findImage(args[args.indexOf("--entrypoint") + 2])]?.labels) code = 3;
+        else if (!envFile || !fs.existsSync(envFile) || (fs.statSync(envFile).mode & 0o777) !== 0o600) code = 1;
+        else if (state.inferenceFails?.includes("validation")) { code = 1; err = "RuntimeError: Failed to find C compiler. Please specify via CC environment variable"; }
+        else {
+            const device = state.gpu === "cuda" && state.images[findImage(args[args.indexOf("--entrypoint") + 2])]?.labels ? "cuda" : "cpu";
+            out = JSON.stringify(Object.fromEntries(args.slice(args.indexOf("-c") + 2).map(kind => [kind, [device]])));
+        }
         break;
     }
     if (args.includes("--gpus") && !state.gpu) { code = 125; break; }

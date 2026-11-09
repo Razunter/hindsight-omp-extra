@@ -5,7 +5,10 @@ import { EXTENSION_ROOT } from "./runtime-config";
 
 const STATE_FILE = path.join(EXTENSION_ROOT, ".local-management.json");
 const LOCK_FILE = path.join(EXTENSION_ROOT, ".local-management.lock");
+/** Serializes stale-lock reclamation; held only for a read and an unlink. */
+const RECLAIM_FILE = LOCK_FILE + ".reclaim";
 const STALE_LOCK_MS = 60_000;
+const ABANDONED_RECLAIM_MS = 10_000;
 
 export type ManagementMode = "off" | "cpu" | "gpu";
 export interface UpstreamIdentity { reference: string; digests: string[] }
@@ -67,13 +70,57 @@ export function liveOperation(state: ManagementState): ManagementState["operatio
     return state.operation && pidAlive(state.operation.pid) ? state.operation : undefined;
 }
 
-function lockIsStale(): boolean {
+function tokenOf(file: string): string | undefined {
+    try { return fs.readFileSync(file, "utf8"); }
+    catch { return undefined; }
+}
+
+/** Create `file` holding `token` unless it exists. */
+function create(file: string, token: string): boolean {
     try {
-        const pid = Number(fs.readFileSync(LOCK_FILE, "utf8"));
-        return Date.now() - fs.statSync(LOCK_FILE).mtimeMs > STALE_LOCK_MS || (Number.isSafeInteger(pid) && pid > 0 && !pidAlive(pid));
-    } catch {
+        const lock = fs.openSync(file, "wx", 0o600);
+        try { fs.writeSync(lock, token); }
+        finally { fs.closeSync(lock); }
+        return true;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("Hindsight: could not lock local management state; check extension-root write permissions");
         return false;
     }
+}
+
+function release(file: string, token: string): void {
+    if (tokenOf(file) === token) fs.rmSync(file, { force: true });
+}
+
+/** The state lock's token while its holder is dead or it outlived any state update; undefined otherwise. */
+function staleToken(): string | undefined {
+    const token = tokenOf(LOCK_FILE);
+    const pid = parseInt(token ?? "", 10);
+    try {
+        return token !== undefined && (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > STALE_LOCK_MS || (pid > 0 && !pidAlive(pid))) ? token : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Remove the state lock if it still holds the stale `token`. Reclaimers take turns under a guard, so none can remove a lock
+ * another reclaimer's successor took meanwhile. False when another live reclaimer holds the guard.
+ */
+function reclaim(token: string, own: string): boolean {
+    if (!create(RECLAIM_FILE, own)) {
+        try {
+            if (Date.now() - fs.statSync(RECLAIM_FILE).mtimeMs <= ABANDONED_RECLAIM_MS) return false;
+            // shortcut: a reclaimer stalled for over ten seconds between taking the mutex and unlinking could still remove a fresh lock; an OS file lock would close that window.
+            fs.rmSync(RECLAIM_FILE, { force: true });
+        } catch {
+            // Released meanwhile.
+        }
+        return true;
+    }
+    try { if (tokenOf(LOCK_FILE) === token) fs.rmSync(LOCK_FILE, { force: true }); }
+    finally { release(RECLAIM_FILE, own); }
+    return true;
 }
 
 /**
@@ -82,25 +129,19 @@ function lockIsStale(): boolean {
  */
 export async function updateState(mutate: (state: ManagementState | undefined) => ManagementState | undefined): Promise<ManagementState | undefined> {
     const deadline = Date.now() + 5_000;
-    for (;;) {
-        try {
-            const lock = fs.openSync(LOCK_FILE, "wx", 0o600);
-            try { fs.writeSync(lock, String(process.pid)); }
-            finally { fs.closeSync(lock); }
-            break;
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("Hindsight: could not lock local management state; check extension-root write permissions");
-            if (lockIsStale()) { fs.rmSync(LOCK_FILE, { force: true }); continue; }
-            if (Date.now() > deadline) throw new Error("Hindsight: local management state is locked by another process; try again");
-            await Bun.sleep(20);
-        }
+    const token = `${process.pid}-${randomUUID()}`;
+    while (!create(LOCK_FILE, token)) {
+        const stale = staleToken();
+        if (stale !== undefined && reclaim(stale, token)) continue;
+        if (Date.now() > deadline) throw new Error("Hindsight: local management state is locked by another process; try again");
+        await Bun.sleep(20);
     }
     try {
         const next = mutate(readState());
         if (next) writeState(next);
         return next;
     } finally {
-        fs.rmSync(LOCK_FILE, { force: true });
+        release(LOCK_FILE, token);
     }
 }
 
@@ -116,11 +157,14 @@ function writeState(state: ManagementState): void {
     }
 }
 
-/** Take the installation-wide operation lease; undefined when another live operation holds it. A dead holder authorizes nothing and is cleared. */
-export async function takeLease(kind: "apply" | "recover", candidateImageId?: string): Promise<string | undefined> {
+/**
+ * Take the installation-wide operation lease; undefined when another live operation holds it or `admit` refuses the state
+ * under the same lock. A dead holder authorizes nothing and is cleared.
+ */
+export async function takeLease(kind: "apply" | "recover", candidateImageId?: string, admit: (state: ManagementState) => boolean = () => true): Promise<string | undefined> {
     const id = randomUUID();
     const taken = await updateState(state => {
-        if (!state || liveOperation(state)) return undefined;
+        if (!state || liveOperation(state) || !admit(state)) return undefined;
         return { ...state, operation: { id, pid: process.pid, kind, startedAt: new Date().toISOString(), ...(candidateImageId ? { candidateImageId } : {}) } };
     });
     return taken ? id : undefined;

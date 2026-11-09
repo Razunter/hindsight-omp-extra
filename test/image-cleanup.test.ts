@@ -95,11 +95,65 @@ test.each([
 test("a derivative another operation claims as its candidate during the update is kept", () => {
     const { f, old } = gpuUpdateAvailable();
     const competitor = { id: "competitor", pid: process.pid, kind: "apply", startedAt: "2026-11-09T00:00:00.000Z", candidateImageId: old };
-    host(f, { mutate: { when: "logs", skip: calls(f, "logs").length, management: { operation: competitor } } });
+    host(f, { mutate: { when: "exec", skip: calls(f, "exec").length, management: { operation: competitor } } });
     expect(applyUpdate(f).notifications.at(-1)?.level).toBe("info");
     expect(f.state().images[old]).toBeDefined();
     expect(removals(f)).toEqual([]);
     expect(f.management()!.owned.map((entry: { imageId: string }) => entry.imageId)).toContain(old);
+});
+
+test("Off chosen while the current container is inspected for cutover stops nothing and replaces nothing", () => {
+    const { f, old } = gpuUpdateAvailable();
+    const running = f.container();
+    // The second container inspection of this apply is the cutover's, after preparation and GPU validation.
+    host(f, { mutate: { when: "container inspect", skip: calls(f, "container").length + 1, management: { mode: "off" } } });
+    const before = f.state().calls.length;
+    expect(applyUpdate(f).notifications.at(-1)?.level).toBe("warning");
+    expect(f.state().calls.slice(before).filter(call => ["stop", "rename", "rm"].includes(call[0]) || (call[0] === "run" && call[1] === "-d"))).toEqual([]);
+    expect(f.container()).toEqual(running);
+    expect(f.management()).toMatchObject({ mode: "off", active: { imageId: old }, failure: { stage: "validate" } });
+});
+
+test.each([
+    ["the old container is stopped", "stop"],
+    ["the new container's readiness is checked", "exec"],
+])("Off chosen while %s finishes the committed handoff but keeps superseded images, and says so", (_name, when) => {
+    const { f, old } = gpuUpdateAvailable();
+    const stale = staleDerivative(f);
+    host(f, { mutate: { when, skip: calls(f, when).length, management: { mode: "off" } } });
+    const outcome = applyUpdate(f).notifications.at(-1)!;
+    expect(outcome.level).toBe("warning");
+    expect(outcome.message).toContain("runtime ready");
+    expect(outcome.message).toContain("turned Off");
+    const rebuilt = f.management()!.active.imageId;
+    expect(rebuilt).not.toBe(old);
+    expect(f.container()).toMatchObject({ image: rebuilt, running: true, gpus: true });
+    expect(f.management()!.mode).toBe("off");
+    expect(removals(f)).toEqual([]);
+    expect(f.state().images[old]).toBeDefined();
+    expect(f.state().images[stale]).toBeDefined();
+    expect(f.management()!.owned.map((entry: { imageId: string }) => entry.imageId)).toEqual(expect.arrayContaining([old, stale]));
+    expect(f.management()!.cleanupFailure.message).toContain("turned Off");
+});
+
+test("Off chosen during cleanup stops it before the next image", () => {
+    const { f } = gpuUpdateAvailable();
+    staleDerivative(f);
+    host(f, { mutate: { when: "image rm", skip: removals(f).length, management: { mode: "off" } } });
+    expect(applyUpdate(f).notifications.at(-1)?.message).toContain("turned Off");
+    expect(removals(f)).toHaveLength(1);
+    expect(f.management()!.owned).toHaveLength(2);
+});
+
+test("an image Docker fails to inspect during cleanup stays recorded and is reported, not taken as gone", () => {
+    const { f } = gpuUpdateAvailable();
+    const stale = staleDerivative(f);
+    host(f, { imageInspectFails: [stale] });
+    const outcome = applyUpdate(f).notifications.at(-1)!;
+    expect(outcome.level).toBe("warning");
+    expect(outcome.message).toContain(stale.slice(7, 19));
+    expect(f.management()!.owned.map((entry: { imageId: string }) => entry.imageId)).toContain(stale);
+    expect(f.management()!.cleanupFailure.message).toContain(stale.slice(7, 19));
 });
 
 test("a failed deletion is reported with the image while the runtime stays ready, and a later clean run clears it", () => {
