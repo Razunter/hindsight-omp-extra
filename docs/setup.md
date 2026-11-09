@@ -70,15 +70,11 @@ Edit these files before launching:
 - **`.env`:** choose the Docker container, named volume, image, worker settings, and API/dashboard ports. The example uses `hindsight-omp`, `hindsight-omp-data`, and ports `8888`/`9999`; change them if occupied. Both published ports bind to `127.0.0.1` by default. [Changing the bind address](configuration.md#network-binding) is explicit.
 - **`providers/primary.env`:** replace the model and API-key placeholders with values authorized for Hindsight. Never copy OMP tokens or put shell variable references in this file: values are literal, not interpolated. For another provider, use the appropriate [provider template](configuration.md#copy-a-complete-example) instead.
 
-The image example follows Hindsight’s [official Docker installation](https://hindsight.vectorize.io/developer/installation) and uses the rolling `latest` tag. For reproducible deployments, choose a tag or digest verified with your provider. Local management uses only an image already in Docker’s local cache and never downloads one, so pull it yourself before opting in:
+The image example follows Hindsight’s [official Docker installation](https://hindsight.vectorize.io/developer/installation) and uses the rolling `latest` tag. For reproducible deployments, choose a tag or digest verified with your provider. You do not need to pull the image yourself: when it is not cached, the first apply looks up its registry digest and offers to download exactly that digest after your approval. An image you already pulled is used as is.
 
-```sh
-docker pull ghcr.io/vectorize-io/hindsight:latest
-```
+Approval binds the exact image shown in the confirmation: a cached image ID or a `repository@digest` download. A tag that moves later is not followed. A different Hindsight version may migrate the reused database, and replacing the image does not roll the database back. A named volume is not a backup.
 
-Approval binds the cached image ID shown in the confirmation; a tag that moves later is not followed. A different Hindsight version may migrate the reused database, and replacing the image does not roll the database back. A named volume is not a backup.
-
-With CPU management on, the extension tells you when the configured image's registry digest has moved: a fresh interactive start checks at most once every 24 hours, and `/hindsight` → **Check for updates** checks immediately. Checks read registry metadata through Docker Buildx, download nothing and change nothing; **Status** shows the last result. See [update checks](configuration.md#update-checks).
+With CPU management on, the extension tells you when the configured image's registry digest has moved: a fresh interactive start checks at most once every 24 hours, and `/hindsight` → **Check for updates** checks immediately. Checks read registry metadata through Docker Buildx, download nothing and change nothing; **Status** shows the last result. To install an available update, choose **Apply requested configuration** and approve it. See [update checks](configuration.md#update-checks) and [installing and updating](configuration.md#installing-and-updating-a-cpu-runtime).
 
 Include only values intended for Hindsight. The validated merged configuration is forwarded to the container, including credentials and variables without a `HINDSIGHT_` prefix. Your AI provider may receive content for memory processing; self-hosting the database does not make remote inference offline.
 
@@ -132,9 +128,9 @@ omp
 
 For a clone not yet [loaded persistently](#load-persistently), use `omp -e /absolute/path/to/hindsight-omp-extra` instead. Pass the package directory so the ingestion skill loads too.
 
-Run `/hindsight`, choose **Mode**, then **CPU**. The extension validates the selected provider configuration, finds the cached image and shows one confirmation with the provider configuration, image ID, data volume and whether an existing container is replaced. Declining changes nothing; CPU stays requested and **Status** shows it as pending.
+Run `/hindsight`, choose **Mode**, then **CPU**. The extension validates the selected provider configuration. If the image is not cached yet, it checks the registry in the background and changes nothing; when the check reports the target, choose **Apply requested configuration**. The confirmation shows the provider configuration, the cached image ID or the exact digest to download, the data volume and whether an existing container is replaced. Declining changes nothing; CPU stays requested and **Status** shows it as pending.
 
-After you confirm, the cutover runs in the background, so OMP stays usable. An existing container keeps running until cutover, is stopped gracefully (up to 75 seconds) and set aside, and the new container starts on the same volume. Success is reported only after Hindsight’s `/health` endpoint reports a healthy API and a connected database. With the example ports:
+After you confirm, the download and cutover run in the background, so OMP stays usable. An existing container keeps running during the download and until cutover, is stopped gracefully (up to 75 seconds) and set aside, and the new container starts on the same volume. Success is reported only after Hindsight’s `/health` endpoint reports a healthy API and a connected database. With the example ports:
 
 ```text
 Hindsight: CPU runtime ready (API :8888, UI :9999)

@@ -26,6 +26,9 @@ export interface DockerState {
     waitForHandler?: boolean;
     released?: boolean;
     outputBytes?: number;
+    /** Registry images by `repo@digest`: pulling one caches that image ID with the digest as its RepoDigest; a missing entry fails. */
+    remote?: Record<string, string>;
+    imageRemoveFails?: boolean;
     runEnvironment?: Record<string, string | undefined>;
     envFile?: { path: string; mode: number };
     /** Simulates another process: once a call starting with `when` has been seen more than `skip` times, patch management state or move a tag. */
@@ -66,6 +69,16 @@ export function upstreamIndex(index: string, platform: string) {
         manifests: [manifest("sha256:" + "e".repeat(64), "s390x"), manifest(platform, process.arch === "arm64" ? "arm64" : "amd64"), { ...manifest("sha256:" + "f".repeat(64), "unknown"), platform: { architecture: "unknown", os: "unknown" } }],
     };
 }
+/** A newer upstream release of the configured image: its registry digests and the image ID that pulling `pull` caches. */
+export const update = { index: "sha256:" + "c".repeat(64), platform: "sha256:" + "d".repeat(64), imageId: "sha256:" + "2".repeat(64), pull: "fixture/image@sha256:" + "d".repeat(64) };
+/** Publish `update` in the fake registry and record it as discovered by a manual check. */
+export function discoverUpdate(f: Fixture): void {
+    const state = f.state();
+    state.registry = { [infrastructure.HINDSIGHT_IMAGE]: upstreamIndex(update.index, update.platform) };
+    state.remote = { [update.pull]: update.imageId };
+    f.setState(state);
+    f.run([{ startup: false, command: true, choices: [menu.check] }]);
+}
 export const infrastructure = {
     HINDSIGHT_CONTAINER_NAME: "fixture-hindsight",
     HINDSIGHT_IMAGE: "fixture/image:local",
@@ -89,6 +102,11 @@ import path from "node:path";
 const file = process.env.FAKE_DOCKER_STATE;
 const state = JSON.parse(fs.readFileSync(file, "utf8"));
 const args = process.argv.slice(2); state.calls.push(args);
+if (state.waitForHandler && ["run", "buildx", "pull"].includes(args[0])) {
+    const deadline = Date.now() + 1000;
+    while (!fs.existsSync(file + ".handler-returned") && Date.now() < deadline) await Bun.sleep(10);
+    state.released = fs.existsSync(file + ".handler-returned");
+}
 const mutation = state.mutate;
 if (mutation && state.calls.filter(call => call.join(" ").startsWith(mutation.when)).length > (mutation.skip ?? 0)) {
     delete state.mutate;
@@ -101,12 +119,11 @@ if (mutation && state.calls.filter(call => call.join(" ").startsWith(mutation.wh
         (state.images[mutation.retag.image] ??= { tags: [] }).tags.push(mutation.retag.tag);
     }
 }
-const findImage = ref => state.images[ref] ? ref : Object.keys(state.images).find(id => state.images[id].tags.includes(ref));
+const findImage = ref => state.images[ref] ? ref : Object.keys(state.images).find(id => state.images[id].tags.includes(ref) || (state.images[id].digests ?? []).includes(ref));
 const findContainer = ref => Object.keys(state.containers).find(name => name === ref || state.containers[name].id === ref);
-if (state.waitForHandler && ["run", "buildx"].includes(args[0])) {
-    const deadline = Date.now() + 1000;
-    while (!fs.existsSync(file + ".handler-returned") && Date.now() < deadline) await Bun.sleep(10);
-    state.released = fs.existsSync(file + ".handler-returned");
+if (state.outputBytes && ["run", "pull"].includes(args[0])) {
+    const output = Buffer.alloc(state.outputBytes, "x");
+    await Bun.write(Bun.stdout, output); await Bun.write(Bun.stderr, output);
 }
 let code = 0, out = "", err = "";
 switch (args[0]) {
@@ -120,9 +137,26 @@ case "buildx": {
 }
 case "image": {
     const id = findImage(args.at(-1));
-    if (args[1] !== "inspect" || !id) { code = 1; break; }
-    out = JSON.stringify({ Id: id, RepoTags: state.images[id].tags, RepoDigests: state.images[id].digests ?? [] }); break;
+    if (!id) { code = 1; break; }
+    if (args[1] === "inspect") out = JSON.stringify({ Id: id, RepoTags: state.images[id].tags, RepoDigests: state.images[id].digests ?? [] });
+    else if (args[1] === "rm" && !args.includes("--force") && !state.imageRemoveFails && state.images[id].tags.length <= 1 && !Object.values(state.containers).some(container => container.image === id)) delete state.images[id];
+    else code = 1;
+    break;
 }
+case "pull": {
+    const id = state.remote?.[args[1]];
+    if (!id) { code = 1; err = "Error response from daemon: synthetic-registry-secret denied"; break; }
+    const image = state.images[id] ??= { tags: [] };
+    image.digests = [...new Set([...(image.digests ?? []), args[1]])];
+    break;
+}
+case "tag": {
+    const id = findImage(args[1]);
+    if (!id) { code = 1; break; }
+    for (const image of Object.values(state.images)) image.tags = image.tags.filter(tag => tag !== args[2]);
+    state.images[id].tags.push(args[2]); break;
+}
+case "ps": out = Object.values(state.containers).filter(container => args.at(-1) === "ancestor=" + container.image).map(container => container.id).join("\\n"); break;
 case "container": {
     const name = findContainer(args.at(-1));
     if (args[1] !== "inspect" || !name) { code = 1; break; }
@@ -135,10 +169,6 @@ case "rename": { const name = findContainer(args[1]); if (!name || state.contain
 case "rm": { const name = findContainer(args.at(-1)); if (!name || state.containers[name].running) { code = 1; break; } delete state.containers[name]; break; }
 case "volume": if (args[1] === "rm" && args.includes("fixture-data")) state.data = null; else code = 1; break;
 case "run": {
-    if (state.outputBytes) {
-        const output = Buffer.alloc(state.outputBytes, "x");
-        await Bun.write(Bun.stdout, output); await Bun.write(Bun.stderr, output);
-    }
     state.runEnvironment = Object.fromEntries(["PATH", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"].map(key => [key, process.env[key]]));
     const env = [], mounts = [], portBindings = {}, labels = {};
     let name;
@@ -197,10 +227,9 @@ globalThis.fetch = async (input, init) => {
     return Response.json(healthy ? { status: "healthy", database: "connected" } : { status: "unhealthy", database: "disconnected" }, { status: healthy ? 200 : 503 });
 };
 const management = () => { try { return JSON.parse(fs.readFileSync(managementFile, "utf8")); } catch { return undefined; } };
-// Background work started by this step: a lease this process holds ends with one outcome notification, then the lease release;
-// an update check claimed during the step ends with its recorded outcome.
-async function settle(since) {
-    const lease = management()?.operation;
+// Background work started by this step: a lease this process held when the handler returned ends with one outcome notification,
+// then the lease release; an update check claimed during the step ends with its recorded outcome.
+async function settle(since, lease) {
     const reported = notifications.length;
     const deadline = Date.now() + 8000;
     const busy = () => {
@@ -260,8 +289,10 @@ for (let i = 0; i < steps.length; i++) {
         try { await command("", ctx); }
         finally { if (step.failWrite) fs.chmodSync(import.meta.dir, 0o700); }
     }
+    // Read the lease before releasing waiting fake Docker calls, which may hand it to a simulated competitor.
+    const lease = management()?.operation;
     fs.writeFileSync(stateFile + ".handler-returned", "returned");
-    await settle(since);
+    await settle(since, lease);
 }
 console.log(JSON.stringify({ notifications, dialogs, tools, commands }));`;
 

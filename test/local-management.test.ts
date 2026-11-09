@@ -107,15 +107,6 @@ test("declining approval prepares and replaces nothing and keeps the request vis
     expect(mutating(f)).toEqual([]);
 });
 
-test("an uncached image requires an explicit download action and changes nothing", () => {
-    const f = setup(); const state = f.state(); state.images = {}; f.setState(state);
-    const result = f.apply();
-    expect(result.notifications.at(-1)?.level).toBe("warning");
-    expect(result.dialogs.filter(dialog => dialog.message !== undefined)).toEqual([]);
-    expect(mutating(f)).toEqual([]);
-    expect(f.management()!.active).toBeUndefined();
-});
-
 test("adopting a legacy container stops it gracefully before reusing its volume", () => {
     const f = setup(); legacyContainer(f);
     expect(f.apply().notifications.at(-1)?.level).toBe("info");

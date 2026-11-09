@@ -32,15 +32,28 @@ export async function dockerAvailable(): Promise<boolean> {
     return (await docker(["version", "--format", "{{.Server.Version}}"], 5_000)).exitCode === 0;
 }
 
-export interface ImageInfo { id: string; digests: string[] }
+export interface ImageInfo { id: string; tags: string[]; digests: string[] }
 
 /** Locally cached image metadata; registry digests come from RepoDigests, never from the image ID. */
 export async function inspectImage(reference: string): Promise<ImageInfo | undefined> {
     const result = await docker(["image", "inspect", "--format", "{{json .}}", reference]);
     if (result.exitCode !== 0) return undefined;
     const image = JSON.parse(result.stdout);
-    if (!/^sha256:[a-f0-9]{64}$/.test(image.Id) || !Array.isArray(image.RepoDigests ?? [])) throw new Error("Invalid image metadata");
-    return { id: image.Id, digests: (image.RepoDigests ?? []).map((entry: string) => entry.slice(entry.indexOf("@") + 1)) };
+    if (!/^sha256:[a-f0-9]{64}$/.test(image.Id) || !Array.isArray(image.RepoDigests ?? []) || !Array.isArray(image.RepoTags ?? [])) throw new Error("Invalid image metadata");
+    return { id: image.Id, tags: image.RepoTags ?? [], digests: (image.RepoDigests ?? []).map((entry: string) => entry.slice(entry.indexOf("@") + 1)) };
+}
+
+/**
+ * Remove an image only when it has no tags and no container, running or stopped, uses it. Never forced and
+ * never prunes parents, so another tag or container wins a concurrent race. False means removal failed.
+ */
+export async function removeUnusedImage(id: string): Promise<boolean> {
+    const image = await inspectImage(id);
+    if (!image || image.tags.length > 0) return true;
+    const users = await docker(["ps", "--all", "--quiet", "--filter", "ancestor=" + id]);
+    if (users.exitCode !== 0) return false;
+    if (users.stdout.trim()) return true;
+    return (await docker(["image", "rm", "--no-prune", id])).exitCode === 0;
 }
 
 const isDigest = (value: unknown): value is string => typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);

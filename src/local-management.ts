@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { CONFIG_LABEL, INSTALLATION_LABEL, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, runManagedContainer, type ContainerInfo } from "./docker";
+import { CONFIG_LABEL, INSTALLATION_LABEL, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeUnusedImage, runManagedContainer, type ContainerInfo } from "./docker";
 import { initialState, pidAlive, readState, releaseLease, takeLease, updateState, type ManagementState, type UpdateCheck } from "./management-state";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 
@@ -11,11 +11,17 @@ const startupRoots = processState[startupKey] ??= new Set<string>();
 
 const MENU = { status: "Status", mode: "Mode", provider: "Provider configuration", apply: "Apply requested configuration", check: "Check for updates" } as const;
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const PULL_TIMEOUT_MS = 60 * 60 * 1000;
+const PINNED = /@sha256:[a-f0-9]{64}$/;
 
 type UI = ExtensionContext["ui"];
 type Outcome = { level: "info" | "warning" | "error"; message: string };
 type FailureStage = NonNullable<ManagementState["failure"]>["stage"];
-interface ApprovedPlan { settings: HindsightSettings; imageId: string; digests: string[] }
+/** The image one approval covers: already cached, or downloaded from the registry by the displayed digest. */
+type Target =
+    | { kind: "cached"; imageId: string; digests: string[] }
+    | { kind: "download"; pull: string; digests: string[] };
+interface ApprovedPlan { settings: HindsightSettings; target: Target }
 
 export function registerLocalManagement(pi: ExtensionAPI): void {
     pi.registerCommand("hindsight", {
@@ -121,7 +127,7 @@ function describeCheck(check: UpdateCheck): string {
     if (check.outcome === "current") return "the approved runtime matches the configured upstream image.";
     if (check.outcome === "available") {
         const { reference, digest, indexDigest } = check.available!;
-        return `update available for ${reference}: platform manifest ${digest}${indexDigest ? `, index ${indexDigest}` : ""}. Nothing was downloaded or changed.`;
+        return `update available for ${reference}: platform manifest ${digest}${indexDigest ? `, index ${indexDigest}` : ""}. Nothing was downloaded or changed; choose Apply requested configuration in /hindsight to review it.`;
     }
     if (check.outcome) return `update check ${check.outcome}: ${check.message}.`;
     return "update check started without a recorded result.";
@@ -137,6 +143,10 @@ async function checkNow(ui: UI): Promise<void> {
         ui.notify(error!, "error");
         return;
     }
+    await startCheck(ui, settings);
+}
+
+async function startCheck(ui: UI, settings: HindsightSettings): Promise<void> {
     const claimed = await claimCheck(false);
     if (claimed === undefined) return;
     ui.notify(`Hindsight: checking ${settings.image} for updates in the background.`, "info");
@@ -172,7 +182,7 @@ async function recover(settings: HindsightSettings): Promise<Outcome> {
     }
     if (!container && pending) return { level: "warning", message: "Hindsight: the managed container is missing and was not recreated." + pendingNote };
     if (!container && !await inspectImage(state.active.imageId)) {
-        return { level: "warning", message: "Hindsight: the approved image is no longer cached, so the missing container was not recreated; restoring it requires an explicit download." };
+        return { level: "warning", message: "Hindsight: the approved image is no longer cached, so the missing container was not recreated; choose Apply requested configuration in /hindsight to approve downloading it again." };
     }
     if (readState()?.mode !== "cpu") return off;
     const started = container
@@ -241,6 +251,7 @@ function showStatus(ui: UI): void {
         lines.push("Management is Off: Docker was not inspected and the service is not managed.");
     }
     if (state?.failure) lines.push(`Last failure (${state.failure.stage}, ${state.failure.at}): ${state.failure.message}`);
+    if (state?.cleanupFailure) lines.push(`Cleanup after the last healthy cutover failed (${state.cleanupFailure.at}): ${state.cleanupFailure.message}`);
     lines.push(state?.check ? `Last update check (${new Date(state.check.attemptedAt).toISOString()}): ${describeCheck(state.check)}` : "Last update check: none");
     if (state?.operation && pidAlive(state.operation.pid)) lines.push(`In progress: ${state.operation.kind} since ${state.operation.startedAt}`);
     ui.notify(lines.join("\n"), "info");
@@ -263,7 +274,25 @@ async function selectProvider(ui: UI): Promise<void> {
     else ui.notify(`Hindsight: selected ${selected}. Local management is Off, so no runtime was changed.`, "info");
 }
 
-/** Plan the cached CPU runtime, ask for one approval, then cut over in the background. */
+/**
+ * The image the requested configuration needs: a recorded upstream update first, then the cached image, then a
+ * fresh download of the approved digest when its image left the cache. Undefined means no target is known yet.
+ */
+async function planTarget(state: ManagementState, settings: HindsightSettings): Promise<Target | undefined> {
+    const cached = await inspectImage(settings.image);
+    const known = state.active?.upstream.digests ?? [];
+    const available = state.check?.available;
+    const update = available?.reference === settings.image ? [available.digest, ...(available.indexDigest ? [available.indexDigest] : [])] : [];
+    const repository = settings.image.replace(PINNED, "").replace(/:[^/:]+$/, "");
+    if (update.length > 0 && !update.some(digest => known.includes(digest) || cached?.digests.includes(digest))) {
+        return { kind: "download", pull: `${repository}@${update[0]}`, digests: update };
+    }
+    if (cached) return { kind: "cached", imageId: cached.id, digests: cached.digests };
+    if (state.active?.upstream.reference === settings.image && known.length > 0) return { kind: "download", pull: `${repository}@${known[0]}`, digests: known };
+    return undefined;
+}
+
+/** Plan the CPU runtime, ask for one approval covering preparation and cutover, then run both in the background. */
 async function apply(ui: UI): Promise<void> {
     const state = readState();
     if (state?.mode !== "cpu") {
@@ -279,54 +308,85 @@ async function apply(ui: UI): Promise<void> {
         ui.notify("Hindsight: Docker is not reachable; nothing was changed.", "error");
         return;
     }
-    const image = await inspectImage(settings.image);
-    if (!image) {
-        ui.notify(`Hindsight: ${settings.image} is not cached locally. Downloading it requires an explicit download action; nothing was changed.`, "warning");
+    const target = await planTarget(state, settings);
+    if (!target) {
+        ui.notify(`Hindsight: ${settings.image} is not cached and its registry target is not known yet; nothing was changed. When the check reports the target, choose Apply requested configuration to approve the download.`, "info");
+        await startCheck(ui, settings);
         return;
     }
     const name = settings.containerName;
     const container = await inspectContainer(name);
-    if (container?.running && !isPending(state, settings) && matchesApproved(container, state) && container.imageId === image.id) {
+    if (target.kind === "cached" && container?.running && !isPending(state, settings) && matchesApproved(container, state) && container.imageId === target.imageId) {
         ui.notify("Hindsight: the approved runtime already matches the requested configuration; nothing to apply.", "info");
         return;
     }
-    const previousImage = container?.imageId ?? state.active?.imageId;
+    const versionChanges = target.kind === "cached"
+        ? (container?.imageId ?? state.active?.imageId ?? target.imageId) !== target.imageId
+        : (container !== undefined || state.active !== undefined) && !target.digests.some(digest => state.active?.upstream.digests.includes(digest));
     const plan = [
         `Hindsight provider configuration: ${settings.provider}`,
-        `Image: ${settings.image}, cached as ${image.id.slice(7, 19)}. No download or build.`,
+        target.kind === "cached"
+            ? `Image: ${settings.image}, cached as ${target.imageId.slice(7, 19)}. No download or build.`
+            : `Image: downloads ${target.pull} for ${settings.image} in the background; the download size is not known in advance. The current service keeps running while it downloads.`,
         container
             ? `Shared service: container ${name} keeps running until cutover, is stopped gracefully (up to 75 seconds) and replaced.`
             : `Shared service: creates container ${name}.`,
         `Data: reuses volume ${settings.volumeName}${settings.codexAuthDir ? " and the Codex credential directory" : ""}, the same ports, bind address and worker identity.`,
-        ...(previousImage && previousImage !== image.id
-            ? ["Warning: a different Hindsight version may migrate the reused database; replacing the image does not roll the database back."]
-            : []),
+        ...(versionChanges ? ["Warning: a different Hindsight version may migrate the reused database; replacing the image does not roll the database back."] : []),
     ];
-    if (!await ui.confirm("Apply the Hindsight CPU runtime?", plan.join("\n"))) return;
-    const lease = await takeLease("apply", image.id);
+    const title = target.kind === "cached" ? "Apply the Hindsight CPU runtime?" : "Download and apply the Hindsight CPU runtime?";
+    if (!await ui.confirm(title, plan.join("\n"))) return;
+    const lease = await takeLease("apply", target.kind === "cached" ? target.imageId : undefined);
     if (!lease) {
         ui.notify("Hindsight: another OMP process is changing the local runtime; nothing was applied. Try again when it finishes.", "warning");
         return;
     }
-    ui.notify("Hindsight: applying the approved CPU runtime in the background.", "info");
-    void runOperation(ui, lease, () => applyApproved({ settings, imageId: image.id, digests: image.digests }, lease));
+    ui.notify(target.kind === "cached"
+        ? "Hindsight: applying the approved CPU runtime in the background."
+        : `Hindsight: preparing ${target.pull} in the background; the current service keeps running until cutover.`, "info");
+    void runOperation(ui, lease, () => applyApproved({ settings, target }, lease));
 }
 
 async function applyApproved(plan: ApprovedPlan, lease: string): Promise<Outcome> {
-    const { settings } = plan;
+    const { settings, target } = plan;
     const fail = async (stage: FailureStage, message: string, level: Outcome["level"] = "error"): Promise<Outcome> => {
         await updateState(state => state && { ...state, failure: { mode: "cpu", provider: settings.provider, stage, message, at: new Date().toISOString() } });
         return { level, message };
     };
-    // Writes are atomic renames, so an unlocked read is consistent; the lease excludes competing lifecycle work.
+    let imageId: string;
+    if (target.kind === "cached") {
+        imageId = target.imageId;
+    } else {
+        const present = await inspectImage(target.pull);
+        if (!present && (await docker(["pull", target.pull], PULL_TIMEOUT_MS)).exitCode !== 0) {
+            // Registry errors can echo credentials or tokens, so neither stdout nor stderr is logged or shown.
+            log("docker pull failed for", target.pull);
+            return fail("prepare", `Hindsight: downloading ${target.pull} failed; nothing was replaced and the current service keeps running. Check Docker's registry access and apply again.`);
+        }
+        const pulled = present ?? await inspectImage(target.pull);
+        if (!pulled) return fail("prepare", `Hindsight: ${target.pull} is not available after the download; nothing was replaced.`);
+        imageId = pulled.id;
+        if (!present) {
+            const entry = { imageId, kind: "download" as const, base: target.pull, recordedAt: new Date().toISOString() };
+            await updateState(state => state && { ...state, owned: [...(state.owned ?? []).filter(owned => owned.imageId !== imageId), entry] });
+        }
+    }
+
+    // Revalidate under the lock: the approval covers exactly this lease, mode, configuration and image.
     const current = resolveSettings().settings;
-    const cached = await inspectImage(settings.image);
-    const state = readState();
-    const changed = state?.operation?.id !== lease ? "another process took over local management"
-        : state.mode !== "cpu" ? "local management was turned Off"
-        : current?.provider !== settings.provider || current.configDigest !== settings.configDigest ? "the provider configuration changed after approval"
-        : cached?.id !== plan.imageId ? "the cached image changed after approval"
-        : undefined;
+    const prepared = await inspectImage(target.kind === "cached" ? settings.image : target.pull);
+    let changed: string | undefined;
+    let installationId = "";
+    await updateState(state => {
+        changed = state?.operation?.id !== lease ? "another process took over local management"
+            : state.mode !== "cpu" ? "local management was turned Off"
+            : current?.provider !== settings.provider || current.configDigest !== settings.configDigest ? "the provider configuration changed after approval"
+            : prepared?.id !== imageId ? "the image changed after approval"
+            : undefined;
+        if (changed) return undefined;
+        installationId = state!.installationId;
+        return { ...state!, operation: { ...state!.operation!, candidateImageId: imageId } };
+    });
     if (changed) return fail("validate", `Hindsight: nothing was replaced because ${changed}; review /hindsight and apply again.`, "warning");
 
     const name = settings.containerName;
@@ -342,7 +402,7 @@ async function applyApproved(plan: ApprovedPlan, lease: string): Promise<Outcome
             return fail("cutover", "Hindsight: could not set the current container aside; it was restarted and nothing was replaced.");
         }
     }
-    if (!await runManagedContainer(settings, plan.imageId, state!.installationId)) {
+    if (!await runManagedContainer(settings, imageId, installationId)) {
         log("docker run failed during cutover");
         if (!previous) return fail("cutover", "Hindsight: the new container could not be created; see the extension's hindsight.log");
         await docker(["rm", name]);
@@ -355,17 +415,36 @@ async function applyApproved(plan: ApprovedPlan, lease: string): Promise<Outcome
     if (!await waitUntilReady(settings)) {
         await docker(["stop", "--time", "75", name], 90_000);
         return fail("readiness", `Hindsight: the new container ${name} did not report a healthy API and database and was stopped.` + (previous
-            ? ` The previous container is preserved as ${previous}; the database may already have been migrated, so restoring it is a manual decision.`
+            ? ` The previous container is preserved as ${previous} and both images are kept; the database may already have been migrated, so restoring it is a manual decision.`
             : ""));
     }
-    await updateState(current => current && {
-        ...current,
-        active: { mode: "cpu", provider: settings.provider, configDigest: settings.configDigest, upstream: { reference: settings.image, digests: plan.digests }, imageId: plan.imageId, appliedAt: new Date().toISOString() },
-        failure: undefined,
+    let previousImage: string | undefined;
+    await updateState(state => {
+        if (!state) return undefined;
+        previousImage = state.active?.imageId;
+        const applied = state.check?.available && target.digests.includes(state.check.available.digest);
+        return {
+            ...state,
+            active: { mode: "cpu", provider: settings.provider, configDigest: settings.configDigest, upstream: { reference: settings.image, digests: target.digests }, imageId, appliedAt: new Date().toISOString() },
+            failure: undefined,
+            cleanupFailure: undefined,
+            check: applied ? { attemptedAt: state.check!.attemptedAt, outcome: "current" } : state.check,
+        };
     });
+
     const ready = `Hindsight: CPU runtime ready (API :${settings.apiPort}, UI :${settings.uiPort})`;
-    if (previous && (await docker(["rm", previous])).exitCode !== 0) {
-        return { level: "warning", message: `${ready}; the previous container ${previous} could not be removed.` };
+    const problems: string[] = [];
+    if (previous && (await docker(["rm", previous])).exitCode !== 0) problems.push(`the previous container ${previous} could not be removed`);
+    // Moving the configured tag leaves the superseded image untagged, which is what makes it removable.
+    if (target.kind === "download" && !PINNED.test(settings.image) && (await docker(["tag", imageId, settings.image])).exitCode !== 0) {
+        problems.push(`${settings.image} could not be tagged to the new image`);
     }
-    return { level: "info", message: ready };
+    if (previousImage && previousImage !== imageId && !await removeUnusedImage(previousImage)) {
+        problems.push(`the previous image ${previousImage.slice(7, 19)} could not be removed`);
+    }
+    if (problems.length === 0) return { level: "info", message: ready };
+    const message = problems.join("; ");
+    log("Cleanup after a healthy cutover failed:", message);
+    await updateState(state => state && { ...state, cleanupFailure: { message, at: new Date().toISOString() } });
+    return { level: "warning", message: `${ready}. Cleanup needs attention: ${message}.` };
 }

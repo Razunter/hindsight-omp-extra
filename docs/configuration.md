@@ -137,21 +137,25 @@ The Anthropic SDK appends `/v1/messages`, so its base excludes `/v1`. OpenCode d
 
 `/hindsight` is the single menu for local Hindsight management. It needs an interactive session and works without any local setup.
 
-- **Status** shows the requested mode, the requested provider configuration, the last approved runtime (provider, image ID, upstream reference, time), pending configuration, the last failure, the last update check and any operation in progress, as separate lines. A requested change is never shown as the active runtime. In Off, status uses only stored state and says Docker was not inspected.
+- **Status** shows the requested mode, the requested provider configuration, the last approved runtime (provider, image ID, upstream reference, time), pending configuration, the last failure, a cleanup failure after the last healthy cutover, the last update check and any operation in progress, as separate lines. A requested change is never shown as the active runtime. In Off, status uses only stored state and says Docker was not inspected.
 - **Mode** switches between **Off** and **CPU**. Off takes effect immediately for every OMP process of this installation without stopping the container or deleting anything. Choosing CPU records the request and continues to the apply step.
 - **Provider configuration** lists contained profile names, never credentials, and atomically saves just the name in `.selected-provider`. Cancellation, a disappearing profile or a failed write preserves the previous saved choice. An empty or missing profiles directory reports setup guidance instead of opening an empty dialog. With CPU management on, it continues to the apply step.
-- **Apply requested configuration** validates the selected configuration (containment, native settings, Codex auth) before any Docker work. It then looks up the configured image in Docker’s local cache. An uncached image is reported as needing an explicit download, and nothing changes. Otherwise one confirmation shows the provider configuration, the cached image ID, the data volume, whether an existing container is replaced, and a warning when the image differs from the running one.
+- **Apply requested configuration** validates the selected configuration (containment, native settings, Codex auth) before any Docker work, then picks the image target: an available update recorded by the last check, otherwise the image cached under the configured reference, otherwise a fresh download of the approved image's registry digest when that image left the cache. With none of these (a first installation without a cached image) it starts an update check and changes nothing; choose Apply again once the check reports the target. One confirmation then shows the provider configuration, the cached image ID or the exact `repository@digest` to download, the data volume, whether an existing container is replaced, and a migration warning when the Hindsight image differs from the running one. There is no separate download-only step.
 - **Check for updates** reads registry metadata for the configured image right away, ignoring the daily interval. It needs CPU management on and a valid configuration; see [update checks](#update-checks).
 
 Mode, approval and runtime state are installation-wide and stored in `.local-management.json` (mode `0600`, written atomically under a short lock). Provider and credential files are never rewritten. A legacy installation without that file is treated as Off and receives one notice.
 
-### Applying a cached CPU runtime
+### Installing and updating a CPU runtime
 
-After approval the handler returns and the work continues in the background. Before cutover the extension checks again that local management is still CPU, the provider configuration is unchanged and the configured tag still resolves to the approved image ID. If anything changed, nothing is replaced and the abandoned change is recorded as a failure.
+After approval the handler returns and the work continues in the background; one notification says it started and one reports the outcome. A download target is pulled with `docker pull <repository>@<digest>` (up to one hour) while the current container keeps running; Docker's output is drained and never shown or logged. An image the download added is recorded in `.local-management.json` as owned by this installation. A failed download leaves the container and the approved runtime unchanged and is recorded as a `prepare` failure.
+
+Before cutover the extension checks again that it still holds the operation lease, local management is still CPU, the provider configuration is unchanged and the prepared image still matches the approval: the cached tag still resolves to the approved image ID, or the downloaded `repository@digest` is present. Because a download is addressed by digest, a tag or update check that moves after approval cannot change what is applied. If anything changed, nothing is replaced and the abandoned change is recorded as a failure; a downloaded image is kept.
 
 Cutover stops an existing container with `docker stop --time 75`, renames it to `<name>-previous-<id>`, and runs the approved image ID with the same name, data volume, Codex mount, ports, bind address, worker identity and shared memory, plus labels identifying this installation and the approved configuration. Two containers never run on the volume at once. If the new container cannot be created, the previous one is renamed back and restarted.
 
-Success requires Hindsight’s `/health` endpoint to report `healthy` with a `connected` database within `HINDSIGHT_OMP_READINESS_TIMEOUT_SECONDS` (default 300). A wildcard bind address is probed on loopback. If the new container exits or never becomes ready, it is stopped, the previous container and both images are kept, and the failure names the preserved container. There is no automatic restore: a newer image may already have migrated the database, and the extension adds no backup, restore or re-embedding step. Only after readiness is the runtime recorded as active and the previous container removed.
+Success requires Hindsight’s `/health` endpoint to report `healthy` with a `connected` database within `HINDSIGHT_OMP_READINESS_TIMEOUT_SECONDS` (default 300). A wildcard bind address is probed on loopback. If the new container exits or never becomes ready, it is stopped, the previous container and both images are kept, and the failure names the preserved container. There is no automatic restore: a newer image may already have migrated the database, so going back to the old image is not a database rollback. The extension adds no backup, restore or re-embedding step.
+
+Only after readiness is the runtime recorded as active, with the registry digests from the approval. The extension then removes the previous container, tags a downloaded image with the configured reference when it is a tag (a digest-pinned reference is left alone), and removes the previously active image only when it has no tag left and no container, running or stopped, uses it: `docker image rm --no-prune`, never forced, never a prune. A failure in these steps is a warning and a separate `cleanupFailure` in Status; the new runtime stays reported as ready.
 
 ### Startup recovery
 
@@ -160,7 +164,7 @@ Only a fresh interactive main OMP process acts on startup, once per process; `/n
 - No approved runtime yet: a warning points to `/hindsight`; Docker is not contacted.
 - The approved container is running: it is reported as running.
 - The approved container is stopped: it is started and checked for readiness.
-- The container is missing: it is recreated from the approved image ID only when that image is still cached and the current configuration matches the approved one. A missing image or a pending change is reported instead. Startup never pulls, builds or follows a moved tag.
+- The container is missing: it is recreated from the approved image ID only when that image is still cached and the current configuration matches the approved one. A missing image or a pending change is reported instead; re-downloading the approved image is an explicit **Apply requested configuration**. Startup never pulls, builds or follows a moved tag.
 - A container with the configured name that is not the approved runtime is left untouched and reported.
 
 A pending configuration is always reported and never applied at startup.
@@ -173,7 +177,7 @@ The check records the index digest and the `linux/<host architecture>` manifest 
 
 With CPU management on and an approved runtime, a fresh interactive main OMP process checks in the background after startup recovery, at most once per 24 hours across all processes of the installation. The attempt time is claimed before the registry call, so failed and interrupted attempts also wait out the interval. An available update, failure or unsupported result is a nonmodal notification; a current result is quiet. Off, headless sessions, subagents and evidence or recall requests never check.
 
-An available update is information only. It does not approve, download or apply anything, and the requested and active runtimes stay unchanged.
+An available update is information only. It does not approve, download or apply anything, and the requested and active runtimes stay unchanged. To install it, choose **Apply requested configuration** and approve the confirmation that names the recorded target.
 
 ### Coordination between OMP processes
 
@@ -181,7 +185,7 @@ Each lifecycle operation takes an installation-wide lease. While another live pr
 
 ### Images
 
-This version never pulls, builds, removes or prunes images; update checks read registry metadata only. Containers are created with `--pull never` from the approved image ID. Tests use an executable fake Docker and synthetic state; they do not contact a registry or build, pull or remove real images.
+Images are downloaded only through an approved apply, by registry digest, and removed only as described above after a healthy cutover. Update checks read registry metadata only. Containers are created with `--pull never` from the approved image ID. Tests use an executable fake Docker and synthetic state; they do not contact a registry or build, pull or remove real images.
 
 ## Migration from the old root provider tuple
 

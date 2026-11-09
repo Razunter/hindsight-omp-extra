@@ -28,8 +28,12 @@ export interface ManagementState {
     noticeShown?: boolean;
     active?: ApprovedRuntime;
     failure?: { mode: "cpu"; provider: string; stage: "prepare" | "validate" | "cutover" | "readiness"; message: string; at: string };
+    /** Housekeeping after a healthy cutover failed; the runtime itself is ready. */
+    cleanupFailure?: { message: string; at: string };
     operation?: { id: string; pid: number; kind: "apply" | "recover"; startedAt: string; candidateImageId?: string };
     check?: UpdateCheck;
+    /** Images this installation downloaded, so later cleanup never claims an image that was already cached. */
+    owned?: { imageId: string; kind: "download"; base: string; recordedAt: string }[];
 }
 
 export function initialState(): ManagementState {

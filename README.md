@@ -56,7 +56,7 @@ The skill uses a scout to distill useful knowledge and queues it through OMP’s
 ## Defaults and limits
 
 - **Local ports:** the launcher binds the API and dashboard to `127.0.0.1`. [`HINDSIGHT_BIND_ADDRESS`](docs/configuration.md#network-binding) overrides both.
-- **Opt-in management:** `/hindsight` shows status, switches local management between Off and CPU, selects the provider configuration, checks for image updates and applies changes after one confirmation, in the current OMP process. Off never stops or changes a running container. Existing installations get a one-time notice instead of being opted in.
+- **Opt-in management:** `/hindsight` shows status, switches local management between Off and CPU, selects the provider configuration, checks for image updates and installs or applies them after one confirmation that names the exact image, in the current OMP process. Off never stops or changes a running container. Existing installations get a one-time notice instead of being opted in.
 - **Approved runtime only:** with CPU management on, a fresh interactive main OMP process starts the last approved container or recreates it from the approved cached image. Edited `.env` or profile files are reported as pending, never applied at startup. Nothing is downloaded automatically: at most once a day, startup reads the configured image's registry metadata and notifies you when it has moved. Headless sessions and subagents never manage Docker. The container keeps running after OMP exits; [stop it explicitly](docs/setup.md#stop-the-container) when you no longer need it.
 - **Advisory recall:** the retrieval footer is on; mid-run nudges are off. Neither forces a lookup, and improved task results from nudges have not been demonstrated.
 
