@@ -57,9 +57,14 @@ export function readState(): ManagementState | undefined {
     }
 }
 
-export function pidAlive(pid: number): boolean {
+function pidAlive(pid: number): boolean {
     try { process.kill(pid, 0); return true; }
     catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/** The recorded operation while its process lives; a dead holder's lease authorizes nothing. */
+export function liveOperation(state: ManagementState): ManagementState["operation"] {
+    return state.operation && pidAlive(state.operation.pid) ? state.operation : undefined;
 }
 
 function lockIsStale(): boolean {
@@ -115,7 +120,7 @@ function writeState(state: ManagementState): void {
 export async function takeLease(kind: "apply" | "recover", candidateImageId?: string): Promise<string | undefined> {
     const id = randomUUID();
     const taken = await updateState(state => {
-        if (!state || (state.operation && pidAlive(state.operation.pid))) return undefined;
+        if (!state || liveOperation(state)) return undefined;
         return { ...state, operation: { id, pid: process.pid, kind, startedAt: new Date().toISOString(), ...(candidateImageId ? { candidateImageId } : {}) } };
     });
     return taken ? id : undefined;

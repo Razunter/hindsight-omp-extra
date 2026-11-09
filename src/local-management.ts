@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { BASE_LABEL, CONFIG_LABEL, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, cudaUsable, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, type ContainerInfo, type ImageInfo } from "./docker";
-import { initialState, pidAlive, readState, releaseLease, takeLease, updateState, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
+import { initialState, liveOperation, readState, releaseLease, takeLease, updateState, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 
 // Reload replaces modules, not this process-lifetime startup decision.
@@ -16,7 +16,8 @@ const CUDA_REPOSITORY = "hindsight-omp-cuda";
 const LOCAL_MODELS = [["Embeddings", "EMBEDDINGS"], ["Reranker", "RERANKER"]] as const;
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const PULL_TIMEOUT_MS = 60 * 60 * 1000;
-const PINNED = /@sha256:[a-f0-9]{64}$/;
+const PINNED = /@(sha256:[a-f0-9]{64})$/;
+const KEEP_GPU = " GPU stays requested; no CPU fallback was applied.";
 
 type UI = ExtensionContext["ui"];
 type Outcome = { level: "info" | "warning" | "error"; message: string };
@@ -26,7 +27,6 @@ type FailureStage = NonNullable<ManagementState["failure"]>["stage"];
  * derivative built from the upstream `base`. `reference` names the image to revalidate; `digests` are the upstream's.
  */
 type Target = { reference: string; digests: string[]; base?: string } & ({ kind: "cached"; imageId: string } | { kind: "download" } | { kind: "build" });
-interface ApprovedPlan { settings: HindsightSettings; target: Target }
 
 export function registerLocalManagement(pi: ExtensionAPI): void {
     pi.registerCommand("hindsight", {
@@ -94,7 +94,7 @@ async function removeSupersededImages(previousImage: string | undefined): Promis
         const state = readState();
         const active = state?.active;
         if (!active) break;
-        const operation = state.operation && pidAlive(state.operation.pid) ? state.operation : undefined;
+        const operation = liveOperation(state);
         const entry = state.owned?.find(owned => owned.imageId === id);
         if (id === active.imageId || id === operation?.candidateImageId || (entry && active.upstream.digests.includes(digestOf(entry.base)))) continue;
         const ownTag = entry?.kind === "derivative" ? derivativeTag(digestOf(entry.base)) : undefined;
@@ -151,7 +151,7 @@ async function claimCheck(background: boolean): Promise<number | undefined> {
 /** Compare the configured upstream reference's registry digests with the approved runtime's. Never prepares or applies anything. */
 async function checkForUpdates(ui: UI, reference: string, claimed: number, background: boolean): Promise<void> {
     const found = await inspectUpstream(reference);
-    const pinned = /@(sha256:[a-f0-9]{64})$/.exec(reference)?.[1];
+    const pinned = PINNED.exec(reference)?.[1];
     const known = readState()?.active?.upstream.digests ?? [];
     let result: Omit<UpdateCheck, "attemptedAt">;
     if (found === "unsupported") {
@@ -321,7 +321,8 @@ function showStatus(ui: UI): void {
     if (state?.failure) lines.push(`Last failure (${MODE_NAME[state.failure.mode]} ${state.failure.stage}, ${state.failure.at}): ${state.failure.message}`);
     if (state?.cleanupFailure) lines.push(`Cleanup after the last healthy cutover failed (${state.cleanupFailure.at}): ${state.cleanupFailure.message}`);
     lines.push(state?.check ? `Last update check (${new Date(state.check.attemptedAt).toISOString()}): ${describeCheck(state.check)}` : "Last update check: none");
-    if (state?.operation && pidAlive(state.operation.pid)) lines.push(`In progress: ${state.operation.kind} since ${state.operation.startedAt}`);
+    const operation = state && liveOperation(state);
+    if (operation) lines.push(`In progress: ${operation.kind} since ${operation.startedAt}`);
     ui.notify(lines.join("\n"), "info");
 }
 
@@ -405,33 +406,14 @@ async function apply(ui: UI, update: boolean): Promise<void> {
         await startCheck(ui, settings);
         return;
     }
-    const name = settings.containerName;
-    const container = await inspectContainer(name);
+    const container = await inspectContainer(settings.containerName);
     if (target.kind === "cached" && container?.running && !isPending(state, settings) && matchesApproved(container, state) && container.imageId === target.imageId) {
         ui.notify("Hindsight: the approved runtime already matches the requested configuration; nothing to apply.", "info");
         return;
     }
-    const runningImage = container?.imageId ?? state.active?.imageId;
-    const sameRelease = state.active?.upstream.digests.some(digest => target.digests.includes(digest)) || (target.kind === "cached" && runningImage === target.imageId);
     const mode = MODE_NAME[state.mode];
-    const plan = [
-        `Hindsight provider configuration: ${settings.provider}`,
-        target.kind === "download"
-            ? `Image: downloads ${target.reference} for ${settings.image} in the background; the download size is not known in advance. The current service keeps running while it downloads.`
-            : target.kind === "build"
-            ? `Image: builds the CUDA derivative ${target.reference} from ${target.base} in the background, replacing only its PyTorch wheel with the CUDA build of the same version (about 11 GB on disk; the base is downloaded first if it is not cached). The current service keeps running during the build and GPU validation.`
-            : gpu
-            ? `Image: reuses this installation's CUDA derivative ${target.reference} (${target.imageId.slice(7, 19)}) of ${target.base}. No download or build.`
-            : `Image: ${settings.image}, cached as ${target.imageId.slice(7, 19)}. No download or build.`,
-        ...(gpu ? [`GPU: needs the NVIDIA driver and NVIDIA Container Toolkit. The container gets --gpus all, and the local ${models.map(([model]) => model.toLowerCase()).join(" and ")} model${models.length > 1 ? "s" : ""} must run on CUDA. Any failure keeps the current service; there is no CPU fallback.`] : []),
-        container
-            ? `Shared service: container ${name} keeps running until cutover, is stopped gracefully (up to 75 seconds) and replaced.`
-            : `Shared service: creates container ${name}.`,
-        `Data: reuses volume ${settings.volumeName}${settings.codexAuthDir ? " and the Codex credential directory" : ""}, the same ports, bind address and worker identity.`,
-        ...(runningImage !== undefined && !sameRelease ? ["Warning: a different Hindsight version may migrate the reused database; replacing the image does not roll the database back."] : []),
-    ];
-    const verb = target.kind === "cached" ? "Apply" : target.kind === "download" ? "Download and apply" : "Build and apply";
-    if (!await ui.confirm(`${verb} the Hindsight ${mode} runtime?`, plan.join("\n"))) return;
+    const verb = { cached: "Apply", download: "Download and apply", build: "Build and apply" }[target.kind];
+    if (!await ui.confirm(`${verb} the Hindsight ${mode} runtime?`, describePlan(state, settings, target, container))) return;
     const lease = await takeLease("apply", target.kind === "cached" ? target.imageId : undefined);
     if (!lease) {
         ui.notify("Hindsight: another OMP process is changing the local runtime; nothing was applied. Try again when it finishes.", "warning");
@@ -442,44 +424,71 @@ async function apply(ui: UI, update: boolean): Promise<void> {
         : target.kind === "download"
         ? `Hindsight: preparing ${target.reference} in the background; the current service keeps running until cutover.`
         : `Hindsight: building the CUDA image from ${target.base} in the background; the current service keeps running until cutover.`, "info");
-    void runOperation(ui, lease, () => applyApproved({ settings, target }, lease, state.installationId));
+    void runOperation(ui, lease, () => applyApproved(settings, target, lease, state.installationId));
 }
 
-async function applyApproved(plan: ApprovedPlan, lease: string, installationId: string): Promise<Outcome> {
-    const { settings, target } = plan;
-    const mode = settings.gpu ? "gpu" : "cpu";
-    const keepGpu = settings.gpu ? " GPU stays requested; no CPU fallback was applied." : "";
-    const fail = async (stage: FailureStage, message: string, level: Outcome["level"] = "error"): Promise<Outcome> => {
-        await updateState(state => state && { ...state, failure: { mode, provider: settings.provider, stage, message, at: new Date().toISOString() } });
-        return { level, message };
-    };
+/** The confirmation text: the image work, GPU requirements, shared-service cutover and data the approval covers. */
+function describePlan(state: ManagementState, settings: HindsightSettings, target: Target, container: ContainerInfo | undefined): string {
+    const models = localModels(settings);
+    const runningImage = container?.imageId ?? state.active?.imageId;
+    const sameRelease = state.active?.upstream.digests.some(digest => target.digests.includes(digest)) || (target.kind === "cached" && runningImage === target.imageId);
+    return [
+        `Hindsight provider configuration: ${settings.provider}`,
+        target.kind === "download"
+            ? `Image: downloads ${target.reference} for ${settings.image} in the background; the download size is not known in advance. The current service keeps running while it downloads.`
+            : target.kind === "build"
+            ? `Image: builds the CUDA derivative ${target.reference} from ${target.base} in the background, replacing only its PyTorch wheel with the CUDA build of the same version (about 11 GB on disk; the base is downloaded first if it is not cached). The current service keeps running during the build and GPU validation.`
+            : settings.gpu
+            ? `Image: reuses this installation's CUDA derivative ${target.reference} (${target.imageId.slice(7, 19)}) of ${target.base}. No download or build.`
+            : `Image: ${settings.image}, cached as ${target.imageId.slice(7, 19)}. No download or build.`,
+        ...(settings.gpu ? [`GPU: needs the NVIDIA driver and NVIDIA Container Toolkit. The container gets --gpus all, and the local ${models.map(([model]) => model.toLowerCase()).join(" and ")} model${models.length > 1 ? "s" : ""} must run on CUDA. Any failure keeps the current service; there is no CPU fallback.`] : []),
+        container
+            ? `Shared service: container ${settings.containerName} keeps running until cutover, is stopped gracefully (up to 75 seconds) and replaced.`
+            : `Shared service: creates container ${settings.containerName}.`,
+        `Data: reuses volume ${settings.volumeName}${settings.codexAuthDir ? " and the Codex credential directory" : ""}, the same ports, bind address and worker identity.`,
+        ...(runningImage !== undefined && !sameRelease ? ["Warning: a different Hindsight version may migrate the reused database; replacing the image does not roll the database back."] : []),
+    ].join("\n");
+}
+
+/** Download or build the approved target, recording images this installation created; returns the image ID or why preparation failed. */
+async function prepareImage(target: Target, installationId: string): Promise<{ imageId: string } | { problem: string }> {
     const own = (imageId: string, kind: "download" | "derivative", base: string) => updateState(state => state && {
         ...state, owned: [...(state.owned ?? []).filter(owned => owned.imageId !== imageId), { imageId, kind, base, recordedAt: new Date().toISOString() }],
     });
-    let imageId: string;
-    if (target.kind === "cached") {
-        imageId = target.imageId;
-    } else if (target.kind === "download") {
+    if (target.kind === "cached") return { imageId: target.imageId };
+    if (target.kind === "download") {
         const present = await inspectImage(target.reference);
         if (!present && (await docker(["pull", target.reference], PULL_TIMEOUT_MS)).exitCode !== 0) {
             // Registry errors can echo credentials or tokens, so neither stdout nor stderr is logged or shown.
             log("docker pull failed for", target.reference);
-            return fail("prepare", `Hindsight: downloading ${target.reference} failed; nothing was replaced and the current service keeps running. Check Docker's registry access and apply again.`);
+            return { problem: `Hindsight: downloading ${target.reference} failed; nothing was replaced and the current service keeps running. Check Docker's registry access and apply again.` };
         }
         const pulled = present ?? await inspectImage(target.reference);
-        if (!pulled) return fail("prepare", `Hindsight: ${target.reference} is not available after the download; nothing was replaced.`);
-        imageId = pulled.id;
-        if (!present) await own(imageId, "download", target.reference);
-    } else {
-        if (!await buildCudaDerivative(target.base!, target.reference, installationId)) {
-            log("docker build failed for", target.base);
-            return fail("prepare", `Hindsight: building the CUDA image from ${target.base} failed (base download, a CUDA PyTorch wheel for its torch version, a dependency change or the CUDA check); nothing was replaced and the current service keeps running.${keepGpu} See "GPU runtime" in docs/configuration.md to rerun the build by hand.`);
-        }
-        const built = await inspectImage(target.reference);
-        if (!built || !builtFor(built, installationId, target.base!)) return fail("prepare", `Hindsight: ${target.reference} is not this installation's CUDA image after the build; nothing was replaced.${keepGpu}`);
-        imageId = built.id;
-        await own(imageId, "derivative", target.base!);
+        if (!pulled) return { problem: `Hindsight: ${target.reference} is not available after the download; nothing was replaced.` };
+        if (!present) await own(pulled.id, "download", target.reference);
+        return { imageId: pulled.id };
     }
+    // Only GPU mode plans a build.
+    if (!await buildCudaDerivative(target.base!, target.reference, installationId)) {
+        log("docker build failed for", target.base);
+        return { problem: `Hindsight: building the CUDA image from ${target.base} failed (base download, a CUDA PyTorch wheel for its torch version, a dependency change or the CUDA check); nothing was replaced and the current service keeps running.${KEEP_GPU} See "GPU runtime" in docs/configuration.md to rerun the build by hand.` };
+    }
+    const built = await inspectImage(target.reference);
+    if (!built || !builtFor(built, installationId, target.base!)) return { problem: `Hindsight: ${target.reference} is not this installation's CUDA image after the build; nothing was replaced.${KEEP_GPU}` };
+    await own(built.id, "derivative", target.base!);
+    return { imageId: built.id };
+}
+
+async function applyApproved(settings: HindsightSettings, target: Target, lease: string, installationId: string): Promise<Outcome> {
+    const mode = settings.gpu ? "gpu" : "cpu";
+    const keepGpu = settings.gpu ? KEEP_GPU : "";
+    const fail = async (stage: FailureStage, message: string, level: Outcome["level"] = "error"): Promise<Outcome> => {
+        await updateState(state => state && { ...state, failure: { mode, provider: settings.provider, stage, message, at: new Date().toISOString() } });
+        return { level, message };
+    };
+    const prepared = await prepareImage(target, installationId);
+    if ("problem" in prepared) return fail("prepare", prepared.problem);
+    const { imageId } = prepared;
     if (settings.gpu && !await cudaUsable(imageId)) {
         log("GPU validation failed for", imageId);
         return fail("validate", `Hindsight: the CUDA image could not use a GPU in Docker (check the NVIDIA driver, the NVIDIA Container Toolkit and docker run --gpus all); nothing was replaced and the current service keeps running.${keepGpu}`);
@@ -487,14 +496,14 @@ async function applyApproved(plan: ApprovedPlan, lease: string, installationId: 
 
     // Revalidate under the lock: the approval covers exactly this lease, mode, configuration and image.
     const current = resolveSettings(settings.gpu).settings;
-    const prepared = await inspectImage(target.reference);
+    const candidate = await inspectImage(target.reference);
     let changed: string | undefined;
     await updateState(state => {
         changed = state?.operation?.id !== lease ? "another process took over local management"
             : state.mode === "off" ? "local management was turned Off"
             : state.mode !== mode ? "the requested mode changed after approval"
             : current?.provider !== settings.provider || current.configDigest !== settings.configDigest ? "the provider configuration changed after approval"
-            : prepared?.id !== imageId ? "the image changed after approval"
+            : candidate?.id !== imageId ? "the image changed after approval"
             : undefined;
         if (changed) return undefined;
         return { ...state!, operation: { ...state!.operation!, candidateImageId: imageId } };

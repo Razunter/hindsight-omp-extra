@@ -22,7 +22,6 @@ export interface DockerState {
     images: Record<string, { tags: string[]; digests?: string[]; labels?: Record<string, string> }>;
     health?: "healthy" | "unhealthy";
     healthProbes?: string[];
-    stopFails?: boolean;
     exitsAfterRun?: boolean;
     sharedVolumeRun?: boolean;
     waitForHandler?: boolean;
@@ -196,7 +195,7 @@ case "logs": {
     const device = state.modelDevice ?? (container.gpus && state.gpu === "cuda" ? "cuda" : "cpu");
     err = "Embeddings: local provider initialized (dim: 384, device: " + device + ")\\nReranker: local provider initialized (device: " + device + ", max_concurrent=4)"; break;
 }
-case "stop": { const name = findContainer(args.at(-1)); if (!name || state.stopFails) { code = 1; break; } state.containers[name].running = false; break; }
+case "stop": { const name = findContainer(args.at(-1)); if (!name) { code = 1; break; } state.containers[name].running = false; break; }
 case "start": { const name = findContainer(args.at(-1)); if (!name) { code = 1; break; } state.containers[name].running = true; break; }
 case "rename": { const name = findContainer(args[1]); if (!name || state.containers[args[2]]) { code = 1; break; } state.containers[args[2]] = state.containers[name]; delete state.containers[name]; break; }
 case "rm": { const name = findContainer(args.at(-1)); if (!name || state.containers[name].running) { code = 1; break; } delete state.containers[name]; break; }
