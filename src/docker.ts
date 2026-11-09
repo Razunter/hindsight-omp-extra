@@ -17,6 +17,7 @@ const PYTHON = "/app/api/.venv/bin/python";
  * Unlike the official recipe it also installs a C compiler: on CUDA, PyTorch JIT-compiles Triton kernels for some
  * local models (ModernBERT rerankers) and otherwise fails with "Failed to find C compiler".
  */
+// UV_HTTP_TIMEOUT: uv's default 30 s read timeout failed real builds while fetching multi-GB NVIDIA wheels from pypi.nvidia.com.
 const CUDA_DOCKERFILE = `ARG BASE
 FROM \${BASE}
 ARG PYTORCH_CUDA_FLAVOR=cu126
@@ -27,7 +28,7 @@ USER hindsight
 RUN set -e; \\
     TORCH_BASE_VERSION=$(${PYTHON} -c 'import torch; print(torch.__version__.split("+", 1)[0])'); \\
     uv pip freeze --python ${PYTHON} | grep -v '^torch==' | sort > /tmp/hindsight-before; \\
-    uv pip install --python ${PYTHON} --no-cache --index "$PYTORCH_CUDA_INDEX" "torch==\${TORCH_BASE_VERSION}+\${PYTORCH_CUDA_FLAVOR}"; \\
+    UV_HTTP_TIMEOUT=300 uv pip install --python ${PYTHON} --no-cache --index "$PYTORCH_CUDA_INDEX" "torch==\${TORCH_BASE_VERSION}+\${PYTORCH_CUDA_FLAVOR}"; \\
     uv pip check --python ${PYTHON}; \\
     uv pip freeze --python ${PYTHON} | sort > /tmp/hindsight-after; \\
     changed=$(comm -23 /tmp/hindsight-before /tmp/hindsight-after); \\
