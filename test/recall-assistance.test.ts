@@ -233,6 +233,30 @@ test.each([[true, 0], [false, 0], [true, 3], [false, 3]] as const)("curated less
     expect(results[1]).toEqual(results[0]);
 });
 
+const quality = (prompt: string | string[]) => text(prompt).split(qualityOpen + "\n")[1]?.split("\n" + qualityClose)[0];
+
+test("observation guidance names observe beside lessons and holds the block alone without a lesson tool", () => {
+    const results = run({ active: ["learn", "observe"], steps: [
+        { systemPrompt: "native guidance" }, { reuse: true },
+        { reuse: true, active: ["observe"] },
+        { reuse: true, active: ["learn"] },
+    ] });
+    expect(quality(results[0])).toContain("Curated lessons:");
+    expect(quality(results[0])).toContain("record an observation with `observe`");
+    expect(results[1]).toEqual(results[0]);
+    expect(quality(results[2])).toMatch(/^Observations: [^\n]*`observe`[^\n]*$/);
+    expect(quality(results[3])).toContain("Curated lessons:");
+    expect(quality(results[3])).not.toContain("`observe`");
+});
+
+test.each([
+    { kind: "sub" }, { values: { "memory.backend": "other" } }, { active: ["read"] },
+])("observation guidance is removed outside an eligible main Hindsight session with observe %j", restriction => {
+    const results = run({ active: ["observe"], steps: [{ systemPrompt: "native guidance" }, { reuse: true, ...restriction }] });
+    expect(quality(results[0])).toContain("`observe`");
+    expect(results[1]).toEqual("native guidance");
+});
+
 interface HookObservation {
     result: { messages?: { role: string; customType?: string; content: string }[]; additionalContext?: string; systemPrompt?: string } | null;
     diagnostics: string[];
@@ -293,7 +317,7 @@ test("errors, internal routes, wrappers, control and memory traffic do not advan
         work("read", { path: "agent://child" }), work("eval"), work("todo"), work("wait"), work("ask"), work("task"),
         work("multi_tool_use"), work("multi_tool_use.parallel"), work("parallel"), work("context_notes"), work("new_context"),
         work("manage_skill"), work("observer_resolve"), work("observer_check"), work("observer_review"), work("observer_evaluation"),
-        work("completion"), work("judge"), work("judge_batch"), work("agent"), work("workpool"),
+        work("completion"), work("judge"), work("judge_batch"), work("agent"), work("workpool"), work("observe"),
         work("retain"), work("learn"), work("hindsight_evidence", { action: "source_read" }),
     ];
     const result = events([work(), ...excluded, work("read", { path: "https://example.com" }), work("write", { path: "file.ts" })]);

@@ -33,7 +33,9 @@ This block is independent of the retrieval footer and recall nudge settings. Dur
 
 Private Auto-Learn capture follows its own prompt and calls its permitted lesson tool directly. This remains valid when `learn` is inactive in the main session but still registered for capture, where OMP refuses `retain` and `eval`.
 
-Preparation replaces the owned block rather than stacking copies. Other backends, child/advisor sessions and sessions without an active native memory writer receive none.
+When a tool named `observe` is also active (skill-observer provides it), the block gains one line, with or without a lesson tool: when injected memories repeat one fact across entries, a mental-model snapshot is truncated, or a recalled claim proved wrong and a saved correction cannot retire it, the agent records an observation with `observe`, naming the entries involved and the fix wanted, and continues the task. The extension does not inspect recalled memories; the agent judges what it sees. Without `observe` the block does not mention observations.
+
+Preparation replaces the owned block rather than stacking copies. Other backends, child/advisor sessions and sessions with neither an active native memory writer nor `observe` receive none.
 
 The block adds guidance, not another capture mechanism. OMP's private Auto-Learn capture copies the main agent's system prompt, so it inherits this guidance without another extension hook or model turn. Native tools still own writes, scope and delivery. A queued correction is not confirmed persistence, deletion of stale memory or a guaranteed retrieval ranking. See the extension-only boundary in the [architecture guide](architecture.md).
 
@@ -63,7 +65,7 @@ Omitting `recallNudgeEveryToolCalls` uses the disabled default `0`; raw-setting 
 
 Counting includes successful leaf-tool results by default, including non-default search, MCP and extension tools. There is no work-tool allowlist to keep in sync with the enabled catalog.
 
-Explicit exclusions cover known memory tools, control/orchestration (questions, todos, waits, delegation, context/skill administration, observer operations and judge/completion helpers), eval/multi-tool wrappers, and internal-URI reads/writes.
+Explicit exclusions cover known memory tools, control/orchestration (questions, todos, waits, delegation, context/skill administration, observer operations including `observe`, and judge/completion helpers), eval/multi-tool wrappers, and internal-URI reads/writes.
 
 A device or eval call counts its actual leaf result once, not its outer receipt or schema read. Errors do not count. Unknown tool identities count unless excluded. The extension does not infer unfamiliar third-party control/memory tools or wrappers from their behavior. This is a coarse cadence heuristic, not semantic progress analysis.
 
