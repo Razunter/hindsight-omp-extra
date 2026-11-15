@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { BASE_LABEL, CONFIG_LABEL, CUDA_RECIPE, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, candidateModelDevices, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, serviceModelDevices, type ContainerInfo, type ImageInfo } from "./docker";
 import { initialState, liveOperation, readState, releaseLease, takeLease, updateState, type ApprovedRuntime, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
+import { latestStableRelease, STABLE_IMAGE } from "./stable-release";
 
 // Reload replaces modules, not this process-lifetime startup decision.
 const startupKey = Symbol.for("hindsight-omp.startup-roots");
@@ -167,9 +168,11 @@ async function claimCheck(background: boolean): Promise<number | undefined> {
     return claimed && now;
 }
 
-/** Compare the configured upstream reference's registry digests with the approved runtime's. Never prepares or applies anything. */
+/** Compare stable-release or explicitly configured registry digests with the approved runtime's. */
 async function checkForUpdates(ui: UI, reference: string, claimed: number, background: boolean): Promise<void> {
-    const found = await inspectUpstream(reference);
+    const stable = reference === STABLE_IMAGE;
+    const release = stable ? await latestStableRelease() : undefined;
+    const found = stable && !release ? undefined : await inspectUpstream(release?.image ?? reference);
     const pinned = PINNED.exec(reference)?.[1];
     const known = readState()?.active?.upstream.digests ?? [];
     let result: Omit<UpdateCheck, "attemptedAt">;
@@ -177,11 +180,13 @@ async function checkForUpdates(ui: UI, reference: string, claimed: number, backg
         result = { outcome: "unsupported", message: "update checks need Docker Buildx (docker buildx imagetools), which is not available" };
     } else if (!found || (pinned && pinned !== found.digest && pinned !== found.indexDigest)) {
         log("Update check failed: the registry query failed or returned unusable metadata");
-        result = { outcome: "failed", message: `could not read registry metadata for ${reference}; see the extension's hindsight.log` };
+        result = { outcome: "failed", message: stable && !release
+            ? "could not read stable Hindsight release metadata from GitHub; nothing was changed"
+            : `could not read registry metadata for ${release?.image ?? reference}; see the extension's hindsight.log` };
     } else if (known.includes(found.digest) || (found.indexDigest !== undefined && known.includes(found.indexDigest))) {
         result = { outcome: "current" };
     } else {
-        result = { outcome: "available", available: { reference, ...found } };
+        result = { outcome: "available", available: { reference, ...found, ...(release ? { release } : {}) } };
     }
     // A newer claim (another process or a later manual check) owns the record.
     const recorded = await updateState(state => state?.check?.attemptedAt === claimed ? { ...state, check: { attemptedAt: claimed, ...result } } : undefined);
@@ -192,8 +197,9 @@ async function checkForUpdates(ui: UI, reference: string, claimed: number, backg
 function describeCheck(check: UpdateCheck): string {
     if (check.outcome === "current") return "the approved runtime matches the configured upstream image.";
     if (check.outcome === "available") {
-        const { reference, digest, indexDigest } = check.available!;
-        return `update available for ${reference}: platform manifest ${digest}${indexDigest ? `, index ${indexDigest}` : ""}. Nothing was downloaded, built or changed; choose ${MENU.update} in /hindsight to review it.`;
+        const { reference, release } = check.available!;
+        const label = release ? `stable ${release.version} (${release.image})` : reference;
+        return `update available for ${label}.${release ? `\n${release.url}` : ""}\nNothing was downloaded, built or changed; choose ${MENU.update} in /hindsight to review it.`;
     }
     if (check.outcome) return `update check ${check.outcome}: ${check.message}.`;
     return "update check started without a recorded result.";
@@ -363,11 +369,18 @@ async function selectProvider(ui: UI): Promise<void> {
  */
 async function planTarget(state: ManagementState, settings: HindsightSettings, update: boolean): Promise<Target | undefined> {
     const repository = settings.image.replace(PINNED, "").replace(/:[^/:]+$/, "");
-    const available = state.check?.available?.reference === settings.image ? state.check.available : undefined;
+    const discovered = state.check?.available;
+    // Offers recorded before stable discovery have no release metadata and must be checked again.
+    const available = discovered?.reference === settings.image && (settings.image !== STABLE_IMAGE || discovered.release) ? discovered : undefined;
     const offered = available ? [available.digest, ...(available.indexDigest ? [available.indexDigest] : [])] : [];
-    let digests = update ? offered : state.active?.upstream.reference === settings.image ? state.active.upstream.digests : [];
+    const approved = state.active?.upstream.reference === settings.image ? state.active : undefined;
+    let digests = update ? offered : approved?.upstream.digests ?? [];
+    if (!update && approved && digests.length === 0) {
+        const cached = !settings.gpu ? await inspectImage(approved.imageId) : undefined;
+        return cached ? { kind: "cached", reference: approved.imageId, imageId: cached.id, digests } : undefined;
+    }
     if (digests.length === 0 && !update) {
-        const cached = await inspectImage(settings.image);
+        const cached = settings.image === STABLE_IMAGE ? undefined : await inspectImage(settings.image);
         if (cached && !settings.gpu) return { kind: "cached", reference: settings.image, imageId: cached.id, digests: cached.digests };
         digests = cached?.digests.length ? cached.digests : offered;
     }
@@ -412,6 +425,10 @@ async function apply(ui: UI, update: boolean): Promise<void> {
     const target = await planTarget(state, settings, update);
     if (!target && update) {
         ui.notify(`Hindsight: no update is recorded for ${settings.image}; choose ${MENU.check} first. Nothing was changed.`, "info");
+        return;
+    }
+    if (!target && state.active?.upstream.reference === settings.image && state.active.upstream.digests.length === 0) {
+        ui.notify(`Hindsight: the approved image has no registry digests and cannot be reused for this configuration. Choose ${MENU.check}, then ${MENU.update} to approve a version change. Nothing was changed.`, "warning");
         return;
     }
     if (!target) {

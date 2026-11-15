@@ -37,6 +37,8 @@ export interface DockerState {
     /** Registry manifests by exact reference, as `buildx imagetools inspect --format '{{json .Manifest}}'` prints them; a missing reference fails. */
     registry?: Record<string, unknown>;
     buildxMissing?: boolean;
+    stableRelease?: { body?: unknown; status?: number; networkError?: boolean };
+    releaseRequests?: string[];
     /** Host GPU support: "cuda" = driver, toolkit and CUDA PyTorch work; "no-cuda" = GPU visible but torch.cuda unavailable; unset = CPU-only host. */
     gpu?: "cuda" | "no-cuda";
     /** Device the managed container's local models initialize and run on; defaults to cuda for a GPU container on a "cuda" host, else cpu. */
@@ -278,6 +280,13 @@ const managementFile = import.meta.dir + "/.local-management.json";
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.href === "https://api.github.com/repos/vectorize-io/hindsight/releases/latest") {
+        const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+        (state.releaseRequests ??= []).push(url.href);
+        fs.writeFileSync(stateFile, JSON.stringify(state));
+        if (state.stableRelease?.networkError) throw new TypeError("synthetic-release-secret");
+        return Response.json(state.stableRelease?.body ?? {}, { status: state.stableRelease?.status ?? (state.stableRelease ? 200 : 404) });
+    }
     if (url.pathname !== "/health") return realFetch(input, init);
     const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
     (state.healthProbes ??= []).push(url.host);

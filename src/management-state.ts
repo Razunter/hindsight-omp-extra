@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { EXTENSION_ROOT } from "./runtime-config";
+import type { StableRelease } from "./stable-release";
 
 const STATE_FILE = path.join(EXTENSION_ROOT, ".local-management.json");
 const LOCK_FILE = path.join(EXTENSION_ROOT, ".local-management.lock");
@@ -13,7 +14,7 @@ const ABANDONED_RECLAIM_MS = 10_000;
 export type ManagementMode = "off" | "cpu" | "gpu";
 export interface UpstreamIdentity { reference: string; digests: string[] }
 /** Registry manifest digests of a discovered upstream image: `digest` is the host-platform manifest, `indexDigest` its multi-platform index. */
-export interface UpstreamTarget { reference: string; digest: string; indexDigest?: string }
+export interface UpstreamTarget { reference: string; digest: string; indexDigest?: string; release?: StableRelease }
 /** A claimed check without an outcome is still running or was interrupted. */
 export interface UpdateCheck { attemptedAt: number; outcome?: "current" | "available" | "failed" | "unsupported"; available?: UpstreamTarget; message?: string }
 export interface ApprovedRuntime {

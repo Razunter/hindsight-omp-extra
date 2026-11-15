@@ -42,7 +42,8 @@ test("startup returns before the registry answers and reports an available updat
     f.setState(state);
     const result = f.run();
     expect(f.state().released).toBe(true);
-    expect(result.notifications.at(-1)).toMatchObject({ level: "info", message: expect.stringContaining(update.platform) });
+    expect(result.notifications.at(-1)?.level).toBe("info");
+    expect(f.management()!.check).toMatchObject({ outcome: "available", available: { digest: update.platform } });
     expect(f.management()!.active.upstream.digests).toEqual([indexDigest]);
 });
 
