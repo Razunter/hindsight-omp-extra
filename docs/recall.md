@@ -33,7 +33,7 @@ This block is independent of the retrieval footer and recall nudge settings. Dur
 
 Private Auto-Learn capture follows its own prompt and calls its permitted lesson tool directly. This remains valid when `learn` is inactive in the main session but still registered for capture, where OMP refuses `retain` and `eval`.
 
-When a tool named `observe` is also active (skill-observer provides it), the block gains one line, with or without a lesson tool: when injected memories repeat one fact across entries, a mental-model snapshot is truncated, or a recalled claim proved wrong and a saved correction cannot retire it, the agent records an observation with `observe`, naming the entries involved and the fix wanted, and continues the task. The extension does not inspect recalled memories; the agent judges what it sees. Without `observe` the block does not mention observations.
+When a tool named `observe` is also active (skill-observer provides it), the block gains one line, with or without a lesson tool. The line asks the agent to record an observation with `observe` when injected memories repeat one fact across entries, a mental-model snapshot is truncated, or a recalled claim proved wrong and a saved correction cannot retire it. The observation names the entries involved and the fix wanted, and the agent then continues the task. The extension does not inspect recalled memories; the agent judges what it sees. Without `observe` the block does not mention observations.
 
 Preparation replaces the owned block rather than stacking copies. Other backends, child/advisor sessions and sessions with neither an active native memory writer nor `observe` receive none.
 
