@@ -4,6 +4,8 @@
 
 The additive `hindsight_evidence` tool exposes `source_search`/`page_search` with a query and `source_read`/`page_read` with a document/page ID. It works in interactive and headless OMP sessions, using the current native Hindsight connection, bank and project/global scope. Native memory tools, Auto-Learn and Docker startup behavior are unchanged.
 
+Each call carries `action` plus that action's field: `query` for searches, `id` for reads. The other field may be omitted or sent as an empty string, as models that fill every advertised field do. A missing or blank required field, a non-empty value in the other field, or any other key is refused with `invalid_input` before any HTTP request.
+
 Example input: `{"action":"source_search","query":"Why was this architecture chosen?"}`. One recall POST includes bounded supporting facts, independently checks each returned record’s scope, and returns at most five fact excerpts with available retained-document IDs.
 
 Observations are labeled synthesis. Missing or excluded support is not original evidence. This is query-based retrieval, not exact expansion of a native recall hit. It does not fetch documents, chunks, files or URLs automatically.

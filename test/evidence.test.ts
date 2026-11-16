@@ -94,9 +94,26 @@ test("requested source facts may be null without inventing observation support",
 test.each([
     { action: "source_search", query: " " }, { action: "source_search", query: "x", bank: "other" },
     { action: "source_search", query: "x", id: "extra" }, { action: "unknown", query: "x" },
+    { action: "page_search", id: "" }, { action: "page_read", query: "", id: "" }, { action: "page_read", query: "x", id: "page" },
+    { action: "page_search", query: "x", id: "", bank: "" },
 ])("invalid input is rejected without HTTP: %j", async params => {
     const f = fixture(() => recall([]));
     expect((await f.run(params)).status).toBe("error"); expect(f.requests).toEqual([]);
+});
+
+// Models fill every advertised field, sending "" for the one the action does not use.
+test.each([
+    { action: "page_search", query: "Quill project's synthesized overview of component boundaries", id: "" },
+    { action: "source_search", query: "supporting source", id: "" },
+    { action: "page_read", query: "", id: "page" },
+    { action: "source_read", query: "", id: "timeout-note" },
+])("an empty inactive field does not block the action: %j", async params => {
+    const f = fixture(request => fetchedEvidence(request, "evidence body"));
+    const result = await f.run(params);
+    expect(result.status).toBe("ok");
+    expect(result.items.length).toBeGreaterThan(0);
+    if (params.action === "source_read") expect(result.items[0].id).toBe("timeout-note");
+    if (params.action === "page_read") expect(result.items[0].id).toBe("page");
 });
 
 test("non-Hindsight configuration fails without HTTP", async () => {
