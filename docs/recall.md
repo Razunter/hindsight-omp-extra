@@ -78,3 +78,14 @@ Accepted prompt reminders, session start/switch/branch/tree, compaction, cadence
 Main and rebound child instances keep separate state. Children/advisors and ineligible sessions receive no nudges. Retries, cancelled preparations, synthetic prompts and agent-origin companions do not create new prompt reminders.
 
 Nudges are advisory, and improved useful retrieval or task correctness has not been demonstrated. They remain disabled by default. Tools without a public leaf-result event cannot advance cadence.
+
+## Mental model warnings
+
+In an interactive main session, the extension checks existing OMP-seeded mental models in the active default Hindsight bank. It first checks about a minute after startup, then tries hourly while OMP is open. A completed check counts for 24 hours per seed across sessions in the same OMP profile. Shared seeds do not warn again when you open another project within that window.
+
+- **Paused** means the last refresh failed. Automatic refresh waits until a refresh succeeds.
+- **Stale** means newer memories exist in the model's scope since its last refresh.
+
+The warning does not block prompts. It lists Paused models first and omits models with a queued or running refresh. You can refresh the listed models in the Hindsight Control Plane. The extension does not refresh them for you.
+
+The check requires the Hindsight memory backend and enabled mental models. It does not check other banks, unrelated projects' seeds, custom models, or knowledge pages. A check that cannot read from Hindsight does not warn, and the next hourly attempt can retry it.

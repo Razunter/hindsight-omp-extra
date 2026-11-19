@@ -273,7 +273,17 @@ Bun.plugin({ name: "fixture-omp-storage", setup(build) {
         getAgentDir: () => process.env.PI_CODING_AGENT_DIR ?? process.env.HOME + "/.omp/agent",
     }, loader: "object" }));
     build.module("@oh-my-pi/pi-coding-agent/config/registry", () => ({ exports: { lookup: () => undefined, register: definition => ({ get: () => definition.default }) }, loader: "object" }));
+    build.module("@oh-my-pi/pi-coding-agent/hindsight/config", () => ({ exports: {
+        loadHindsightConfig: () => ({ mentalModelsEnabled: false }), isHindsightConfigured: () => false,
+    }, loader: "object" }));
+    build.module("@oh-my-pi/pi-coding-agent/hindsight/bank", () => ({ exports: {
+        computeBankScope: () => { throw new Error("Unexpected mental model monitor check"); },
+    }, loader: "object" }));
+    build.module("@oh-my-pi/pi-coding-agent/hindsight/mental-models", () => ({ exports: {
+        resolveSeedsForScope: () => [], seedAlreadyExists: () => false,
+    }, loader: "object" }));
     build.module("@oh-my-pi/pi-natives/vcs", () => ({ exports: { repo: () => undefined }, loader: "object" }));
+    build.module("@oh-my-pi/pi-utils", () => ({ exports: { tryAcquireFileLock: () => null }, loader: "object" }));
 } });
 const stateFile = process.env.FAKE_DOCKER_STATE;
 const managementFile = import.meta.dir + "/.local-management.json";
@@ -331,7 +341,8 @@ for (let i = 0; i < steps.length; i++) {
         registerCommand(name, options) { commands.push(name); if (name === "hindsight") command = options.handler; },
     });
     const choices = [...(step.choices ?? [])];
-    const ctx = { cwd: import.meta.dir, sessionManager: { getBranch: () => [] }, hasUI: step.hasUI ?? true, agent: { kind: step.kind ?? "main" }, ui: {
+    const ctx = { cwd: import.meta.dir, sessionManager: { getBranch: () => [] }, hasUI: step.hasUI ?? true, agent: { kind: step.kind ?? "main" },
+        setTimeout() {}, setInterval() {}, ui: {
         notify(message, level) { notifications.push({ message, level }); },
         async select(title, options) {
             dialogs.push({ title, options });

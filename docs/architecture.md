@@ -8,9 +8,9 @@ hindsight-omp-extra adds evidence access and optional local deployment to OMP's 
 
 | Component | Responsibility |
 | --- | --- |
-| OMP | Native `retain`, `recall`, `reflect`, and `learn` tools; memory backend selection; transcript capture; project scoping; shared Auto-Learn; session artifact storage |
-| Hindsight | Retained documents, extracted facts, observations, synthesized knowledge pages, and memory processing with its configured AI provider |
-| This extension | Source/page evidence search and read, recall/lesson guidance, the user-invoked ingestion skill, and opt-in local Hindsight management with named provider selection |
+| OMP | Native `retain`, `recall`, `reflect`, and `learn` tools; memory backend selection; transcript capture; project scoping; mental model seeding; shared Auto-Learn; session artifact storage |
+| Hindsight | Retained documents, extracted facts, observations, synthesized knowledge pages, mental model refresh and retries, and memory processing with its configured AI provider |
+| This extension | Source/page evidence search and read, recall/lesson guidance, read-only mental model warnings, the user-invoked ingestion skill, and opt-in local Hindsight management with named provider selection |
 
 A **supporting source** is retained material or underlying facts supporting a recalled claim. It can be unavailable even when the claim remains recallable. A **knowledge page** is synthesized knowledge, not original-source evidence.
 
@@ -43,6 +43,12 @@ Routine previews are bounded. When local presentation limits omit permitted cont
 Scope checks happen before artifact creation. Excluded evidence and unverified knowledge pages never enter the snapshot. Backend omissions remain omissions.
 
 An artifact records fetch-time scope and content. Later retagging or deletion does not revoke it. A fresh evidence read rechecks current scope. Tags are retrieval filters, not server authorization.
+
+## Mental model warnings follow OMP scope
+
+The monitor uses OMP's bank and seed selection. It reads mental model metadata and checks for queued or running refreshes before it reports failures or staleness. It never writes to Hindsight, refreshes models, or manages the server.
+
+Each profile keeps one check timestamp per hashed API URL, bank ID, and seed ID under its agent directory. A check holds an OMP file lock for its API URL and bank until it finishes, so concurrent sessions neither repeat a seed's check nor split one bank's findings across two warnings. The lock is freed if the process dies. A failed read records nothing, so the next timer can retry. See [mental model warnings](recall.md#mental-model-warnings).
 
 ## Guidance does not own retrieval or capture
 
