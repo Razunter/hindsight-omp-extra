@@ -3,6 +3,8 @@ import { isDeepStrictEqual } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 export const ATTEMPT_ENTRY = "hindsight-curation-attempt";
+export const CURATION_LIMIT = 5;
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface Attempt {
     id: string;
@@ -15,6 +17,43 @@ export interface Attempt {
     tags: string[];
     targetIds: string[];
     keeperId: string;
+}
+
+export function findAttempt(session: ExtensionContext["sessionManager"], match: { id?: string; callId?: string }): Attempt | undefined {
+    const branch = new Set(session.getBranch().map(entry => entry.id));
+    const entries = session.getEntries();
+    for (let i = entries.length - 1; i >= 0; i--) {
+        const entry = entries[i]!;
+        if (entry.type !== "custom" || entry.customType !== ATTEMPT_ENTRY || !entry.data || typeof entry.data !== "object") continue;
+        const value = entry.data as Partial<Attempt>;
+        if (match.id !== undefined ? value.id !== match.id : value.callId !== match.callId) continue;
+        if (typeof value.id !== "string" || !UUID.test(value.id) || typeof value.callId !== "string" ||
+            value.sessionId !== session.getSessionId() || typeof value.connection !== "string" || !/^[0-9a-f]{64}$/.test(value.connection) ||
+            typeof value.bank !== "string" || typeof value.project !== "string" || (value.scope !== "project" && value.scope !== "global") ||
+            !Array.isArray(value.tags) || !value.tags.every(tag => typeof tag === "string") ||
+            !Array.isArray(value.targetIds) || !value.targetIds.length || value.targetIds.length > CURATION_LIMIT ||
+            !value.targetIds.every(id => typeof id === "string" && UUID.test(id)) || new Set(value.targetIds).size !== value.targetIds.length ||
+            typeof value.keeperId !== "string" || !UUID.test(value.keeperId) || value.targetIds.includes(value.keeperId)) return;
+        if (!branch.has(entry.id)) {
+            // OMP restore can rewind to the assistant's pending call, leaving an in-tool append on the old continuation.
+            let parentId = entry.parentId;
+            const seen = new Set<string>();
+            let sameInvocation = false;
+            while (parentId && !seen.has(parentId)) {
+                seen.add(parentId);
+                const parent = session.getEntry(parentId);
+                if (!parent || parent.type === "reset_boundary") break;
+                if (parent.type === "message") {
+                    sameInvocation = branch.has(parent.id) && parent.message.role === "assistant" &&
+                        parent.message.content.some(part => part.type === "toolCall" && part.id === value.callId && part.name === "hindsight_curate");
+                    break;
+                }
+                parentId = parent.parentId;
+            }
+            if (!sameInvocation) continue;
+        }
+        return value as Attempt;
+    }
 }
 
 export function connectionKey(sessionId: string, target: { apiUrl: string; token?: string; bank: string; scoping: string; cwd: string; root: string }): string {

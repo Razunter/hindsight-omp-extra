@@ -7,15 +7,13 @@ import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { computeBankScope } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
 import { isHindsightConfigured, loadHindsightConfig, type HindsightScoping } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { ATTEMPT_ENTRY, connectionKey, recordAttempt } from "./curation-attempt";
+import { CURATION_LIMIT, UUID, connectionKey, findAttempt, recordAttempt, type Attempt } from "./curation-attempt";
 import { confirmArchive } from "./curation-review";
 import { request } from "./evidence";
 
 const TOOL = "hindsight_curate";
 const PASS = "skill-observer";
-const FACT_LIMIT = 5;
 const PATH_LIMIT = 512;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PROVENANCE_KEYS = ["source", "session_id", "author", "project", "cwd", "project_path", "repo_root", "repository"] as const;
 type JsonObject = Record<string, unknown>;
 type FactType = "world" | "experience";
@@ -90,54 +88,71 @@ export function registerCuration(pi: ExtensionAPI): void {
     pi.registerTool({
         name: TOOL,
         label: "Hindsight curation",
-        description: "Review Hindsight facts during a user-started /observe pass. First investigate one cued lead. For an exact duplicate with matching material metadata, call archive with target and keeper IDs from that lookup. Calling archive opens its own native confirmation and writes only if approved there. Do not ask separately. Report IDs and outcomes without quoting archived claims.",
-        parameters: pi.arktype({ action: "'investigate' | 'archive'", lead: "string", "targets?": "string[] | null", "keeper?": "string | null" }),
+        description: "Review Hindsight facts during a user-started /observe pass. Investigate one cued lead. For exact duplicates with matching material metadata, call archive with target and keeper IDs from that lookup. Archive opens its own native confirmation and writes only if approved there. Do not ask separately. Reconcile an interrupted attempt by its recorded attempt ID; this only reads. Report IDs and outcomes without quoting archived claims.",
+        parameters: pi.arktype({
+            action: "'investigate' | 'archive' | 'reconcile'", "lead?": "string | null",
+            "targets?": "string[] | null", "keeper?": "string | null", "attempt?": "string | null",
+        }),
         approval: "read",
         loadMode: "essential",
         async execute(callId, params, invocationSignal, _update, ctx) {
             const input = object(params);
-            if (!input || Object.keys(input).some(key => !["action", "lead", "targets", "keeper"].includes(key)) ||
-                typeof input.lead !== "string" || !UUID.test(input.lead) ||
-                !(input.action === "investigate" ? (input.targets == null || (Array.isArray(input.targets) && input.targets.length === 0)) &&
-                    (input.keeper == null || input.keeper === "") :
-                    input.action === "archive" && strings(input.targets) && input.targets.length === 1 &&
-                    UUID.test(input.targets[0]!) && typeof input.keeper === "string" && UUID.test(input.keeper) && input.keeper !== input.targets[0])) {
+            if (!input || Object.keys(input).some(key => !["action", "lead", "targets", "keeper", "attempt"].includes(key))) {
                 return outcome({ status: "error", reason: "invalid_input" });
             }
+            const { action, lead: leadRef, targets: targetIds, keeper: keeperId, attempt: attemptId } = input;
+            const haveTargets = strings(targetIds) && targetIds.length > 0 && targetIds.length <= CURATION_LIMIT &&
+                targetIds.every(id => UUID.test(id)) && new Set(targetIds).size === targetIds.length;
+            const noTargets = targetIds == null || (Array.isArray(targetIds) && targetIds.length === 0);
+            const noKeeper = keeperId == null || keeperId === "";
+            const valid = action === "reconcile" ? typeof attemptId === "string" && UUID.test(attemptId) &&
+                (leadRef == null || leadRef === "" || (typeof leadRef === "string" && UUID.test(leadRef))) && noTargets && noKeeper
+                : (attemptId == null || attemptId === "") && typeof leadRef === "string" && UUID.test(leadRef) &&
+                    (action === "investigate" ? noTargets && noKeeper :
+                        action === "archive" && haveTargets && typeof keeperId === "string" && UUID.test(keeperId) && !targetIds.includes(keeperId));
+            if (!valid) return outcome({ status: "error", reason: "invalid_input" });
             if (invocationSignal?.aborted) return outcome({ status: "error", reason: "cancelled" });
             if (!nativeMain(ctx) || !pi.getActiveTools().includes(TOOL)) return outcome({ status: "unavailable", reason: "interactive_main_required" });
             const generation = invalidated;
-            const pass = activePass(ctx, generation);
-            const lead = pass?.leads.find(item => item.ref === input.lead);
-            if (!pass || !lead || !isCurationLead(lead)) return outcome({ status: "unavailable", reason: "eligible_observation_lead_required" });
             const target = getTarget(pi, ctx.cwd);
-            if (!target) return outcome({ status: "unavailable", reason: "hindsight_configuration" });
             const session = ctx.sessionManager;
             const anchor = session.getLeafId();
             const sessionId = session.getSessionId();
             const sessionFile = session.getSessionFile();
-            const assertCurrent = () => {
+            const assertScope = () => {
                 invocationSignal?.throwIfAborted();
-                const current = generation === invalidated && nativeMain(ctx) && pi.getActiveTools().includes(TOOL) && activePass(ctx, generation);
-                if (!current || current.id !== pass.id || !current.leads.some(item => item.ref === lead.ref && item.kind === lead.kind && item.text === lead.text) ||
+                if (generation !== invalidated || !nativeMain(ctx) || !pi.getActiveTools().includes(TOOL) ||
                     session.getSessionId() !== sessionId || (anchor && !session.getBranch().some(entry => entry.id === anchor))) throw new Error("pass_changed");
-                const now = getTarget(pi, ctx.cwd);
-                if (!isDeepStrictEqual(now, target) || session.getSessionFile() !== sessionFile) throw new Error("scope_changed");
+                if (!isDeepStrictEqual(getTarget(pi, ctx.cwd), target) || session.getCwd() !== ctx.cwd || session.getSessionFile() !== sessionFile) throw new Error("scope_changed");
             };
-            if (input.action === "archive") {
+            const recorded = action === "reconcile" ? findAttempt(session, { id: attemptId as string })
+                : action === "archive" ? findAttempt(session, { callId }) : undefined;
+            if (recorded) return outcome(await reconcile(recorded, target, assertScope, invocationSignal));
+            if (action === "reconcile") return outcome({ status: "unavailable", reason: "attempt_not_in_branch" });
+
+            const pass = activePass(ctx, generation);
+            const lead = pass?.leads.find(item => item.ref === leadRef);
+            if (!pass || !lead || !isCurationLead(lead)) return outcome({ status: "unavailable", reason: "eligible_observation_lead_required" });
+            if (!target) return outcome({ status: "unavailable", reason: "hindsight_configuration" });
+            const assertCurrent = () => {
+                assertScope();
+                const current = activePass(ctx, generation);
+                if (current?.id !== pass.id || !current.leads.some(item => item.ref === lead.ref && item.kind === lead.kind && item.text === lead.text)) throw new Error("pass_changed");
+            };
+            if (action === "archive") {
                 if (reviewing) return outcome({ status: "unavailable", reason: "another_review_open" });
                 if (!investigation || investigation.passId !== pass.id || investigation.lead !== lead.ref || !isDeepStrictEqual(investigation.target, target)) {
                     return outcome({ status: "unavailable", reason: "investigate_first" });
                 }
-                if (session.getBranch().some(entry => entry.type === "custom" && entry.customType === ATTEMPT_ENTRY && object(entry.data)?.callId === callId)) {
-                    return outcome({ status: "unavailable", reason: "attempt_already_recorded" });
+                const candidates = investigation.candidates;
+                const originals = (targetIds as string[]).map(id => candidates.find(candidate => candidate.fact.id === id));
+                const keeper = investigation.candidates.find(candidate => candidate.fact.id === keeperId);
+                if (!keeper || !originals.every((item): item is Candidate => Boolean(item && duplicateOf(item, keeper)))) {
+                    return outcome({ status: "unavailable", reason: "no_complete_same_scope_keeper" });
                 }
-                const original = investigation.candidates.find(candidate => candidate.fact.id === (input.targets as string[])[0]);
-                const keeper = investigation.candidates.find(candidate => candidate.fact.id === input.keeper);
-                if (!original || !keeper || !duplicateOf(original, keeper)) return outcome({ status: "unavailable", reason: "no_complete_same_scope_keeper" });
                 reviewing = true;
                 try {
-                    return outcome(await archiveDuplicate(pi, ctx, callId, target, lead, original, keeper, assertCurrent, invocationSignal));
+                    return outcome(await archiveDuplicates(pi, ctx, callId, target, lead, originals, keeper, assertCurrent, invocationSignal));
                 } catch (error) {
                     return outcome({ status: "error", reason: invocationSignal?.aborted ? "cancelled" : changeReason(error) });
                 } finally { reviewing = false; }
@@ -249,7 +264,7 @@ function getTarget(pi: ExtensionAPI, cwd: string): CurationTarget | undefined {
 }
 
 function changeReason(error: unknown): string {
-    return error instanceof Error && ["pass_changed", "scope_changed"].includes(error.message) ? error.message : transportCategory(error) ?? "network";
+    return error instanceof Error && ["pass_changed", "scope_changed", "reviewed_fact_changed"].includes(error.message) ? error.message : transportCategory(error) ?? "network";
 }
 
 function duplicateOf(target: Candidate, keeper: Candidate): boolean {
@@ -261,68 +276,117 @@ function duplicateOf(target: Candidate, keeper: Candidate): boolean {
                 Boolean(target.source.provenance.source) && isDeepStrictEqual(target.source.provenance, keeper.source.provenance)));
 }
 
-async function archiveDuplicate(
-    pi: ExtensionAPI, ctx: ExtensionContext, callId: string, target: CurationTarget, lead: Lead,
-    original: Candidate, keeper: Candidate, assertCurrent: () => void, signal?: AbortSignal,
-): Promise<JsonObject> {
-    const fact = original.fact;
-    const attemptId = randomUUID();
-    const reason = `Duplicate of ${keeper.fact.id}; same claim, scope and material metadata. Curation attempt ${attemptId}.`;
-    const review = [
-        `Action: archive one duplicate. Bank: ${target.bank}. Scope: ${fact.scope.kind}. Project: ${target.project}.`,
-        `Audience tags: ${JSON.stringify(fact.tags)}. The archived fact will be removed from recall, including historical recall.`,
-        `Evidence (${lead.kind}): ${lead.text}`,
-        `Reason: ${reason}`,
-        `Archive ${fact.id}:\n${JSON.stringify(original, null, 2)}`,
-        `Keep active ${keeper.fact.id}:\n${JSON.stringify(keeper, null, 2)}`,
-    ].join("\n\n");
-    const ask = await confirmArchive(ctx.ui, review, signal);
-    if (ask !== "approved") return { status: "unavailable", reason: ask ?? "declined" };
-    const requestOnce = (suffix: string, body?: JsonObject, method?: string) => {
+type Read = (suffix: string, body?: JsonObject, method?: string) => Promise<JsonObject>;
+function scopedRequest(target: CurationTarget, assertCurrent: () => void, signal?: AbortSignal): Read {
+    return (suffix, body, method) => {
         assertCurrent();
         const deadline = AbortSignal.timeout(target.timeout);
         return request(target, suffix, signal ? AbortSignal.any([deadline, signal]) : deadline, body, method);
     };
-    const readFact = (id: string) => requestOnce("/memories/" + id);
-    const recheck = async () => {
-        const snapshots = await Promise.all([keeper.fact, fact].map(async previous =>
-            isDeepStrictEqual(parseFact(await readFact(previous.id), target, previous.id), previous)));
+}
+
+function archiveReason(attempt: Attempt): string {
+    return `Duplicate of ${attempt.keeperId}; same claim, scope and material metadata. Curation attempt ${attempt.id}.`;
+}
+
+function archiveSummary(attempt: Attempt) {
+    return { bank: attempt.bank, scope: attempt.scope === "project" ? { kind: "project", project: attempt.project } : { kind: "global" },
+        attempt: attempt.id, keeper: attempt.keeperId, archived: [] as string[], observedArchived: [] as string[],
+        unchanged: [] as string[], unknown: [] as string[], conflictingReason: [] as string[] };
+}
+
+async function readArchiveState(
+    read: Read, target: CurationTarget, attempt: Attempt, id: string, assertCurrent: () => void, expected?: CuratableFact,
+): Promise<"unchanged" | "observedArchived" | "unknown" | "conflictingReason"> {
+    try {
+        const actual = await read("/memories/" + id);
+        assertCurrent();
+        const archived = actual.state === "invalidated" && typeof actual.invalidated_at === "string" && validDate(actual.invalidated_at);
+        const fact = parseFact(archived ? { ...actual, state: "valid", invalidation_reason: null, invalidated_at: null } : actual, target, id);
+        if (!fact || fact.scope.kind !== attempt.scope || !isDeepStrictEqual(fact.tags, attempt.tags) ||
+            (expected && !isDeepStrictEqual(fact, expected))) return "unknown";
+        if (!archived) return "unchanged";
+        return actual.invalidation_reason === archiveReason(attempt) ? "observedArchived" : "conflictingReason";
+    } catch { return "unknown"; }
+}
+
+async function reconcile(attempt: Attempt, target: CurationTarget | undefined, assertCurrent: () => void, signal?: AbortSignal) {
+    const summary = archiveSummary(attempt);
+    if (!target || attempt.connection !== connectionKey(attempt.sessionId, target) || target.bank !== attempt.bank || target.project !== attempt.project ||
+        classifyScope(attempt.tags, target)?.kind !== attempt.scope) {
+        return { status: "unverified", reason: "scope_changed", ...summary, unknown: attempt.targetIds };
+    }
+    const read = scopedRequest(target, assertCurrent, signal);
+    const states = await Promise.all(attempt.targetIds.map(id => readArchiveState(read, target, attempt, id, assertCurrent)));
+    for (const [index, state] of states.entries()) {
+        if (state === "conflictingReason") summary.unknown.push(attempt.targetIds[index]!);
+        summary[state].push(attempt.targetIds[index]!);
+    }
+    return { status: summary.unknown.length ? "unverified" : "observed", ...summary,
+        note: "Readback only. The attempt record does not store previous fact text or prove who changed a fact." };
+}
+
+async function archiveDuplicates(
+    pi: ExtensionAPI, ctx: ExtensionContext, callId: string, target: CurationTarget, lead: Lead,
+    originals: Candidate[], keeper: Candidate, assertCurrent: () => void, signal?: AbortSignal,
+): Promise<JsonObject> {
+    const first = originals[0]!.fact;
+    const session = ctx.sessionManager;
+    const sessionId = session.getSessionId();
+    const attempt: Attempt = {
+        id: randomUUID(), callId, sessionId, connection: connectionKey(sessionId, target),
+        bank: target.bank, scope: first.scope.kind, project: target.project, tags: first.tags,
+        targetIds: originals.map(item => item.fact.id), keeperId: keeper.fact.id,
+    };
+    const reason = archiveReason(attempt);
+    const review = [
+        `Action: archive ${originals.length} duplicate fact(s). Bank: ${target.bank}. Scope: ${first.scope.kind}. Project: ${target.project}.`,
+        `Audience tags: ${JSON.stringify(first.tags)}. Archive removes these facts from recall, including historical recall.`,
+        `Evidence (${lead.kind}): ${lead.text}`,
+        `Reason: ${reason}`,
+        ...originals.map(item => `Archive ${item.fact.id}:\n${JSON.stringify(item, null, 2)}`),
+        `Keep active ${keeper.fact.id}:\n${JSON.stringify(keeper, null, 2)}`,
+    ].join("\n\n");
+    const approval = await confirmArchive(ctx.ui, review, signal);
+    if (approval !== "approved") return { status: "unavailable", reason: approval ?? "declined" };
+    const read = scopedRequest(target, assertCurrent, signal);
+    const recheck = async (candidates: Candidate[]) => {
+        const snapshots = await Promise.all(candidates.map(async previous => {
+            const fact = parseFact(await read("/memories/" + previous.fact.id), target, previous.fact.id);
+            if (!fact || !isDeepStrictEqual(fact, previous.fact)) return false;
+            const source = await supportingSource(fact, target, {}, undefined, read);
+            const { excerpt, ...reviewed } = previous.source.status === "scoped_reference" ? previous.source : { ...previous.source, excerpt: undefined };
+            return isDeepStrictEqual(source, reviewed);
+        }));
         assertCurrent();
         return snapshots.every(Boolean);
     };
-    if (!await recheck()) return { status: "unavailable", reason: "reviewed_fact_changed" };
-
-    const session = ctx.sessionManager;
-    const sessionId = session.getSessionId();
-    const attempt = {
-        id: attemptId, callId, sessionId, connection: connectionKey(sessionId, target),
-        bank: target.bank, scope: fact.scope.kind, project: target.project, tags: fact.tags,
-        targetIds: [fact.id], keeperId: keeper.fact.id,
-    };
+    if (!await recheck([keeper, ...originals])) return { status: "unavailable", reason: "reviewed_fact_changed" };
     if (!await recordAttempt(pi, session, attempt)) return { status: "error", reason: "attempt_not_saved" };
-    if (!await recheck()) return { status: "unavailable", reason: "reviewed_fact_changed", attempt: attemptId };
-    const summary = { bank: target.bank, scope: fact.scope, attempt: attempt.id, keeper: keeper.fact.id, archived: [] as string[],
-        observedArchived: [] as string[], unchanged: [] as string[], unknown: [] as string[] };
-    let acknowledged = false;
-    try {
-        await requestOnce("/memories/" + fact.id, { state: "invalidated", reason }, "PATCH");
-        acknowledged = true;
-    } catch { /* The server can commit before the response is lost. */ }
-    try {
-        const actual = await readFact(fact.id);
-        assertCurrent();
-        if (isDeepStrictEqual(parseFact(actual, target, fact.id), fact)) {
-            summary.unchanged.push(fact.id);
-        } else if (actual.id === fact.id && (actual.bank_id === undefined || actual.bank_id === target.bank) &&
-            actual.text === fact.text && actual.type === fact.type && isDeepStrictEqual(actual.tags, fact.tags) &&
-            actual.state === "invalidated" && actual.invalidation_reason === reason &&
-            typeof actual.invalidated_at === "string" && validDate(actual.invalidated_at)) {
-            (acknowledged ? summary.archived : summary.observedArchived).push(fact.id);
-        } else {
-            summary.unknown.push(fact.id);
+
+    const summary = archiveSummary(attempt);
+    let stopped = false;
+    let failure: string | undefined;
+    for (const item of originals) {
+        const { id } = item.fact;
+        let acknowledged = false;
+        if (!stopped) {
+            try {
+                if (!await recheck([keeper, item])) throw new Error("reviewed_fact_changed");
+                await read("/memories/" + id, { state: "invalidated", reason }, "PATCH");
+                acknowledged = true;
+            } catch (error) { failure = changeReason(error); }
         }
-    } catch { summary.unknown.push(fact.id); }
-    return { status: summary.archived.length ? "ok" : "unverified", ...summary };
+        const state = await readArchiveState(read, target, attempt, id, assertCurrent, item.fact);
+        if (acknowledged && state === "observedArchived") summary.archived.push(id);
+        else {
+            stopped = true;
+            if (state === "conflictingReason") summary.unknown.push(id);
+            summary[state].push(id);
+        }
+    }
+    const status = !stopped ? "ok" : summary.archived.length ? "partial" : "unverified";
+    return { status, ...(failure ? { reason: failure } : {}), ...summary };
 }
 
 async function investigate(target: CurationTarget, lead: Lead, signal: AbortSignal, assertCurrent: () => void) {
@@ -346,7 +410,7 @@ async function investigate(target: CurationTarget, lead: Lead, signal: AbortSign
         if (!hit || typeof hit.id !== "string" || !UUID.test(hit.id) || !isFactType(hit.type) || typeof hit.text !== "string"
             || (hit.bank_id !== undefined && hit.bank_id !== target.bank)) { omitted = true; continue; }
         if (hits.has(hit.id)) continue;
-        if (hits.size === FACT_LIMIT) { truncated = true; break; }
+        if (hits.size === CURATION_LIMIT) { truncated = true; break; }
         hits.set(hit.id, hit);
     }
     const reads = await Promise.all([...hits].map(async ([id, hit]) => {

@@ -57,12 +57,15 @@ assert.ok(tool, "Hindsight extension must register its read-only curation action
 let liveCwd = cwd;
 let liveSession = sessionId;
 let branch: Entry[] = [];
+let siblingEntries: Entry[] = [];
 const nativeForm = async () => { throw new Error("Investigation must not open a confirmation"); };
 const ctx = {
     cwd, mode: "tui", hasUI: true, agent: { kind: "main" },
     ui: { formDialog: nativeForm as typeof nativeForm | undefined, custom: nativeForm as typeof nativeForm | undefined },
     sessionManager: {
-        getBranch: () => [...branch], getEntries: () => [...branch], getCwd: () => liveCwd, getSessionId: () => liveSession,
+        getBranch: () => [...branch], getEntries: () => [...branch, ...siblingEntries],
+        getEntry: (id: string) => branch.find(entry => entry.id === id) ?? siblingEntries.find(entry => entry.id === id),
+        getCwd: () => liveCwd, getSessionId: () => liveSession,
         getSessionFile: () => sessionFile, getLeafId: () => branch.at(-1)?.id,
         async ensureOnDisk() {
             if (!persist) throw new Error("Session record unavailable");
@@ -311,10 +314,10 @@ try {
     assert.equal(requests.length, 6);
 
     const duplicate = 'Quill uses the "blue" calibration dial.\nKeep this line <literal>.';
-    const prepare = async () => {
+    const prepare = async (count = 2) => {
         branch = [current];
         facts.clear();
-        for (const id of ids.slice(0, 2)) facts.set(id, rawFact(id, { text: duplicate }));
+        for (const id of ids.slice(0, count)) facts.set(id, rawFact(id, { text: duplicate }));
         await run();
         requests.length = 0;
     };
@@ -386,4 +389,47 @@ try {
         else if (mode === "lost") assert.deepEqual(applied.body.observedArchived, [ids[0]]);
         else assert.deepEqual(applied.body.unknown, [ids[0]]);
     }
+
+    const batch = { action: "archive", lead: ref, targets: [ids[0], ids[2]], keeper: ids[1] };
+    const invocation = { type: "message", id: "archive-call", parentId: current.id,
+        message: { role: "assistant", content: [{ type: "toolCall", id: "fixture", name: "hindsight_curate" }] } };
+    for (const mode of ["ack", "lost", "conflict"] as const) {
+        await prepare(3);
+        branch.push(invocation);
+        for (const targets of [[ids[0], ids[0]], [ids[0], ids[1]]]) {
+            assert.equal((await run({ ...batch, targets })).body.reason, "invalid_input");
+        }
+        assert.equal(requests.length, 0);
+        patchMode = mode;
+        const applied = await run(batch);
+        const attempt = branch.find(entry => entry.customType === "hindsight-curation-attempt");
+        assert.deepEqual((attempt?.data as Entry)?.targetIds, batch.targets);
+        assert.deepEqual(requests.filter(request => request.method === "PATCH").map(request => request.path),
+            (mode === "ack" ? batch.targets : [ids[0]]).map(id => prefix() + `/memories/${id}`));
+        assert.deepEqual(applied.body.archived, mode === "ack" ? batch.targets : []);
+        assert.deepEqual(applied.body.observedArchived, mode === "lost" ? [ids[0]] : []);
+        assert.deepEqual(applied.body.unchanged, mode === "ack" ? [] : [ids[2]]);
+        assert.deepEqual(applied.body.unknown, mode === "conflict" ? [ids[0]] : []);
+        assert.ok(batch.targets.every(id => review.includes(id)) && review.includes(ids[1]));
+    }
+    assert.equal(facts.get(ids[2])?.state, "valid");
+    const interrupted = branch.pop()!;
+    assert.equal(interrupted.customType, "hindsight-curation-attempt");
+    const attemptId = (interrupted.data as Entry).id;
+    siblingEntries = [interrupted];
+    await emit("session_start");
+    ctx.ui.custom = nativeForm;
+    requests.length = 0;
+    const recovered = await run({ action: "reconcile", attempt: attemptId, lead: ref });
+    assert.deepEqual(recovered.body.unknown, [ids[0]], "a conflicting archive reason is not attributed to the attempt");
+    assert.deepEqual(recovered.body.unchanged, [ids[2]]);
+    assert.deepEqual((await run(batch)).body.unchanged, [ids[2]], "replayed archive calls can only reconcile");
+    assert.ok(requests.length && requests.every(request => request.method === "GET"));
+    requests.length = 0;
+    settings.hindsightApiToken = "changed";
+    assert.deepEqual((await run({ action: "reconcile", attempt: attemptId })).body.unknown, batch.targets);
+    settings.hindsightApiToken = "fixture-token";
+    branch = [];
+    assert.equal((await run({ action: "reconcile", attempt: attemptId })).body.reason, "attempt_not_in_branch");
+    assert.equal(requests.length, 0);
 } finally { server.stop(true); rmSync(sessionDir, { recursive: true, force: true }); }
