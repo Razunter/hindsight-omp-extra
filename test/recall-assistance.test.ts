@@ -157,14 +157,22 @@ test("guidance changes with permitted routes without stacking or advertising rem
     }
 });
 
-test("enabled eval guidance uses retrieval bridges and falls back to device discovery when eval is disabled", () => {
-    const results = run({ active: ["eval", "read", "write", "recall"], steps: [
-        { systemPrompt: "base" }, { reuse: true, active: ["read", "write", "recall"] },
+test("retrieval guidance follows eval, mounted commands, and direct tools", () => {
+    const results = run({ active: ["eval", "bash", "recall"], values: { "tools.commands": true }, steps: [
+        { systemPrompt: "base" }, { reuse: true, active: ["bash", "recall"] },
+        { reuse: true, active: ["read", "write", "recall"] },
+        { reuse: true, active: ["bash", "recall"], values: { "tools.commands": false } },
     ] });
     expect(results[0]).toContain("tool.recall");
-    expect(results[0]).not.toContain("xd://recall");
-    expect(results[1]).toContain("xd://recall");
+    expect(results[0]).not.toContain("--help");
+    expect(results[1]).toContain("<tool> --help");
+    expect(results[1]).not.toContain("recall --help");
     expect(results[1]).not.toContain("tool.recall");
+    for (const result of results.slice(2)) {
+        expect(result).toContain("Available retrieval tools: recall");
+        expect(result).not.toContain("--help");
+        expect(result).not.toContain("xd://");
+    }
 });
 
 test("terminal availability does not change eligible main guidance", () => {

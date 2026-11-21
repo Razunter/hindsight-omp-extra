@@ -19,7 +19,7 @@ hindsightOmp:
 
 This typed boolean defaults to `true` and is read at each prompt preparation. Live changes affect subsequently prepared context without changing stored history or restarting Hindsight/Docker. Only the extension-owned block is replaced or removed; native guidance and other extensions' content are preserved.
 
-The footer requires `memory.backend: hindsight`, a main agent, and at least one enabled `recall`, `reflect`, or `hindsight_evidence` route. Children/advisors, other/off backends, and sessions without an enabled retrieval route receive none. It never activates tools or widens restrictions. With `eval` enabled, guidance names the permitted `tool.*` bridges; otherwise it names exposed retrieval tools and, when `read`/`write` are enabled, their ordinary `xd://` schema/call routes.
+The footer requires `memory.backend: hindsight`, a main agent, and at least one enabled `recall`, `reflect`, or `hindsight_evidence` route. Children, advisors, other backends, and sessions without an enabled retrieval route receive none. The footer never activates tools or widens restrictions. With `eval` enabled, it names the permitted `tool.*` bridges. Otherwise, it points to direct calls. If `bash` is enabled and `tools.commands: true`, the footer also explains how to run `<tool> --help` for a mounted command.
 
 Delivery performs no memory request, capture, timer, extra model turn, provider change or container reconciliation. The agent still decides whether to retrieve. An agent-selected lookup has the native/evidence tool's normal cost and error behavior.
 

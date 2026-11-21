@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- When `eval` is disabled, the retrieval footer points to direct tools and, when enabled, OMP 19.1 shell commands instead of removed `xd://` routes.
 - Interactive main sessions now warn about Paused or Stale OMP-seeded mental models in the active default Hindsight bank. The read-only check runs in the background and shares a 24-hour cadence per seed across sessions in the same OMP profile.
 - Fix: `hindsight_evidence` accepted only `action` plus the one field the action uses, so models that send both `query` and `id` (one empty) got `invalid_input` on every call. The unused field may now be omitted or empty; a non-empty unused field, a missing required field or any other key is still refused.
 - Local Hindsight management is now opt-in and Off by default, including for existing installations, which get a one-time notice. Off does no Docker work and no provider-file validation, never stops the running container and leaves provider files, selection and credentials untouched. Evidence, recall guidance and ingestion work without local management.
