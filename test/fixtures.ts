@@ -267,29 +267,48 @@ default: code = 1;
 fs.writeFileSync(file, JSON.stringify(state));
 if (out) console.log(out); if (err) console.error(err); process.exit(code);`;
 
+export const fixtureFileLock = `const tryAcquireFileLock = file => {
+    try {
+        const socket = Bun.listen({ unix: "\\0hindsight-test:" + Bun.hash(file), socket: { data() {} } });
+        return { release: () => socket.stop(true) };
+    } catch (error) {
+        if (error.code === "EADDRINUSE") return null;
+        throw error;
+    }
+};
+Bun.plugin({ name: "fixture-file-lock", setup(build) {
+    build.module("@oh-my-pi/pi-utils", () => ({ exports: { tryAcquireFileLock }, loader: "object" }));
+} });`;
+
 const startupDriver = `import fs from "node:fs";
+${fixtureFileLock}
 Bun.plugin({ name: "fixture-omp-storage", setup(build) {
     build.module("@oh-my-pi/pi-coding-agent", () => ({ exports: {
-        getAgentDir: () => process.env.PI_CODING_AGENT_DIR ?? process.env.HOME + "/.omp/agent",
+        getAgentDir: () => process.env.PI_CODING_AGENT_DIR ?? import.meta.dir,
     }, loader: "object" }));
-    build.module("@oh-my-pi/pi-coding-agent/config/registry", () => ({ exports: { lookup: () => undefined, register: definition => ({ get: () => definition.default }) }, loader: "object" }));
+    build.module("@oh-my-pi/pi-coding-agent/config/registry", () => ({ exports: { lookup: id => id === "memory.backend" ? { get: settings => settings.backend } : undefined, register: definition => ({ get: () => definition.default }) }, loader: "object" }));
     build.module("@oh-my-pi/pi-coding-agent/hindsight/config", () => ({ exports: {
-        loadHindsightConfig: () => ({ mentalModelsEnabled: false }), isHindsightConfigured: () => false,
+        loadHindsightConfig: settings => settings, isHindsightConfigured: settings => Boolean(settings.hindsightApiUrl),
     }, loader: "object" }));
     build.module("@oh-my-pi/pi-coding-agent/hindsight/bank", () => ({ exports: {
-        computeBankScope: () => { throw new Error("Unexpected mental model monitor check"); },
+        computeBankScope: () => ({ bankId: "fixture-bank" }),
     }, loader: "object" }));
     build.module("@oh-my-pi/pi-coding-agent/hindsight/mental-models", () => ({ exports: {
-        resolveSeedsForScope: () => [], seedAlreadyExists: () => false,
+        resolveSeedsForScope: () => [{ id: "user-preferences" }, { id: "project-decisions" }], seedAlreadyExists: () => false,
     }, loader: "object" }));
     build.module("@oh-my-pi/pi-natives/vcs", () => ({ exports: { repo: () => undefined }, loader: "object" }));
-    build.module("@oh-my-pi/pi-utils", () => ({ exports: { tryAcquireFileLock: () => null }, loader: "object" }));
 } });
 const stateFile = process.env.FAKE_DOCKER_STATE;
 const managementFile = import.meta.dir + "/.local-management.json";
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.hostname === "status-fixture.invalid") {
+        const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+        state.calls.push(["unexpected-status-request"]);
+        fs.writeFileSync(stateFile, JSON.stringify(state));
+        throw new Error("Status must not contact Hindsight");
+    }
     if (url.href === "https://api.github.com/repos/vectorize-io/hindsight/releases/latest") {
         const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
         (state.releaseRequests ??= []).push(url.href);
@@ -315,8 +334,7 @@ async function settle(since, lease) {
     const busy = () => {
         const current = management();
         return (lease?.pid === process.pid && (notifications.length === reported || current?.operation?.id === lease.id))
-            || (current?.check?.attemptedAt >= since && !current.check.outcome)
-            || fs.existsSync(import.meta.dir + "/.local-management.lock");
+            || (current?.check?.attemptedAt >= since && !current.check.outcome);
     };
     while (busy()) {
         if (Date.now() > deadline) throw new Error("Background lifecycle operation did not finish");
@@ -332,7 +350,9 @@ for (let i = 0; i < steps.length; i++) {
     const startups = [];
     let command;
     module.default({
-        pi: { settings: {} },
+        pi: { settings: step.mentalModels ? {
+            backend: "hindsight", hindsightApiUrl: "http://status-fixture.invalid", mentalModelsEnabled: true, scoping: "per-project-tagged",
+        } : {} },
         getActiveTools() { return []; },
         setLabel() {},
         arktype(schema) { return {}; },
@@ -341,7 +361,7 @@ for (let i = 0; i < steps.length; i++) {
         registerCommand(name, options) { commands.push(name); if (name === "hindsight") command = options.handler; },
     });
     const choices = [...(step.choices ?? [])];
-    const ctx = { cwd: import.meta.dir, sessionManager: { getBranch: () => [] }, hasUI: step.hasUI ?? true, agent: { kind: step.kind ?? "main" },
+    const ctx = { cwd: import.meta.dir, sessionManager: { getBranch: () => [], getCwd: () => import.meta.dir }, hasUI: step.hasUI ?? true, agent: { kind: step.kind ?? "main" },
         setTimeout() {}, setInterval() {}, ui: {
         notify(message, level) { notifications.push({ message, level }); },
         async select(title, options) {
@@ -413,7 +433,7 @@ export function fixture(): Fixture {
             // --no-env-file: Bun would otherwise load the cwd's real .env over the fixture's settings.
             const result = Bun.spawnSync([process.execPath, "--no-env-file", path.join(root, "driver.ts")], {
                 timeout: 10_000,
-                env: { ...env, ...overrides, PATH: path.join(root, "bin") + ":" + process.env.PATH, FAKE_DOCKER_STATE: statePath, FIXTURE_STEPS: JSON.stringify(steps) },
+                env: { ...env, PI_CODING_AGENT_DIR: root, ...overrides, PATH: path.join(root, "bin") + ":" + process.env.PATH, FAKE_DOCKER_STATE: statePath, FIXTURE_STEPS: JSON.stringify(steps) },
             });
             if (result.exitCode !== 0) throw new Error(result.stderr.toString() || "Fixture run did not finish within ten seconds");
             return JSON.parse(result.stdout.toString());

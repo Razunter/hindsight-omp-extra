@@ -18,6 +18,14 @@ Local Hindsight management is Off by default. In Off, these files are not read f
 
 The container keeps running after OMP exits (`--restart unless-stopped`). Stopping OMP does not stop Hindsight. See [stopping the container](setup.md#stop-the-container).
 
+### Upgrade the installation-state lock
+
+Before upgrading or rolling back across the lock change, let any `/hindsight` operation finish and exit every OMP process that uses this extension installation. The running container stays up.
+
+On the first state update, the new version reserves the old `.local-management.lock` path with an empty directory so older processes cannot acquire that lock. If a **regular lock file** remains from a previous process, remove it only after confirming all old processes have exited. Do not remove `.local-management.json`.
+
+To roll back, stop the new processes first, then remove only the empty `.local-management.lock` directory with `rmdir` from the extension root. Keep the state file, provider settings, and container data.
+
 ## Shared infrastructure
 
 The extension root `.env` supplies defaults; `providers/<selected-name>.env` overrides them. The launcher forwards every variable in the validated merged configuration to the container, regardless of prefix, including empty values and launcher settings. This exposes all credentials in those files to the container. Include only values intended for Hindsight. The host process environment is not forwarded wholesale. Optional `HINDSIGHT_BIND_ADDRESS` and the required Docker settings below use this precedence: process environment, selected profile, then base `.env`.

@@ -1,15 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { tryAcquireFileLock } from "@oh-my-pi/pi-utils";
 import { EXTENSION_ROOT } from "./runtime-config";
 import type { StableRelease } from "./stable-release";
 
-const STATE_FILE = path.join(EXTENSION_ROOT, ".local-management.json");
-const LOCK_FILE = path.join(EXTENSION_ROOT, ".local-management.lock");
-/** Serializes stale-lock reclamation; held only for a read and an unlink. */
-const RECLAIM_FILE = LOCK_FILE + ".reclaim";
-const STALE_LOCK_MS = 60_000;
-const ABANDONED_RECLAIM_MS = 10_000;
+const ROOT = fs.realpathSync(EXTENSION_ROOT);
+const STATE_FILE = path.join(ROOT, ".local-management.json");
+const LEGACY_LOCK = path.join(ROOT, ".local-management.lock");
 
 export type ManagementMode = "off" | "cpu" | "gpu";
 export interface UpstreamIdentity { reference: string; digests: string[] }
@@ -71,78 +69,32 @@ export function liveOperation(state: ManagementState): ManagementState["operatio
     return state.operation && pidAlive(state.operation.pid) ? state.operation : undefined;
 }
 
-function tokenOf(file: string): string | undefined {
-    try { return fs.readFileSync(file, "utf8"); }
-    catch { return undefined; }
-}
-
-/** Create `file` holding `token` unless it exists. */
-function create(file: string, token: string): boolean {
-    try {
-        const lock = fs.openSync(file, "wx", 0o600);
-        try { fs.writeSync(lock, token); }
-        finally { fs.closeSync(lock); }
-        return true;
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("Hindsight: could not lock local management state; check extension-root write permissions");
-        return false;
-    }
-}
-
-function release(file: string, token: string): void {
-    if (tokenOf(file) === token) fs.rmSync(file, { force: true });
-}
-
-/** The state lock's token while its holder is dead or it outlived any state update; undefined otherwise. */
-function staleToken(): string | undefined {
-    const token = tokenOf(LOCK_FILE);
-    const pid = parseInt(token ?? "", 10);
-    try {
-        return token !== undefined && (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > STALE_LOCK_MS || (pid > 0 && !pidAlive(pid))) ? token : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
-/**
- * Remove the state lock if it still holds the stale `token`. Reclaimers take turns under a guard, so none can remove a lock
- * another reclaimer's successor took meanwhile. False when another live reclaimer holds the guard.
- */
-function reclaim(token: string, own: string): boolean {
-    if (!create(RECLAIM_FILE, own)) {
-        try {
-            if (Date.now() - fs.statSync(RECLAIM_FILE).mtimeMs <= ABANDONED_RECLAIM_MS) return false;
-            // shortcut: a reclaimer stalled for over ten seconds between taking the mutex and unlinking could still remove a fresh lock; an OS file lock would close that window.
-            fs.rmSync(RECLAIM_FILE, { force: true });
-        } catch {
-            // Released meanwhile.
-        }
-        return true;
-    }
-    try { if (tokenOf(LOCK_FILE) === token) fs.rmSync(LOCK_FILE, { force: true }); }
-    finally { release(RECLAIM_FILE, own); }
-    return true;
-}
-
 /**
  * Read-modify-write the state under the installation lock. `mutate` returns the new state to write,
  * or undefined to leave the file untouched. Never hold this across Docker work.
  */
 export async function updateState(mutate: (state: ManagementState | undefined) => ManagementState | undefined): Promise<ManagementState | undefined> {
     const deadline = Date.now() + 5_000;
-    const token = `${process.pid}-${randomUUID()}`;
-    while (!create(LOCK_FILE, token)) {
-        const stale = staleToken();
-        if (stale !== undefined && reclaim(stale, token)) continue;
-        if (Date.now() > deadline) throw new Error("Hindsight: local management state is locked by another process; try again");
+    let lock = tryAcquireFileLock(STATE_FILE);
+    while (!lock) {
+        if (Date.now() >= deadline) throw new Error("Hindsight: local management state is locked by another process; try again");
         await Bun.sleep(20);
+        lock = tryAcquireFileLock(STATE_FILE);
     }
     try {
+        // A directory reserves the old exclusive-create path without reclaiming another process's lock.
+        try { fs.mkdirSync(LEGACY_LOCK, { recursive: true, mode: 0o700 }); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+                throw new Error("Hindsight: legacy local management lock remains at .local-management.lock. Stop older OMP processes and see 'Upgrade the installation-state lock' in docs/configuration.md");
+            }
+            throw new Error("Hindsight: could not reserve the local management lock; check extension-root write permissions");
+        }
         const next = mutate(readState());
         if (next) writeState(next);
         return next;
     } finally {
-        release(LOCK_FILE, token);
+        lock.release();
     }
 }
 
