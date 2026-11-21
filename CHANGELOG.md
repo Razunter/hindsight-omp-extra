@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- In a `skill-observer` observation pass, `hindsight_curate` investigates a specific Hindsight finding. After native approval, it can archive duplicate or obsolete facts. If it creates a replacement, it verifies the exact fact before archiving the original. Check interrupted attempts by ID without repeating writes.
 - When `eval` is disabled, the retrieval footer points to direct tools and, when enabled, OMP 19.1 shell commands instead of removed `xd://` routes.
 - Interactive main sessions now warn about Paused or Stale OMP-seeded mental models in the active default Hindsight bank. The read-only check runs in the background and shares a 24-hour cadence per seed across sessions in the same OMP profile.
 - Fix: `hindsight_evidence` accepted only `action` plus the one field the action uses, so models that send both `query` and `id` (one empty) got `invalid_input` on every call. The unused field may now be omitted or empty; a non-empty unused field, a missing required field or any other key is still refused.

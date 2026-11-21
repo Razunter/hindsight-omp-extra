@@ -53,6 +53,24 @@ The skill uses a scout to distill useful knowledge and queues it through OMP’s
 
 [Evidence tool reference](docs/evidence.md) · [Ingestion requirements and workflow](docs/ingestion.md)
 
+### Curate Hindsight facts in `/observe`
+
+With [skill-observer](https://github.com/Razunter/skill-observer) loaded, run `/observe` with a specific Hindsight finding, or follow up on one already recorded by Observer. For example, `/observe Hindsight recalls duplicate facts about the release procedure.` The pass looks up a bounded set of raw facts in OMP's active Hindsight bank. It does not audit the whole bank.
+
+The Hindsight review shows the bank and whether the change is project-specific or global. It shows which facts would be archived, why, and what would stay active. Read every page. Press **a** on the last page to approve, or **Enter** or **Esc** to leave the facts active. The separate Observer form cannot approve Hindsight changes.
+
+For a first-hand correction, give the affected fact ID and say exactly what you know. Replace the placeholders in these examples:
+
+```text
+/observe I confirm Hindsight fact FACT_ID is obsolete and has no remaining use, including as history.
+/observe I confirm Hindsight fact FACT_ID is superseded by KEEPER_ID and the keeper preserves its still-useful details.
+/observe I confirm Hindsight fact FACT_ID is incorrect and the exact correction preserves its still-useful details. Exact replacement: CORRECTED FACT TEXT
+```
+
+The pass prefers an active keeper that preserves all useful details. To create a replacement, the server must already have a compatible `chunks` strategy. Before archiving the original, the pass must read back exactly one fact: an active `world` fact with the approved text and reviewed metadata. Bank settings stay unchanged. The replacement can remain active if archive fails. If no suitable keeper or exact replacement is available, the original stays active.
+
+Archive leaves the original text and ID in Hindsight but removes it from recall, even historical recall. In a restored session, use the attempt ID to check which facts are active or archived without repeating writes. Recovery cannot tell whether an active fact was edited while OMP was stopped, or whether an observed replacement matches the approved text. To reverse an archive, restore the original explicitly in Hindsight's Control Plane. Rechecks can detect changes before a write; they cannot lock out another writer.
+
 ## Defaults and limits
 
 - **Local ports:** the launcher binds the API and dashboard to `127.0.0.1`. [`HINDSIGHT_BIND_ADDRESS`](docs/configuration.md#network-binding) overrides both.
