@@ -432,4 +432,35 @@ try {
     branch = [];
     assert.equal((await run({ action: "reconcile", attempt: attemptId })).body.reason, "attempt_not_in_branch");
     assert.equal(requests.length, 0);
+
+    patchMode = "ack";
+    facts.set(ids[0], rawFact(ids[0], { text: "The retired Quill lookup code is BLUE." }));
+    facts.set(ids[1], rawFact(ids[1], { text: "In 2022 the Quill lookup code was BLUE.", occurred_start: "2022-01-01" }));
+    const obsolete = (id: string) => run({ action: "obsolete", lead: ref, targets: [id], keeper: null });
+    const attestation = `I confirm Hindsight fact ${ids[0]} is obsolete and has no remaining use, including as history.`;
+    for (const [message, kind] of [
+        ["Hindsight's Quill lookup code fact might be obsolete; the search did not find a use.", "note"],
+        [attestation, "observation"],
+        [`Do not treat this as my attestation: "${attestation}"`, "note"],
+    ]) {
+        branch = [lead({ id: "uncertain-obsolete", text: message, kind })];
+        await run();
+        requests.length = 0;
+        assert.equal((await obsolete(ids[0])).body.reason, "obsolescence_not_established");
+        assert.equal(requests.length, 0);
+    }
+    branch = [lead({ id: "obsolete-pass", text: `The fixture Quill lookup code was temporary. ${attestation}` })];
+    await run();
+    requests.length = 0;
+    assert.equal((await obsolete(ids[1])).body.reason, "obsolescence_not_established", "an attestation for one fact cannot retire its historical counterpart");
+    ctx.ui.custom = answer("a") as unknown as typeof nativeForm;
+    assert.deepEqual((await obsolete(ids[0])).body.archived, [ids[0]]);
+    assert.match(review, /no replacement/i);
+    assert.match(review, /retired Quill lookup code/);
+    assert.equal(facts.get(ids[0])?.text, "The retired Quill lookup code is BLUE.");
+    assert.match(String(facts.get(ids[0])?.invalidation_reason), /obsolete.*no remaining use/i);
+    assert.equal(facts.get(ids[1])?.state, "valid");
+    assert.deepEqual(requests.filter(request => request.method !== "GET").map(request => [request.method, request.path]), [
+        ["PATCH", `${prefix()}/memories/${ids[0]}`],
+    ]);
 } finally { server.stop(true); rmSync(sessionDir, { recursive: true, force: true }); }

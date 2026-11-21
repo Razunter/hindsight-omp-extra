@@ -88,9 +88,9 @@ export function registerCuration(pi: ExtensionAPI): void {
     pi.registerTool({
         name: TOOL,
         label: "Hindsight curation",
-        description: "Review Hindsight facts during a user-started /observe pass. Investigate one cued lead. For exact duplicates with matching material metadata, call archive with target and keeper IDs from that lookup. Archive opens its own native confirmation and writes only if approved there. Do not ask separately. Reconcile an interrupted attempt by its recorded attempt ID; this only reads. Report IDs and outcomes without quoting archived claims.",
+        description: "Review Hindsight facts during a user-started /observe pass. Investigate one cued lead. Call archive for exact duplicates with target and keeper IDs; call obsolete for one fact the user's note explicitly attests is obsolete and has no remaining use, including history. Both actions open their own native confirmation before any write. Do not ask separately. Reconcile an interrupted attempt by its recorded ID; this only reads. Report IDs and outcomes without quoting archived claims.",
         parameters: pi.arktype({
-            action: "'investigate' | 'archive' | 'reconcile'", "lead?": "string | null",
+            action: "'investigate' | 'archive' | 'obsolete' | 'reconcile'", "lead?": "string | null",
             "targets?": "string[] | null", "keeper?": "string | null", "attempt?": "string | null",
         }),
         approval: "read",
@@ -108,8 +108,9 @@ export function registerCuration(pi: ExtensionAPI): void {
             const valid = action === "reconcile" ? typeof attemptId === "string" && UUID.test(attemptId) &&
                 (leadRef == null || leadRef === "" || (typeof leadRef === "string" && UUID.test(leadRef))) && noTargets && noKeeper
                 : (attemptId == null || attemptId === "") && typeof leadRef === "string" && UUID.test(leadRef) &&
-                    (action === "investigate" ? noTargets && noKeeper :
-                        action === "archive" && haveTargets && typeof keeperId === "string" && UUID.test(keeperId) && !targetIds.includes(keeperId));
+                    (action === "investigate" ? noTargets && noKeeper : haveTargets &&
+                        (action === "obsolete" ? targetIds.length === 1 && noKeeper :
+                            action === "archive" && typeof keeperId === "string" && UUID.test(keeperId) && !targetIds.includes(keeperId)));
             if (!valid) return outcome({ status: "error", reason: "invalid_input" });
             if (invocationSignal?.aborted) return outcome({ status: "error", reason: "cancelled" });
             if (!nativeMain(ctx) || !pi.getActiveTools().includes(TOOL)) return outcome({ status: "unavailable", reason: "interactive_main_required" });
@@ -126,7 +127,7 @@ export function registerCuration(pi: ExtensionAPI): void {
                 if (!isDeepStrictEqual(getTarget(pi, ctx.cwd), target) || session.getCwd() !== ctx.cwd || session.getSessionFile() !== sessionFile) throw new Error("scope_changed");
             };
             const recorded = action === "reconcile" ? findAttempt(session, { id: attemptId as string })
-                : action === "archive" ? findAttempt(session, { callId }) : undefined;
+                : action === "archive" || action === "obsolete" ? findAttempt(session, { callId }) : undefined;
             if (recorded) return outcome(await reconcile(recorded, target, assertScope, invocationSignal));
             if (action === "reconcile") return outcome({ status: "unavailable", reason: "attempt_not_in_branch" });
 
@@ -139,20 +140,30 @@ export function registerCuration(pi: ExtensionAPI): void {
                 const current = activePass(ctx, generation);
                 if (current?.id !== pass.id || !current.leads.some(item => item.ref === lead.ref && item.kind === lead.kind && item.text === lead.text)) throw new Error("pass_changed");
             };
-            if (action === "archive") {
+            if (action === "archive" || action === "obsolete") {
                 if (reviewing) return outcome({ status: "unavailable", reason: "another_review_open" });
                 if (!investigation || investigation.passId !== pass.id || investigation.lead !== lead.ref || !isDeepStrictEqual(investigation.target, target)) {
                     return outcome({ status: "unavailable", reason: "investigate_first" });
                 }
                 const candidates = investigation.candidates;
                 const originals = (targetIds as string[]).map(id => candidates.find(candidate => candidate.fact.id === id));
-                const keeper = investigation.candidates.find(candidate => candidate.fact.id === keeperId);
-                if (!keeper || !originals.every((item): item is Candidate => Boolean(item && duplicateOf(item, keeper)))) {
+                const keeper = candidates.find(candidate => candidate.fact.id === keeperId);
+                if (!originals.every((item): item is Candidate => item !== undefined)) {
+                    return outcome({ status: "unavailable", reason: action === "archive" ? "no_complete_same_scope_keeper" : "target_not_in_investigation" });
+                }
+                if (action === "archive" && (!keeper || !originals.every(item => duplicateOf(item, keeper)))) {
                     return outcome({ status: "unavailable", reason: "no_complete_same_scope_keeper" });
+                }
+                if (action === "obsolete") {
+                    const attestation = `I confirm Hindsight fact ${originals[0]!.fact.id} is obsolete and has no remaining use, including as history.`;
+                    if (lead.kind !== "note" || !lead.text.split(/(?<=[.!?])\s+|\r?\n/).some(line => line.trim().toLowerCase() === attestation.toLowerCase())) {
+                        return outcome({ status: "unavailable", reason: "obsolescence_not_established",
+                            note: "Use a first-hand note that identifies the fact and confirms it is obsolete and not useful even as history. A failed search does not qualify." });
+                    }
                 }
                 reviewing = true;
                 try {
-                    return outcome(await archiveDuplicates(pi, ctx, callId, target, lead, originals, keeper, assertCurrent, invocationSignal));
+                    return outcome(await archiveFacts(pi, ctx, callId, target, lead, originals, keeper, assertCurrent, invocationSignal));
                 } catch (error) {
                     return outcome({ status: "error", reason: invocationSignal?.aborted ? "cancelled" : changeReason(error) });
                 } finally { reviewing = false; }
@@ -286,7 +297,9 @@ function scopedRequest(target: CurationTarget, assertCurrent: () => void, signal
 }
 
 function archiveReason(attempt: Attempt): string {
-    return `Duplicate of ${attempt.keeperId}; same claim, scope and material metadata. Curation attempt ${attempt.id}.`;
+    const explanation = attempt.keeperId ? `Duplicate of ${attempt.keeperId}; same claim, scope and material metadata.`
+        : "The operator confirmed the fact is obsolete and has no remaining use, including as history.";
+    return `${explanation} Curation attempt ${attempt.id}.`;
 }
 
 function archiveSummary(attempt: Attempt) {
@@ -326,9 +339,9 @@ async function reconcile(attempt: Attempt, target: CurationTarget | undefined, a
         note: "Readback only. The attempt record does not store previous fact text or prove who changed a fact." };
 }
 
-async function archiveDuplicates(
+async function archiveFacts(
     pi: ExtensionAPI, ctx: ExtensionContext, callId: string, target: CurationTarget, lead: Lead,
-    originals: Candidate[], keeper: Candidate, assertCurrent: () => void, signal?: AbortSignal,
+    originals: Candidate[], keeper: Candidate | undefined, assertCurrent: () => void, signal?: AbortSignal,
 ): Promise<JsonObject> {
     const first = originals[0]!.fact;
     const session = ctx.sessionManager;
@@ -336,16 +349,16 @@ async function archiveDuplicates(
     const attempt: Attempt = {
         id: randomUUID(), callId, sessionId, connection: connectionKey(sessionId, target),
         bank: target.bank, scope: first.scope.kind, project: target.project, tags: first.tags,
-        targetIds: originals.map(item => item.fact.id), keeperId: keeper.fact.id,
+        targetIds: originals.map(item => item.fact.id), ...(keeper ? { keeperId: keeper.fact.id } : {}),
     };
     const reason = archiveReason(attempt);
     const review = [
-        `Action: archive ${originals.length} duplicate fact(s). Bank: ${target.bank}. Scope: ${first.scope.kind}. Project: ${target.project}.`,
+        `Action: ${keeper ? `archive ${originals.length} duplicate fact(s)` : "archive one obsolete fact without a replacement"}. Bank: ${target.bank}. Scope: ${first.scope.kind}. Project: ${target.project}.`,
         `Audience tags: ${JSON.stringify(first.tags)}. Archive removes these facts from recall, including historical recall.`,
         `Evidence (${lead.kind}): ${lead.text}`,
         `Reason: ${reason}`,
         ...originals.map(item => `Archive ${item.fact.id}:\n${JSON.stringify(item, null, 2)}`),
-        `Keep active ${keeper.fact.id}:\n${JSON.stringify(keeper, null, 2)}`,
+        keeper ? `Keep active ${keeper.fact.id}:\n${JSON.stringify(keeper, null, 2)}` : "No replacement. The operator attested that this fact has no remaining use.",
     ].join("\n\n");
     const approval = await confirmArchive(ctx.ui, review, signal);
     if (approval !== "approved") return { status: "unavailable", reason: approval ?? "declined" };
@@ -361,7 +374,7 @@ async function archiveDuplicates(
         assertCurrent();
         return snapshots.every(Boolean);
     };
-    if (!await recheck([keeper, ...originals])) return { status: "unavailable", reason: "reviewed_fact_changed" };
+    if (!await recheck(keeper ? [keeper, ...originals] : originals)) return { status: "unavailable", reason: "reviewed_fact_changed" };
     if (!await recordAttempt(pi, session, attempt)) return { status: "error", reason: "attempt_not_saved" };
 
     const summary = archiveSummary(attempt);
@@ -372,7 +385,7 @@ async function archiveDuplicates(
         let acknowledged = false;
         if (!stopped) {
             try {
-                if (!await recheck([keeper, item])) throw new Error("reviewed_fact_changed");
+                if (!await recheck(keeper ? [keeper, item] : [item])) throw new Error("reviewed_fact_changed");
                 await read("/memories/" + id, { state: "invalidated", reason }, "PATCH");
                 acknowledged = true;
             } catch (error) { failure = changeReason(error); }
@@ -403,13 +416,23 @@ async function investigate(target: CurationTarget, lead: Lead, signal: AbortSign
     if (!Array.isArray(recall.results)) return { response: { status: "unavailable", reason: "unsupported_recall_envelope" }, candidates: [] };
     const chunks = object(recall.chunks);
     const hits = new Map<string, JsonObject>();
+    if (lead.kind === "note") {
+        for (const match of lead.text.matchAll(/\bHindsight fact ([a-f0-9-]{36})\b/gi)) {
+            const id = match[1]!.toLowerCase();
+            if (UUID.test(id)) hits.set(id, {});
+            if (hits.size === CURATION_LIMIT) break;
+        }
+    }
     let omitted = false;
     let truncated = query.length < lead.text.length;
     for (const value of recall.results) {
         const hit = object(value);
         if (!hit || typeof hit.id !== "string" || !UUID.test(hit.id) || !isFactType(hit.type) || typeof hit.text !== "string"
             || (hit.bank_id !== undefined && hit.bank_id !== target.bank)) { omitted = true; continue; }
-        if (hits.has(hit.id)) continue;
+        if (hits.has(hit.id)) {
+            if (!hits.get(hit.id)!.type) hits.set(hit.id, hit);
+            continue;
+        }
         if (hits.size === CURATION_LIMIT) { truncated = true; break; }
         hits.set(hit.id, hit);
     }
@@ -418,7 +441,7 @@ async function investigate(target: CurationTarget, lead: Lead, signal: AbortSign
         try { row = await read("/memories/" + id); }
         catch (error) { if (transportCategory(error) === "missing") return; throw error; }
         const fact = parseFact(row, target, id);
-        if (!fact || fact.type !== hit.type) return;
+        if (!fact || (hit.type !== undefined && fact.type !== hit.type)) return;
         const source = await supportingSource(fact, target, hit, fact.chunk_id ? chunks?.[fact.chunk_id] : undefined, read);
         if (source.status === "foreign_project") return;
         const { metadata, document_id: _document, chunk_id: _chunk, ...shown } = fact;

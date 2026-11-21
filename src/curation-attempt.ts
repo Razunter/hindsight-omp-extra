@@ -16,7 +16,7 @@ export interface Attempt {
     project: string;
     tags: string[];
     targetIds: string[];
-    keeperId: string;
+    keeperId?: string;
 }
 
 export function findAttempt(session: ExtensionContext["sessionManager"], match: { id?: string; callId?: string }): Attempt | undefined {
@@ -33,7 +33,8 @@ export function findAttempt(session: ExtensionContext["sessionManager"], match: 
             !Array.isArray(value.tags) || !value.tags.every(tag => typeof tag === "string") ||
             !Array.isArray(value.targetIds) || !value.targetIds.length || value.targetIds.length > CURATION_LIMIT ||
             !value.targetIds.every(id => typeof id === "string" && UUID.test(id)) || new Set(value.targetIds).size !== value.targetIds.length ||
-            typeof value.keeperId !== "string" || !UUID.test(value.keeperId) || value.targetIds.includes(value.keeperId)) return;
+            (value.keeperId === undefined ? value.targetIds.length !== 1 : typeof value.keeperId !== "string" ||
+                !UUID.test(value.keeperId) || value.targetIds.includes(value.keeperId))) return;
         if (!branch.has(entry.id)) {
             // OMP restore can rewind to the assistant's pending call, leaving an in-tool append on the old continuation.
             let parentId = entry.parentId;
