@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fixture, imageId, infrastructure, menu, nativeEnv, profile, type Container, type Fixture } from "./fixtures";
@@ -76,6 +77,27 @@ test("menu access and cancellation work without valid local setup", () => {
     ]);
     expect(result.notifications.map(n => n.level)).toEqual(["info"]);
     expect(f.management()).toBeUndefined();
+    expect(f.state().calls).toEqual([]);
+});
+
+test("Status shows last known mental model details with local management Off", () => {
+    const f = setup();
+    const dir = path.join(f.root, "hindsight-mental-model-monitor");
+    fs.mkdirSync(dir);
+    const checkedAt = Date.UTC(2026, 10, 21, 15);
+    for (const [id, check] of [
+        ["user-preferences", { checkedAt, model: { name: "User Preferences", status: "Paused", refreshedAt: null }, failed: true }],
+        ["project-decisions", { checkedAt, model: { name: "Project Decisions", status: "Unknown" } }],
+    ] as const) {
+        const key = createHash("sha256").update(JSON.stringify(["http://status-fixture.invalid", "fixture-bank", id])).digest("hex");
+        fs.writeFileSync(path.join(dir, key + ".json"), JSON.stringify(check));
+    }
+    const result = f.run([{ startup: false, mentalModels: true, command: true, choices: [menu.status] }]);
+    const detail = result.notifications[0]!.message;
+    expect(detail).toContain("Management is Off: Docker was not inspected");
+    expect(detail).toContain("Check unavailable · last known: 2 models · 1 paused · 1 unknown");
+    expect(detail).toContain("User Preferences: Paused · never refreshed · checked");
+    expect(detail).toContain("Project Decisions: Unknown · refresh time unknown · checked");
     expect(f.state().calls).toEqual([]);
 });
 

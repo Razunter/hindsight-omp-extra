@@ -1,9 +1,9 @@
-import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
-import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { computeBankScope } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
+import { loadHindsightConfig, type HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
+import { isHindsightHttpUrl, request, transportCategory } from "./hindsight-http";
 
-const RESPONSE_BYTES = 1024 * 1024;
 const OUTPUT_BYTES = 16 * 1024;
 const ID_CHARS = 512;
 const TEXT_FIELDS = ["excerpt", "text", "context", "occurred_start", "occurred_end", "mentioned_at", "created_at", "updated_at", "source", "title", "filename", "name", "type", "description", "timestamp"];
@@ -84,83 +84,41 @@ export function registerEvidence(pi: ExtensionAPI): void {
                 if (query.truncated) { output.query_truncated = true; output.truncated = true; }
                 return result(output, ctx.sessionManager);
             } catch (error) {
-                const category = invocationSignal?.aborted ? "cancelled" : deadline?.aborted ? "deadline" : error instanceof EvidenceError ? error.category : "network";
-                return result({ action, status: error instanceof EvidenceError && error.unavailable ? "unavailable" : "error", category, truncated: false, items: [] }, ctx.sessionManager);
+                const transport = transportCategory(error);
+                const evidenceError = error instanceof EvidenceError ? error : undefined;
+                const category = invocationSignal?.aborted ? "cancelled" : deadline?.aborted ? "deadline" : evidenceError?.category ?? transport ?? "network";
+                const status = evidenceError?.unavailable || transport === "missing" ? "unavailable" : "error";
+                return result({ action, status, category, truncated: false, items: [] }, ctx.sessionManager);
             }
         },
     });
 }
 
 function currentScope(pi: ExtensionAPI, cwd: string): Scope {
-    const get = (id: string): unknown => {
-        const handle = lookup(id);
-        if (!handle) throw new EvidenceError("configuration", true);
-        return handle.get(pi.pi.settings);
-    };
-    if (get("memory.backend") !== "hindsight") throw new EvidenceError("backend", true);
-    const apiUrl = get("hindsight.apiUrl");
-    const token = get("hindsight.apiToken");
-    const bankId = get("hindsight.bankId");
-    const prefix = get("hindsight.bankIdPrefix");
-    const scoping = get("hindsight.scoping");
-    const budget = get("hindsight.recallBudget");
-    const types = get("hindsight.recallTypes");
-    if (typeof apiUrl !== "string" || (token !== undefined && typeof token !== "string") || (bankId !== undefined && typeof bankId !== "string") || (prefix !== undefined && typeof prefix !== "string") || !["global", "per-project", "per-project-tagged"].includes(String(scoping)) || !["low", "mid", "high"].includes(String(budget)) || !strings(types) || types.some(type => !["world", "experience", "observation"].includes(type))) throw new EvidenceError("configuration", true);
+    const settings = pi.pi.settings;
+    const backend = lookup("memory.backend");
+    if (!backend) throw new EvidenceError("configuration", true);
+    if (backend.get(settings) !== "hindsight") throw new EvidenceError("backend", true);
+    let config: HindsightConfig;
+    try { config = loadHindsightConfig(settings); } catch { throw new EvidenceError("configuration", true); }
+    const { hindsightApiUrl: apiUrl, hindsightApiToken: token, bankId, bankIdPrefix, scoping, recallBudget: budget, recallTypes: types } = config;
+    if (typeof apiUrl !== "string" || (token != null && typeof token !== "string") ||
+        (bankId != null && typeof bankId !== "string") || (bankIdPrefix != null && typeof bankIdPrefix !== "string") ||
+        !["global", "per-project", "per-project-tagged"].includes(scoping) || !["low", "mid", "high"].includes(budget) ||
+        !strings(types) || types.some(type => !["world", "experience", "observation"].includes(type))) throw new EvidenceError("configuration", true);
     let url: URL;
     try { url = new URL(apiUrl); } catch { throw new EvidenceError("configuration", true); }
-    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new EvidenceError("configuration", true);
-    const base = bankId?.trim() || "omp";
-    const bankPrefix = prefix?.trim();
-    let bank = bankPrefix ? bankPrefix + "-" + base : base;
-    const project = path.basename(vcs.repo(cwd)?.primaryRoot() ?? cwd).toLowerCase() || "unknown";
-    if (scoping === "per-project") bank += "-" + project;
+    if (!isHindsightHttpUrl(url)) throw new EvidenceError("configuration", true);
+    const { bankId: bank, recallTags } = computeBankScope(config, cwd);
     validId(bank, "configuration");
+    const tag = recallTags?.[0];
+    if (scoping === "per-project-tagged" && !tag) throw new EvidenceError("configuration", true);
     return {
-        apiUrl: url.href.replace(/\/$/, ""), token, bank,
-        tag: scoping === "per-project-tagged" ? "project:" + project : undefined,
-        budget: String(budget), types,
-        maxTokens: positive(get("hindsight.recallMaxTokens")), queryChars: positive(get("hindsight.recallMaxQueryChars")),
-        timeout: positive(get("hindsight.recallTimeoutMs")),
+        apiUrl: url.href.replace(/\/$/, ""), token: token ?? undefined, bank, tag,
+        budget, types,
+        maxTokens: positive(config.recallMaxTokens), queryChars: positive(config.recallMaxQueryChars),
+        timeout: positive(config.recallTimeoutMs),
     };
-}
-
-export async function request(scope: Pick<Scope, "apiUrl" | "token" | "bank">, suffix: string, signal: AbortSignal, body?: RecordValue, method?: string): Promise<RecordValue> {
-    return requestJson(scope.apiUrl + "/v1/default/banks/" + encodeURIComponent(scope.bank) + suffix, scope.token, signal, body, method);
-}
-
-export async function requestJson(url: string, token: string | undefined, signal: AbortSignal, body?: RecordValue, method = body ? "POST" : "GET"): Promise<RecordValue> {
-    const response = await fetch(url, {
-        method, redirect: "error", signal,
-        headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...(token ? { Authorization: "Bearer " + token } : {}) },
-        ...(body ? { body: JSON.stringify(body) } : {}),
-    });
-    if (!response.ok) {
-        // Cleanup cannot replace the classified HTTP failure.
-        await response.body?.cancel().catch(() => undefined);
-        if (response.status === 404) throw new EvidenceError("missing", true);
-        throw new EvidenceError(response.status === 401 || response.status === 403 ? "authentication" : "http");
-    }
-    const reader = response.body?.getReader();
-    if (!reader) throw new EvidenceError("schema");
-    const chunks: Uint8Array[] = [];
-    let bytes = 0;
-    try {
-        while (true) {
-            const chunk = await reader.read();
-            if (chunk.done) break;
-            bytes += chunk.value.byteLength;
-            if (bytes > RESPONSE_BYTES) throw new EvidenceError("too_large");
-            chunks.push(chunk.value);
-        }
-    } finally {
-        // Cleanup cannot replace a response-size, abort or stream failure.
-        try { await reader.cancel().catch(() => undefined); } finally { reader.releaseLock(); }
-    }
-    const buffer = new Uint8Array(bytes);
-    let offset = 0;
-    for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.byteLength; }
-    try { return record(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer))); }
-    catch { throw new EvidenceError("schema"); }
 }
 
 function sourceSearch(body: RecordValue, scope: Scope): Envelope {
@@ -171,12 +129,12 @@ function sourceSearch(body: RecordValue, scope: Scope): Envelope {
     for (const [id, value] of Object.entries(supports)) {
         const support = validFact(value);
         if (support.id !== id) throw new EvidenceError("schema");
-        if (allowed(support, scope)) allowedSupports.set(id, support); else omitted = true;
+        if (matchesEvidenceScope(support, scope)) allowedSupports.set(id, support); else omitted = true;
     }
     const candidates: RecordValue[] = [];
     for (const value of body.results) {
         const fact = validFact(value);
-        if (allowed(fact, scope)) candidates.push(fact); else omitted = true;
+        if (matchesEvidenceScope(fact, scope)) candidates.push(fact); else omitted = true;
     }
     const output: Envelope = { action: "source_search", status: "empty", truncated: body.source_facts_truncated, items: [] };
     const seen = new Set<string>();
@@ -211,7 +169,7 @@ function sourceRead(document: RecordValue, scope: Scope, id: string): Envelope {
     const currentId = validId(document.id);
     const currentBank = validId(document.bank_id);
     if (!strings(document.tags)) throw new EvidenceError("scope_schema");
-    if (currentId !== id || currentBank !== scope.bank || !allowed(document, scope)) throw new EvidenceError("scope", true);
+    if (currentId !== id || currentBank !== scope.bank || !matchesEvidenceScope(document, scope)) throw new EvidenceError("scope", true);
     if (typeof document.original_text !== "string") throw new EvidenceError("schema");
     const output: Envelope = { action: "source_read", status: "ok", truncated: false, items: [] };
     const item: EvidenceItem = { kind: "document", id, text: document.original_text, text_origin: "retained_original_text", provenance: provenance(document.document_metadata) };
@@ -227,7 +185,7 @@ function sourceRead(document: RecordValue, scope: Scope, id: string): Envelope {
 
 function pageRead(page: RecordValue, scope: Scope, id: string, field: "text" | "excerpt" = "text"): Envelope {
     if (!strings(page.tags)) throw new EvidenceError("scope_schema");
-    if (validId(page.id) !== id || !allowed(page, scope)) throw new EvidenceError("scope", true);
+    if (validId(page.id) !== id || !matchesEvidenceScope(page, scope)) throw new EvidenceError("scope", true);
     if (typeof page.body !== "string" || typeof page.name !== "string") throw new EvidenceError("schema");
     const output: Envelope = { action: "page_read", status: "ok", truncated: false, items: [] };
     const item: EvidenceItem = { kind: "knowledge_page", id, [field]: page.body, synthesis: true, provenance: "unavailable" };
@@ -259,7 +217,7 @@ async function pageSearch(scope: Scope, query: string, signal: AbortSignal): Pro
     const reads = [...ids].map(async id => {
         try { return pageRead(await request(scope, "/knowledge-base/pages/" + encodeURIComponent(id), readSignal), scope, id, "excerpt"); }
         catch (error) {
-            if (error instanceof EvidenceError && error.unavailable && ["missing", "scope"].includes(error.category)) return undefined;
+            if (transportCategory(error) === "missing" || (error instanceof EvidenceError && error.category === "scope")) return undefined;
             throw error;
         }
     });
@@ -282,7 +240,7 @@ function validFact(value: unknown): RecordValue {
     return fact;
 }
 
-function allowed(value: RecordValue, scope: Scope): boolean {
+function matchesEvidenceScope(value: RecordValue, scope: Scope): boolean {
     if (!strings(value.tags)) throw new EvidenceError("scope_schema");
     if (value.bank_id !== undefined && value.bank_id !== scope.bank) return false;
     if (!scope.tag) return true;

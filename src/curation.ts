@@ -1,63 +1,19 @@
-import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { computeBankScope } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
-import { isHindsightConfigured, loadHindsightConfig, type HindsightScoping } from "@oh-my-pi/pi-coding-agent/hindsight/config";
+import { isHindsightConfigured, loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { CURATION_LIMIT, UUID, connectionKey, findAttempt, recordAttempt, type Attempt, type Decision } from "./curation-attempt";
-import { confirmArchive } from "./curation-review";
-import { exactRetainStrategy, observeReplacement, submitReplacement, unusedReplacementDocument, type CurationRequest, type ExactReplacement } from "./curation-retain";
-import { request, requestJson } from "./evidence";
+import { changeReason, recoverAttempt, reviewAttempt, type Decision } from "./curation-attempt";
+import { CURATION_LIMIT, UUID, duplicateOf, investigate, object, safePathId, strings,
+    type Candidate, type CuratableFact, type CurationEvidence, type CurationTarget, type JsonObject } from "./curation-facts";
+import { isHindsightHttpUrl } from "./hindsight-http";
 
 const TOOL = "hindsight_curate";
 const PASS = "skill-observer";
-const PATH_LIMIT = 512;
-const PROVENANCE_LIMIT = 256;
-const PROVENANCE_KEYS = ["source", "session_id", "author", "project", "cwd", "project_path", "repo_root", "repository"] as const;
-type JsonObject = Record<string, unknown>;
-type FactType = "world" | "experience";
-type Provenance = Partial<Record<typeof PROVENANCE_KEYS[number], string>>;
-type FactScope = { kind: "project"; project: string } | { kind: "global" };
-type CuratableFact = {
-    id: string;
-    type: FactType;
-    state: "valid";
-    scope: FactScope;
-    text: string;
-    context: string;
-    date: string;
-    occurred_start: string | null;
-    occurred_end: string | null;
-    mentioned_at: string | null;
-    edited_at: string | null;
-    entities: string[];
-    tags: string[];
-    metadata: Record<string, string>;
-    document_id: string | null;
-    chunk_id: string | null;
-};
-interface CurationTarget {
-    apiUrl: string;
-    token?: string;
-    bank: string;
-    scoping: HindsightScoping;
-    project: string;
-    projectTag: string;
-    cwd: string;
-    root: string;
-    budget: "low" | "mid" | "high";
-    maxTokens: number;
-    queryChars: number;
-    timeout: number;
-}
-interface Lead { ref: string; kind: "note" | "observation"; text: string }
-type SourceReference = { status: "unavailable" } | {
-    status: "scoped_reference"; document_id: string; provenance: Provenance; created_at: string | null; updated_at: string | null; excerpt?: string;
-};
-interface Candidate { fact: CuratableFact; source: SourceReference }
+interface Lead extends CurationEvidence { ref: string }
 interface Investigation { passId: string; lead: string; target: CurationTarget; candidates: Candidate[] }
 
 export function registerCuration(pi: ExtensionAPI): void {
@@ -135,9 +91,9 @@ export function registerCuration(pi: ExtensionAPI): void {
                     session.getSessionId() !== sessionId || (anchor && !session.getBranch().some(entry => entry.id === anchor))) throw new Error("pass_changed");
                 if (!isDeepStrictEqual(getTarget(pi, ctx.cwd), target) || session.getCwd() !== ctx.cwd || session.getSessionFile() !== sessionFile) throw new Error("scope_changed");
             };
-            const recorded = action === "reconcile" ? findAttempt(session, { id: attemptId as string })
-                : action !== "investigate" ? findAttempt(session, { callId }) : undefined;
-            if (recorded) return outcome(await reconcile(recorded, target, assertScope, invocationSignal));
+            const recovery = action === "investigate" ? undefined : recoverAttempt(session,
+                action === "reconcile" ? { id: attemptId as string } : { callId }, target, assertScope, invocationSignal);
+            if (recovery) return outcome(await recovery);
             if (action === "reconcile") return outcome({ status: "unavailable", reason: "attempt_not_in_branch" });
 
             const pass = activePass(ctx, generation);
@@ -172,8 +128,8 @@ export function registerCuration(pi: ExtensionAPI): void {
                     keeper = candidates.find(candidate => supersedes(lead, first, candidate.fact, correction));
                     decision = keeper ? "superseded" : "replace";
                     if (!keeper) {
-                        const previous = findAttempt(session, { replacementFor: first.id, connection: connectionKey(sessionId, target) });
-                        if (previous) return outcome({ ...await reconcile(previous, target, assertScope, invocationSignal),
+                        const previous = recoverAttempt(session, { replacementFor: first.id }, target, assertScope, invocationSignal);
+                        if (previous) return outcome({ ...await previous,
                             reason: "replacement_attempt_exists", note: "This call did not submit another retain. Reconcile the previous attempt or review an active keeper." });
                     }
                 } else decision = "obsolete";
@@ -186,7 +142,7 @@ export function registerCuration(pi: ExtensionAPI): void {
                 }
                 reviewing = true;
                 try {
-                    return outcome(await archiveFacts(pi, ctx, callId, target, lead, { originals, keeper, decision, correction }, assertCurrent, invocationSignal));
+                    return outcome(await reviewAttempt(pi, ctx, callId, target, lead, { originals, keeper, decision, correction }, assertCurrent, invocationSignal));
                 } catch (error) {
                     return outcome({ status: "error", reason: invocationSignal?.aborted ? "cancelled" : changeReason(error) });
                 } finally { reviewing = false; }
@@ -284,7 +240,7 @@ function getTarget(pi: ExtensionAPI, cwd: string): CurationTarget | undefined {
         const config = loadHindsightConfig(settings);
         if (!isHindsightConfigured(config)) return;
         const url = new URL(config.hindsightApiUrl);
-        if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) return;
+        if (!isHindsightHttpUrl(url)) return;
         if (!["global", "per-project", "per-project-tagged"].includes(config.scoping) || !["low", "mid", "high"].includes(config.recallBudget)
             || !positive(config.recallMaxTokens) || !positive(config.recallMaxQueryChars) || !positive(config.recallTimeoutMs)
             || (config.hindsightApiToken != null && typeof config.hindsightApiToken !== "string")) return;
@@ -299,25 +255,6 @@ function getTarget(pi: ExtensionAPI, cwd: string): CurationTarget | undefined {
             timeout: Math.min(config.recallTimeoutMs, 30_000),
         };
     } catch { return undefined; }
-}
-
-function changeReason(error: unknown): string {
-    return error instanceof Error && ["pass_changed", "scope_changed", "reviewed_fact_changed"].includes(error.message) ? error.message : transportCategory(error) ?? "network";
-}
-
-function duplicateOf(target: Candidate, keeper: Candidate): boolean {
-    const material = ({ id, document_id, chunk_id, edited_at, ...claim }: CuratableFact) => claim;
-    const evidence = provenance(target.fact.metadata);
-    if (!isDeepStrictEqual(material(target.fact), material(keeper.fact))) return false;
-    const original = target.source;
-    const retained = keeper.source;
-    const samePassage = target.fact.document_id === keeper.fact.document_id && target.fact.chunk_id === keeper.fact.chunk_id;
-    if (original.status === "scoped_reference" && retained.status === "scoped_reference") {
-        if (!isDeepStrictEqual(original.provenance, retained.provenance) ||
-            (!samePassage && original.excerpt !== retained.excerpt)) return false;
-        if (original.provenance.source || original.provenance.session_id) return true;
-    } else if (!samePassage) return false;
-    return Boolean(evidence.source || evidence.session_id || evidence.author);
 }
 
 function correctionText(lead: Lead, id: string): string | undefined {
@@ -340,368 +277,9 @@ function hasAttestation(text: string, attestation: string): boolean {
     return text.split(/(?<=[.!?])\s+|\r?\n/).some(sentence => sentence.trim().toLowerCase() === expected);
 }
 
-function exactReplacement(fact: CuratableFact, text: string) {
-    if (fact.type !== "world" || fact.occurred_start !== null || fact.occurred_end !== null || fact.entities.length ||
-        fact.mentioned_at !== (fact.date || null) || !text.trim() || text !== text.trim() || Buffer.byteLength(text) > 3_000 ||
-        /[\p{C}\p{Zl}\p{Zp}]|⟦hs-att:/u.test(text)) return;
-    return { type: "world", text, date: fact.date, context: fact.context, tags: fact.tags, metadata: fact.metadata };
-}
-
-function matchesReplacement(fact: CuratableFact, draft: ExactReplacement, documentId: string) {
-    return fact.document_id === documentId && fact.type === "world" && fact.text === draft.text && fact.context === draft.context &&
-        fact.date === draft.date && fact.mentioned_at === (draft.date || null) && fact.occurred_start === null && fact.occurred_end === null &&
-        fact.entities.length === 0 && isDeepStrictEqual(fact.tags, draft.tags) && isDeepStrictEqual(fact.metadata, draft.metadata);
-}
-
-
-function scopedRequest(target: CurationTarget, assertCurrent: () => void, signal?: AbortSignal): CurationRequest {
-    return (suffix, body, method) => {
-        assertCurrent();
-        const deadline = AbortSignal.timeout(target.timeout);
-        const requestSignal = signal ? AbortSignal.any([deadline, signal]) : deadline;
-        return suffix === "/openapi.json" ? requestJson(target.apiUrl + suffix, target.token, requestSignal) : request(target, suffix, requestSignal, body, method);
-    };
-}
-
-function archiveReason(attempt: Attempt, keeperId = attempt.keeperId): string {
-    const explanation = attempt.decision === "duplicate" ? `Duplicate of ${keeperId}; same claim, scope and material metadata.`
-        : attempt.decision === "obsolete" ? "The operator confirmed the fact is obsolete and has no remaining use, including as history."
-        : `Superseded by ${keeperId ?? `the verified fact from document ${attempt.replacement!.documentId}`}; first-hand correction preserving useful details.`;
-    return `${explanation} Curation attempt ${attempt.id}.`;
-}
-
-function archiveSummary(attempt: Attempt) {
-    return { bank: attempt.bank, scope: attempt.scope === "project" ? { kind: "project", project: attempt.project } : { kind: "global" },
-        attempt: attempt.id, keeper: attempt.keeperId, archived: [] as string[], observedArchived: [] as string[],
-        unchanged: [] as string[], observedActive: [] as string[], unknown: [] as string[], conflictingReason: [] as string[] };
-}
-
-async function readArchiveState(
-    read: CurationRequest, target: CurationTarget, attempt: Attempt, id: string, assertCurrent: () => void, expected?: CuratableFact, keeperId = attempt.keeperId,
-): Promise<"unchanged" | "observedActive" | "observedArchived" | "unknown" | "conflictingReason"> {
-    try {
-        const actual = await read("/memories/" + id);
-        assertCurrent();
-        const archived = actual.state === "invalidated" && typeof actual.invalidated_at === "string" && validDate(actual.invalidated_at);
-        const fact = parseFact(archived ? { ...actual, state: "valid", invalidation_reason: null, invalidated_at: null } : actual, target, id);
-        if (!fact || fact.scope.kind !== attempt.scope || !isDeepStrictEqual(fact.tags, attempt.tags) ||
-            (expected && !isDeepStrictEqual(fact, expected))) return "unknown";
-        if (!archived) return expected ? "unchanged" : "observedActive";
-        if (attempt.replacement && !keeperId) return "unknown";
-        return actual.invalidation_reason === archiveReason(attempt, keeperId) ? "observedArchived" : "conflictingReason";
-    } catch { return "unknown"; }
-}
-
-async function reconcile(attempt: Attempt, target: CurationTarget | undefined, assertCurrent: () => void, signal?: AbortSignal) {
-    const summary = archiveSummary(attempt);
-    if (!target || attempt.connection !== connectionKey(attempt.sessionId, target) || target.bank !== attempt.bank || target.project !== attempt.project ||
-        classifyScope(attempt.tags, target)?.kind !== attempt.scope) {
-        return { status: "unverified", reason: "scope_changed", ...summary, unknown: attempt.targetIds,
-            ...(attempt.replacement ? { replacement: { ...attempt.replacement, state: "unknown" } } : {}) };
-    }
-    const read = scopedRequest(target, assertCurrent, signal);
-    const replacement = attempt.replacement && await observeReplacement(read, attempt.replacement, attempt.tags, false);
-    let observedReplacementId: string | undefined;
-    if (replacement?.state === "observed") {
-        try {
-            const fact = parseFact(await read("/memories/" + replacement.factId), target, replacement.factId);
-            assertCurrent();
-            if (fact && fact.document_id === attempt.replacement?.documentId && fact.scope.kind === attempt.scope &&
-                isDeepStrictEqual(fact.tags, attempt.tags) && fact.type === "world") observedReplacementId = fact.id;
-        } catch { /* Report only what was observed. */ }
-    }
-    const states = await Promise.all(attempt.targetIds.map(id => readArchiveState(read, target, attempt, id, assertCurrent, undefined, summary.keeper ?? observedReplacementId)));
-    for (const [index, state] of states.entries()) {
-        if (state === "conflictingReason") summary.unknown.push(attempt.targetIds[index]!);
-        summary[state].push(attempt.targetIds[index]!);
-    }
-    return { status: summary.unknown.length || replacement ? "unverified" : "observed", ...summary,
-        ...(replacement ? { replacement: replacement.state === "observed" ? { ...replacement, state: "observed_not_verified" } : replacement } : {}),
-        note: "Readback only. An active fact may have changed since review. A replacement observed after restart has not been compared with the approved text." };
-}
-
-async function archiveFacts(
-    pi: ExtensionAPI, ctx: ExtensionContext, callId: string, target: CurationTarget, lead: Lead,
-    plan: { originals: Candidate[]; keeper?: Candidate; decision: Decision; correction?: string }, assertCurrent: () => void, signal?: AbortSignal,
-): Promise<JsonObject> {
-    const { originals, decision, correction } = plan;
-    let { keeper } = plan;
-    const first = originals[0]!.fact;
-    const session = ctx.sessionManager;
-    const sessionId = session.getSessionId();
-    const read = scopedRequest(target, assertCurrent, signal);
-    let draft: ExactReplacement | undefined;
-    if (decision === "replace") {
-        const fields = exactReplacement(first, correction!);
-        if (!fields) return { status: "unavailable", reason: "replacement_does_not_fit_exact_retain",
-            note: "Find an active same-scope keeper preserving the fact's type and metadata. The original was not changed." };
-        const capability = await exactRetainStrategy(read, target.bank, fields.text);
-        assertCurrent();
-        if (!capability.strategy) return { status: "unavailable", reason: capability.reason,
-            note: "Could not verify that Hindsight can store the exact replacement. Find an active keeper before archiving the original." };
-        draft = { ...fields, strategy: capability.strategy };
-    }
-    const attempt: Attempt = {
-        id: randomUUID(), callId, sessionId, connection: connectionKey(sessionId, target),
-        bank: target.bank, scope: first.scope.kind, project: target.project, tags: first.tags,
-        targetIds: originals.map(item => item.fact.id), decision, ...(keeper ? { keeperId: keeper.fact.id } : {}),
-        ...(draft ? { replacement: { documentId: `curation-${randomUUID()}`, operationId: randomUUID() } } : {}),
-    };
-    const action = decision === "duplicate" ? `archive ${originals.length} duplicate fact(s)`
-        : decision === "obsolete" ? "archive one obsolete fact without a replacement"
-        : decision === "superseded" ? "archive one fact superseded by an active keeper" : "retain an exact replacement, then archive one fact";
-    const review = [
-        `Action: ${action}. Bank: ${target.bank}. Scope: ${first.scope.kind}. Project: ${target.project}.`,
-        `Audience tags: ${JSON.stringify(first.tags)}. Archive removes these facts from recall, including historical recall.`,
-        `Evidence (${lead.kind}): ${lead.text}`,
-        `Reason: ${archiveReason(attempt)}`,
-        ...originals.map(item => `Archive ${item.fact.id}:\n${JSON.stringify(item, null, 2)}`),
-        keeper ? `Keep active ${keeper.fact.id}:\n${JSON.stringify(keeper, null, 2)}`
-            : draft ? `Exact replacement:\n${JSON.stringify(draft, null, 2)}\nDocument: ${attempt.replacement!.documentId}\nThe new fact can remain active if archive fails or is refused.`
-            : "No replacement. The operator attested that this fact has no remaining use.",
-    ].join("\n\n");
-    const approval = await confirmArchive(ctx.ui, review, signal);
-    if (approval !== "approved") return { status: "unavailable", reason: approval ?? "declined" };
-    const recheck = async (candidates: Candidate[]) => {
-        const snapshots = await Promise.all(candidates.map(async previous => {
-            const fact = parseFact(await read("/memories/" + previous.fact.id), target, previous.fact.id);
-            if (!fact || !isDeepStrictEqual(fact, previous.fact)) return false;
-            const source = await supportingSource(fact, target, {}, undefined, read);
-            const { excerpt, ...reviewed } = previous.source.status === "scoped_reference" ? previous.source : { ...previous.source, excerpt: undefined };
-            return isDeepStrictEqual(source, reviewed);
-        }));
-        assertCurrent();
-        return snapshots.every(Boolean);
-    };
-    if (draft && attempt.replacement) {
-        const capability = await exactRetainStrategy(read, target.bank, draft.text);
-        if (capability.strategy !== draft.strategy || !await unusedReplacementDocument(read, attempt.replacement)) {
-            return { status: "unavailable", reason: "retain_capability_or_document_changed" };
-        }
-    }
-    if (!await recheck(keeper ? [keeper, ...originals] : originals)) return { status: "unavailable", reason: "reviewed_fact_changed" };
-    if (!await recordAttempt(pi, session, attempt)) return { status: "error", reason: "attempt_not_saved" };
-
-    const summary = archiveSummary(attempt);
-    let replacement: JsonObject | undefined;
-    if (draft && attempt.replacement) {
-        const ids = attempt.replacement;
-        const acknowledged = await submitReplacement(read, target.bank, ids, draft);
-        const observed = await observeReplacement(read, ids, attempt.tags, true);
-        replacement = { ...observed, acknowledged };
-        if (observed.state === "observed") {
-            try {
-                const fact = parseFact(await read("/memories/" + observed.factId), target, observed.factId);
-                assertCurrent();
-                if (fact && matchesReplacement(fact, draft, ids.documentId)) {
-                    const source = await supportingSource(fact, target, {}, undefined, read);
-                    assertCurrent();
-                    if (source.status !== "foreign_project") keeper = { fact, source };
-                }
-            } catch { /* The replacement must be positively verified before archive. */ }
-            replacement.state = keeper ? "verified" : "mismatch";
-        }
-        if (!keeper) {
-            const original = originals[0]!.fact;
-            const state = await readArchiveState(read, target, attempt, original.id, assertCurrent, original);
-            summary[state].push(original.id);
-            return { status: "unverified", reason: "replacement_not_verified", ...summary, replacement };
-        }
-        summary.keeper = keeper.fact.id;
-    }
-    const reason = archiveReason(attempt, summary.keeper);
-    let stopped = false;
-    let failure: string | undefined;
-    for (const item of originals) {
-        const { id } = item.fact;
-        let acknowledged = false;
-        if (!stopped) {
-            try {
-                if (!await recheck(keeper ? [keeper, item] : [item])) throw new Error("reviewed_fact_changed");
-                await read("/memories/" + id, { state: "invalidated", reason }, "PATCH");
-                acknowledged = true;
-            } catch (error) { failure = changeReason(error); }
-        }
-        const state = await readArchiveState(read, target, attempt, id, assertCurrent, item.fact, summary.keeper);
-        if (acknowledged && state === "observedArchived") summary.archived.push(id);
-        else {
-            stopped = true;
-            if (state === "conflictingReason") summary.unknown.push(id);
-            summary[state].push(id);
-        }
-    }
-    const status = !stopped ? "ok" : summary.archived.length ? "partial"
-        : replacement && summary.keeper && summary.unchanged.length === originals.length ? "retained_only" : "unverified";
-    return { status, ...(failure ? { reason: failure } : {}), ...summary, ...(replacement ? { replacement } : {}) };
-}
-
-async function investigate(target: CurationTarget, lead: Lead, signal: AbortSignal, assertCurrent: () => void) {
-    const query = clip(lead.text, target.queryChars);
-    const read = (suffix: string, body?: JsonObject) => {
-        assertCurrent();
-        return request(target, suffix, signal, body);
-    };
-    const recall = await read("/memories/recall", {
-        query, budget: target.budget, max_tokens: target.maxTokens, types: ["world", "experience"],
-        ...(target.scoping === "per-project-tagged" ? { tags: [target.projectTag], tags_match: "any" } : {}),
-        rerank: { prune: false, dedup: false }, include: { entities: null, chunks: { max_tokens: 512 } },
-    });
-    if (!Array.isArray(recall.results)) return { response: { status: "unavailable", reason: "unsupported_recall_envelope" }, candidates: [] };
-    const chunks = object(recall.chunks);
-    const hits = new Map<string, JsonObject>();
-    if (lead.kind === "note") {
-        for (const match of lead.text.matchAll(/\bHindsight fact ([a-f0-9-]{36})\b(?: is superseded by ([a-f0-9-]{36})\b and the keeper preserves its still-useful details\.)?/gi)) {
-            for (const value of [match[1], match[2]]) {
-                if (value && UUID.test(value) && hits.size < CURATION_LIMIT) hits.set(value.toLowerCase(), {});
-            }
-            if (hits.size === CURATION_LIMIT) break;
-        }
-    }
-    let omitted = false;
-    let truncated = query.length < lead.text.length;
-    for (const value of recall.results) {
-        const hit = object(value);
-        if (!hit || typeof hit.id !== "string" || !UUID.test(hit.id) || !isFactType(hit.type) || typeof hit.text !== "string"
-            || (hit.bank_id !== undefined && hit.bank_id !== target.bank)) { omitted = true; continue; }
-        if (hits.has(hit.id)) {
-            if (!hits.get(hit.id)!.type) hits.set(hit.id, hit);
-            continue;
-        }
-        if (hits.size === CURATION_LIMIT) { truncated = true; break; }
-        hits.set(hit.id, hit);
-    }
-    const reads = await Promise.all([...hits].map(async ([id, hit]) => {
-        let row: JsonObject;
-        try { row = await read("/memories/" + id); }
-        catch (error) { if (transportCategory(error) === "missing") return; throw error; }
-        const fact = parseFact(row, target, id);
-        if (!fact || (hit.type !== undefined && fact.type !== hit.type)) return;
-        const source = await supportingSource(fact, target, hit, fact.chunk_id ? chunks?.[fact.chunk_id] : undefined, read);
-        if (source.status === "foreign_project") return;
-        const { metadata, document_id: _document, chunk_id: _chunk, ...shown } = fact;
-        const candidate = { ...shown, provenance: provenance(metadata), source };
-        if (Buffer.byteLength(JSON.stringify(candidate)) > 3000) return;
-        return { fact, source, candidate };
-    }));
-    assertCurrent();
-    const found = reads.filter(fact => fact !== undefined);
-    return {
-        response: {
-            status: found.length ? "ok" : "empty", bank: target.bank, project: target.project, scoping: target.scoping,
-            truncated, omitted_candidates: omitted || found.length !== reads.length, facts: found.map(item => item.candidate),
-            limits: "A recall match does not prove that a fact is correct today or that two facts are duplicates. This search may miss relevant facts. Different repositories can share the same Hindsight project label.",
-        },
-        candidates: found.map(({ fact, source }) => ({ fact, source })),
-    };
-}
-
-function parseFact(row: JsonObject, target: CurationTarget, id: string): CuratableFact | undefined {
-    const { type, state, text, context, date, occurred_start, occurred_end, mentioned_at, edited_at, entities, tags, document_id, chunk_id } = row;
-    const metadata = object(row.metadata);
-    if (row.id !== id || (row.bank_id !== undefined && row.bank_id !== target.bank) || !isFactType(type) || state !== "valid"
-        || row.invalidated_at !== null || row.invalidation_reason !== null || row.observation_scopes !== null
-        || typeof text !== "string" || !text.trim() || typeof context !== "string" || typeof date !== "string" || (date !== "" && !validDate(date))
-        || !validDate(occurred_start) || !validDate(occurred_end) || !validDate(mentioned_at) || !validDate(edited_at)
-        || !strings(entities) || !strings(tags) || !metadata || !stringMetadata(metadata)
-        || (document_id !== null && !safePathId(document_id)) || (chunk_id !== null && !safePathId(chunk_id))
-        || (chunk_id !== null && document_id === null) || foreignProvenance(metadata, target)) return;
-    const scope = classifyScope(tags, target);
-    if (!scope) return;
-    return { id, type, state, scope, text, context, date, occurred_start, occurred_end, mentioned_at, edited_at, entities, tags, metadata, document_id, chunk_id };
-}
-
-function classifyScope(tags: string[], target: CurationTarget): FactScope | undefined {
-    if (new Set(tags).size !== tags.length || tags.some(tag => !safePathId(tag) || tag !== tag.trim())) return;
-    const projectTags = tags.filter(tag => /^project:/i.test(tag));
-    const ownTag = projectTags.length === 1 && projectTags[0] === target.projectTag;
-    if (target.scoping === "global") return projectTags.length ? undefined : { kind: "global" };
-    if (ownTag || (target.scoping === "per-project" && projectTags.length === 0)) return { kind: "project", project: target.project };
-    if (target.scoping === "per-project-tagged" && tags.length === 0) return { kind: "global" };
-}
-
-async function supportingSource(fact: CuratableFact, target: CurationTarget, hit: JsonObject, chunkData: unknown, read: (suffix: string) => Promise<JsonObject>) {
-    if (!fact.document_id) return { status: "unavailable" } as const;
-    // The list endpoint has metadata only; GET /documents/{id} contains the whole source.
-    const filter = new URLSearchParams({ q: fact.document_id, limit: "5" });
-    let response: JsonObject;
-    try { response = await read("/documents?" + filter); }
-    catch (error) {
-        if (transportCategory(error)) return { status: "unavailable" } as const;
-        throw error;
-    }
-    if (!Array.isArray(response.items) || response.items.length > 5 || response.offset !== 0 || response.limit !== 5
-        || typeof response.total !== "number" || !Number.isSafeInteger(response.total) || response.total < response.items.length) return { status: "unavailable" } as const;
-    const matches = response.items.map(object).filter(item => item?.id === fact.document_id);
-    const doc = matches.length === 1 && matches[0];
-    if (!doc || doc.bank_id !== target.bank || !strings(doc.tags) || !validDate(doc.created_at) || !validDate(doc.updated_at)
-        || typeof doc.text_length !== "number" || !Number.isSafeInteger(doc.text_length) || doc.text_length < 0) return { status: "unavailable" } as const;
-    const metadata = doc.document_metadata === null ? {} : object(doc.document_metadata);
-    if (!metadata) return { status: "unavailable" } as const;
-    if (foreignProvenance(metadata, target) || doc.tags.some(tag => /^project:/i.test(tag) && tag !== target.projectTag)) return { status: "foreign_project" } as const;
-    if (PROVENANCE_KEYS.some(key => {
-        const value = metadata[key];
-        return typeof value === "string" && clip(value, PROVENANCE_LIMIT) !== value;
-    })) return { status: "unavailable" } as const;
-    const scope = classifyScope(doc.tags, target);
-    if (scope?.kind !== fact.scope.kind || doc.tags.length !== fact.tags.length || !doc.tags.every(tag => fact.tags.includes(tag))) return { status: "unavailable" } as const;
-    const chunk = object(chunkData);
-    const matchingChunk = chunk && fact.chunk_id && hit.chunk_id === fact.chunk_id && hit.document_id === fact.document_id && chunk.id === fact.chunk_id
-        && typeof chunk.chunk_index === "number" && Number.isSafeInteger(chunk.chunk_index) && chunk.chunk_index >= 0
-        && typeof chunk.truncated === "boolean" && typeof chunk.text === "string" ? chunk.text : undefined;
-    const excerpt = matchingChunk ? clip(matchingChunk, Math.min(480, Math.floor(doc.text_length / 2))) : "";
-    return {
-        status: "scoped_reference", document_id: fact.document_id, provenance: provenance(metadata),
-        created_at: doc.created_at, updated_at: doc.updated_at, ...(excerpt ? { excerpt } : {}),
-    } as const;
-}
-
-function foreignProvenance(metadata: JsonObject, target: CurationTarget): boolean {
-    const { cwd, repo_root, project_path, project, repository } = metadata;
-    for (const location of [cwd, repo_root, project_path]) {
-        if (location === undefined) continue;
-        if (typeof location !== "string" || !path.isAbsolute(location)) return true;
-        if (![target.root, target.cwd].some(owned => path.normalize(owned) === path.normalize(location))) return true;
-    }
-    if (project !== undefined && (typeof project !== "string" || project.toLowerCase() !== target.project)) return true;
-    // A basename alone cannot authenticate an external repository identity.
-    return repository !== undefined && (typeof repository !== "string" || !path.isAbsolute(repository) || path.normalize(repository) !== path.normalize(target.root));
-}
-
-function provenance(metadata: JsonObject): Provenance {
-    const fields: Provenance = {};
-    for (const key of PROVENANCE_KEYS) {
-        const value = metadata[key];
-        if (typeof value === "string" && value.trim()) fields[key] = clip(value, PROVENANCE_LIMIT);
-    }
-    return fields;
-}
-
 function outcome(body: JsonObject) {
     const { status } = body;
     return { content: [{ type: "text" as const, text: JSON.stringify(body) }], details: { status }, ...(status === "error" || status === "unavailable" ? { isError: true } : {}) };
 }
 
-function object(value: unknown): JsonObject | undefined {
-    return value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
-}
-function isFactType(value: unknown): value is FactType { return value === "world" || value === "experience"; }
-function safePathId(value: unknown): value is string {
-    return typeof value === "string" && value.length > 0 && value.length <= PATH_LIMIT && value !== "." && value !== ".." && !/[\u0000-\u001f\u007f]/.test(value);
-}
-function strings(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === "string"); }
-function stringMetadata(value: JsonObject): value is Record<string, string> { return Object.values(value).every(item => typeof item === "string"); }
 function positive(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value > 0; }
-function validDate(value: unknown): value is string | null {
-    return value === null || (typeof value === "string" && /^\d{4}-\d\d-\d\d(?:T\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?)?$/.test(value) && Number.isFinite(Date.parse(value)));
-}
-function clip(value: string, count: number): string {
-    let end = 0;
-    for (const character of value) {
-        if (count-- === 0) break;
-        end += character.length;
-    }
-    return value.slice(0, end);
-}
-function transportCategory(error: unknown): string | undefined {
-    return error instanceof Error && "category" in error && typeof error.category === "string" ? error.category : undefined;
-}

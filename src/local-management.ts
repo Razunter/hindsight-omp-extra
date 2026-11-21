@@ -2,7 +2,8 @@ import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { BASE_LABEL, CONFIG_LABEL, CUDA_RECIPE, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, candidateModelDevices, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, serviceModelDevices, type ContainerInfo, type ImageInfo } from "./docker";
 import { initialState, liveOperation, readState, releaseLease, takeLease, updateState, type ApprovedRuntime, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
-import { mentalModelStatus } from "./mental-model-monitor";
+import { readMentalModelSnapshot } from "./mental-model-status";
+import { formatMentalModelStatus } from "./mental-model-status-view";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 import { latestStableRelease, STABLE_IMAGE } from "./stable-release";
 
@@ -304,7 +305,7 @@ async function readinessProblem(settings: HindsightSettings): Promise<string | u
 async function openMenu(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
     const { ui } = ctx;
     const choice = await ui.select("Hindsight local management", Object.values(MENU));
-    if (choice === MENU.status) showStatus(ui, mentalModelStatus(pi, ctx, "details")?.message);
+    if (choice === MENU.status) showStatus(ui, formatMentalModelStatus(readMentalModelSnapshot(pi, ctx), "details")?.message);
     if (choice === MENU.mode) {
         const mode = await ui.select("Local Hindsight management mode", ["Off", "CPU", "GPU"]);
         if (mode === "Off") {

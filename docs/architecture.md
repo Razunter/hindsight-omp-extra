@@ -10,7 +10,7 @@ hindsight-omp-extra adds evidence access and optional local deployment to OMP's 
 | --- | --- |
 | OMP | Native `retain`, `recall`, `reflect`, and `learn` tools; memory backend selection; transcript capture; project scoping; mental model seeding; shared Auto-Learn; session artifact storage |
 | Hindsight | Retained documents, extracted facts, observations, synthesized knowledge pages, mental model refresh and retries, and memory processing with its configured AI provider |
-| This extension | Source/page evidence search and read, recall/lesson guidance, read-only mental model warnings, the user-invoked ingestion skill, and opt-in local Hindsight management with named provider selection |
+| This extension | Source/page evidence, approved memory curation, recall/lesson guidance, mental model status, the user-invoked ingestion skill, and opt-in local Hindsight management |
 
 A **supporting source** is retained material or underlying facts supporting a recalled claim. It can be unavailable even when the claim remains recallable. A **knowledge page** is synthesized knowledge, not original-source evidence.
 
@@ -30,6 +30,8 @@ Native file-based Codex authentication, where used, has its own independently au
 
 Local Hindsight management is the extension's optional ownership of a local Hindsight container's lifecycle. Evidence, recall guidance and ingestion register independently of it and work against whatever server OMP's native connection points to. Management is Off by default, including for installations that predate it; Off does no Docker or provider-file work.
 
+OMP's OS-owned lock serializes state updates on the canonical extension path and is released if the process dies. The separate operation lease spans Docker work without holding the state mutex. See [lock upgrade and rollback](configuration.md#upgrade-the-installation-state-lock).
+
 One installation-wide state file holds the requested mode, the last approved runtime, the last update check and the images this installation downloaded or built, separate from provider and credential files. Approval binds a concrete cached image ID or registry `repository@digest` download and the configuration identity. Downloads and cutover run in the background under an installation-wide lease while the current service keeps running, and are revalidated when the lease is taken and again just before the shared service is touched, so another process, a runtime it applied, Off, a provider edit or a moved tag cannot widen an approval. A runtime becomes active only after API and database readiness; only then are superseded images removed: the previous image and recorded owned images outside the active release, each revalidated just before deletion and kept while anything else tags or uses it. Update checks compare registry manifest digests of the configured upstream reference with those of the approved image, record the exact available target and authorize nothing. See the [lifecycle reference](configuration.md#local-management-lifecycle).
 
 GPU mode is an explicit choice, never a default or a fallback target. It reuses the same approval, lease, revalidation, cutover and readiness path as CPU; only preparation differs. The extension builds an owned CUDA derivative from the approved upstream digest with a context that holds only a generated Dockerfile, records its ownership and base, and reuses it until an approved update names a new base. Update checks keep comparing the configured upstream reference. A GPU runtime counts as active only when, besides API and database readiness, each configured local model runs one inference on CUDA, probed in a throwaway container before cutover and in the running container for readiness; a failed GPU request leaves the previous runtime running and stays visible as requested and failed.
@@ -38,17 +40,23 @@ GPU mode is an explicit choice, never a default or a fallback target. It reuses 
 
 The `hindsight_evidence` tool adds supporting-source and knowledge-page search/read without replacing native memory tools, transcript retention, or Auto-Learn. It does not add a durable outbox, replay machinery, or stronger delivery guarantees for native writes.
 
+Evidence uses OMP's active default Hindsight bank and project tag on each call. Evidence, curation, and the monitor use the same HTTP helper to limit response size. Each keeps its own rules for disclosure, mutation, or seed selection.
+
 Routine previews are bounded. When local presentation limits omit permitted content, the extension stores the complete validated, allowlisted result in an OMP session artifact. The agent can read that same snapshot locally without another Hindsight request. This uses native artifact storage rather than an extension-owned cache or cursor protocol.
 
 Scope checks happen before artifact creation. Excluded evidence and unverified knowledge pages never enter the snapshot. Backend omissions remain omissions.
 
 An artifact records fetch-time scope and content. Later retagging or deletion does not revoke it. A fresh evidence read rechecks current scope. Tags are retrieval filters, not server authorization.
 
+## Curation records the attempt before writing
+
+The observation pass adapter checks lead eligibility and keeps the investigation for the active pass. The curation attempt module asks for confirmation through OMP and saves the attempt before writing to Hindsight. It verifies any replacement against what the user approved and reads archived facts again to confirm their state. Reconciliation repeats no writes. It can observe a replacement after restart but cannot verify it against approved text that was not saved with the attempt record.
+
 ## Mental model warnings follow OMP scope
 
 The monitor uses OMP's bank and seed selection. It reads mental model metadata and checks for queued or running refreshes before it reports failures or staleness. It never writes to Hindsight, refreshes models, or manages the server.
 
-Each profile keeps one check timestamp per hashed API URL, bank ID, and seed ID under its agent directory. A check holds an OMP file lock for its API URL and bank until it finishes, so concurrent sessions neither repeat a seed's check nor split one bank's findings across two warnings. The lock is freed if the process dies. A failed read records nothing, so the next timer can retry. See [mental model warnings](recall.md#mental-model-warnings).
+Each profile stores one result per API URL, bank ID, and seed ID. The monitor holds an OMP lock for the whole bank check, so concurrent sessions cannot split one bank's findings across two warnings. A failed check marks the saved record as failed without replacing the last successful result. Startup and `/hindsight` **Status** both read the mental model status snapshot without contacting Hindsight. See [mental model warnings](recall.md#mental-model-warnings).
 
 ## Guidance does not own retrieval or capture
 

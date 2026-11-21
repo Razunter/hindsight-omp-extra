@@ -1,20 +1,29 @@
 import { afterAll, afterEach, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { BankScope } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
 
 interface TestItem extends Record<string, unknown> { id: string; excerpt: string; }
 interface TestEnvelope extends Record<string, unknown> { items: TestItem[]; status: string; }
 interface TestTool { execute(id: string, params: unknown, signal: AbortSignal | undefined, update: undefined, ctx: { cwd: string; sessionManager: { saveArtifact(content: string, toolType: string): Promise<string | undefined> } }): Promise<{ content: { text: string }[]; details: Record<string, unknown>; isError?: boolean }>; }
 
-const values: Record<string, unknown> = {
-    "memory.backend": "hindsight", "hindsight.apiUrl": "", "hindsight.apiToken": "synthetic-token",
-    "hindsight.bankId": "bank", "hindsight.bankIdPrefix": "", "hindsight.scoping": "per-project-tagged",
-    "hindsight.recallBudget": "mid", "hindsight.recallMaxTokens": 1024,
-    "hindsight.recallMaxQueryChars": 800, "hindsight.recallTypes": ["world", "experience"], "hindsight.recallTimeoutMs": 1000,
+const defaults = {
+    backend: "hindsight", hindsightApiUrl: "", hindsightApiToken: "synthetic-token",
+    bankId: "bank", bankIdPrefix: "", scoping: "per-project-tagged",
+    recallBudget: "mid", recallMaxTokens: 1024,
+    recallMaxQueryChars: 800, recallTypes: ["world", "experience"], recallTimeoutMs: 1000,
 };
-let primaryRoot: string | undefined = "/repo/Project";
+type Settings = typeof defaults;
+const settings = { ...defaults };
+const tagged = (bankId: string, tag: string): BankScope => ({ bankId, recallTags: [tag], recallTagsMatch: "any" });
+const defaultScope = (config: Settings, _cwd: string): BankScope => {
+    if (config.scoping === "per-project-tagged") return tagged(config.bankId, "project:project");
+    return { bankId: config.scoping === "per-project" ? "bank-project" : config.bankId };
+};
+let resolveScope = defaultScope;
 Bun.plugin({ name: "evidence-host-boundary", setup(build) {
-    build.module("@oh-my-pi/pi-coding-agent/config/registry", () => ({ exports: { lookup: (id: string) => ({ get: () => values[id] }) }, loader: "object" }));
-    build.module("@oh-my-pi/pi-natives/vcs", () => ({ exports: { repo: () => primaryRoot ? { primaryRoot: () => primaryRoot } : undefined }, loader: "object" }));
+    build.module("@oh-my-pi/pi-coding-agent/config/registry", () => ({ exports: { lookup: (id: string) => id === "memory.backend" ? { get: (live: Settings) => live.backend } : undefined }, loader: "object" }));
+    build.module("@oh-my-pi/pi-coding-agent/hindsight/config", () => ({ exports: { loadHindsightConfig: (live: Settings) => live }, loader: "object" }));
+    build.module("@oh-my-pi/pi-coding-agent/hindsight/bank", () => ({ exports: { computeBankScope: (config: Settings, cwd: string) => resolveScope(config, cwd) }, loader: "object" }));
 } });
 const { registerEvidence } = await import("../src/evidence");
 const proxyBypass = { NO_PROXY: process.env.NO_PROXY, no_proxy: process.env.no_proxy };
@@ -28,10 +37,8 @@ afterAll(() => {
 const servers: Bun.Server<undefined>[] = [];
 afterEach(() => {
     for (const server of servers.splice(0)) server.stop(true);
-    values["memory.backend"] = "hindsight"; values["hindsight.scoping"] = "per-project-tagged";
-    values["hindsight.bankId"] = "bank"; values["hindsight.bankIdPrefix"] = "";
-    values["hindsight.recallMaxQueryChars"] = 800; values["hindsight.recallTimeoutMs"] = 1000;
-    primaryRoot = "/repo/Project";
+    Object.assign(settings, defaults);
+    resolveScope = defaultScope;
 });
 function fixture(handler: (request: Request) => Response | Promise<Response>) {
     const requests: { url: string; method: string; body?: Record<string, unknown> }[] = [];
@@ -45,10 +52,10 @@ function fixture(handler: (request: Request) => Response | Promise<Response>) {
         requests.push({ url: request.url, method: request.method, body: request.method === "POST" ? await request.clone().json() : undefined });
         return handler(request);
     } });
-    servers.push(server); values["hindsight.apiUrl"] = server.url.href;
+    servers.push(server); settings.hindsightApiUrl = server.url.href;
     let tool: TestTool;
     // The owned host double implements only the registrar’s documented seams.
-    const host = { arktype: (_schema: unknown) => ({}), pi: { settings: {} }, registerTool(definition: TestTool) { tool = definition; } } as unknown as ExtensionAPI;
+    const host = { arktype: (_schema: unknown) => ({}), pi: { settings }, registerTool(definition: TestTool) { tool = definition; } } as unknown as ExtensionAPI;
     registerEvidence(host);
     return { requests, artifacts, sessionManager, async run(params: unknown, signal?: AbortSignal, cwd = "/repo/worktrees/other") {
         const result = await tool.execute("fixture", params, signal, undefined, { cwd, sessionManager });
@@ -117,25 +124,60 @@ test.each([
 });
 
 test("non-Hindsight configuration fails without HTTP", async () => {
-    const f = fixture(() => recall([])); values["memory.backend"] = "off";
+    const f = fixture(() => recall([])); settings.backend = "off";
     expect((await f.run({ action: "source_search", query: "x" })).status).toBe("unavailable");
     expect(f.requests).toEqual([]);
 });
 
-test("scope and query limits are re-resolved and primary repository identity wins over worktree cwd", async () => {
+test.each(["unsafe URL", "missing native tag"])("%s fails closed before HTTP", async invalid => {
+    const f = fixture(() => recall([]));
+    if (invalid === "unsafe URL") settings.hindsightApiUrl += "?unexpected=true";
+    else resolveScope = () => ({ bankId: "native-bank" });
+    expect(await f.run({ action: "source_search", query: "x" })).toMatchObject({ status: "unavailable", category: "configuration", items: [] });
+    expect(f.requests).toEqual([]);
+});
+
+test("evidence uses the native bank and project tag instead of re-deriving either", async () => {
+    resolveScope = () => tagged("native-bank", "project:native");
+    const f = fixture(() => recall([fact("native", ["project:native"]), fact("cwd", ["project:other"]), fact("global", [])]));
+    const result = await f.run({ action: "source_search", query: "x" });
+    expect(result.items.map(item => item.id)).toEqual(["native", "global"]);
+    expect(new URL(f.requests[0].url).pathname).toBe("/v1/default/banks/native-bank/memories/recall");
+    expect(f.requests[0].body).toMatchObject({ tags: ["project:native"], tags_match: "any" });
+});
+
+test("scope and query limits follow live settings across linked worktrees", async () => {
+    const worktree = "/repo/worktrees/other";
+    const linkedWorktree = "/repo/worktrees/linked";
+    const outside = "/outside/Folder";
+    const selections: Record<string, Record<string, BankScope>> = {
+        "per-project-tagged:": { [worktree]: tagged("bank", "project:project") },
+        "per-project: team ": {
+            [worktree]: { bankId: "team-bank-project" },
+            [linkedWorktree]: { bankId: "team-bank-project" },
+            [outside]: { bankId: "team-bank-folder" },
+        },
+        "global: team ": { [worktree]: { bankId: "team-bank" } },
+    };
+    resolveScope = (config, cwd) => {
+        const selected = selections[`${config.scoping}:${config.bankIdPrefix}`]?.[cwd];
+        if (!selected) throw new Error("Unexpected fixture bank selection");
+        return selected;
+    };
     const f = fixture(() => recall([fact("global", [])]));
-    values["hindsight.recallMaxQueryChars"] = 2;
+    settings.recallMaxQueryChars = 2;
     expect((await f.run({ action: "source_search", query: "😀abc" })).query_truncated).toBe(true);
-    expect(f.requests[0].body.query).toBe("😀a");
-    values["hindsight.scoping"] = "per-project"; values["hindsight.bankIdPrefix"] = " team ";
+    expect(f.requests[0].body).toMatchObject({ query: "😀a", tags: ["project:project"] });
+    settings.scoping = "per-project"; settings.bankIdPrefix = " team ";
+    await f.run({ action: "source_search", query: "x" }, undefined, worktree);
+    await f.run({ action: "source_search", query: "x" }, undefined, linkedWorktree);
+    await f.run({ action: "source_search", query: "x" }, undefined, outside);
+    settings.scoping = "global";
     await f.run({ action: "source_search", query: "x" });
-    expect(decodeURIComponent(new URL(f.requests[1].url).pathname.split("/")[4])).toBe("team-bank-project");
-    primaryRoot = undefined;
-    await f.run({ action: "source_search", query: "x" }, undefined, "/outside/Folder");
-    expect(decodeURIComponent(new URL(f.requests[2].url).pathname.split("/")[4])).toBe("team-bank-folder");
-    values["hindsight.scoping"] = "global";
-    await f.run({ action: "source_search", query: "x" });
-    expect(f.requests[3].body).not.toHaveProperty("tags");
+    expect(f.requests.slice(1).map(({ url }) => new URL(url).pathname.split("/")[4])).toEqual([
+        "team-bank-project", "team-bank-project", "team-bank-folder", "team-bank",
+    ]);
+    expect(f.requests[4].body).not.toHaveProperty("tags");
 });
 
 test.each([undefined, null, "project:project", [42]])("missing or malformed tags cannot authorize a global fact: %j", async tags => {
@@ -188,9 +230,9 @@ test("already cancelled invocation makes no request", async () => {
 test("deadline and invocation cancellation bound pending HTTP", async () => {
     // Real HTTP cancellation must exercise the platform clock, not only a mocked timer.
     const f = fixture(request => new Promise<Response>(resolve => { request.signal.addEventListener("abort", () => resolve(recall([])), { once: true }); }));
-    values["hindsight.recallTimeoutMs"] = 10;
+    settings.recallTimeoutMs = 10;
     expect((await f.run({ action: "source_search", query: "x" })).category).toBe("deadline");
-    values["hindsight.recallTimeoutMs"] = 1000;
+    settings.recallTimeoutMs = 1000;
     expect((await f.run({ action: "source_search", query: "x" }, AbortSignal.timeout(10))).category).toBe("cancelled");
 });
 
@@ -200,7 +242,7 @@ test("source search can finish after ten seconds within the configured recall de
         await Bun.sleep(10_100);
         return recall([fact("slow-source", [], { document_id: "slow-document" })]);
     });
-    values["hindsight.recallTimeoutMs"] = 30_000;
+    settings.recallTimeoutMs = 30_000;
     const result = await f.run({ action: "source_search", query: "slow evidence" });
     expect(result.status).toBe("ok");
     expect(result.items.map(item => item.document_id)).toEqual(["slow-document"]);
@@ -262,9 +304,9 @@ test("document scope is fresh after a search, retagging and configuration change
     expect((await f.run({ action: "source_read", id: "doc" })).status).toBe("ok");
     tags = ["project:other"];
     expect((await f.run({ action: "source_read", id: "doc" })).status).toBe("unavailable");
-    primaryRoot = "/repo/Other";
+    resolveScope = config => tagged(config.bankId, "project:other");
     expect((await f.run({ action: "source_read", id: "doc" })).status).toBe("ok");
-    values["hindsight.bankId"] = "changed";
+    settings.bankId = "changed";
     expect((await f.run({ action: "source_read", id: "doc" })).status).toBe("unavailable");
     expect(f.requests.map(request => request.method)).toEqual(["POST", "GET", "GET", "GET", "GET"]);
     expect(new URL(f.requests[4].url).pathname).toBe("/v1/default/banks/changed/documents/doc");
@@ -304,7 +346,7 @@ test("cancelled document read and excessive responses use shared error limits", 
 });
 
 test.each(["global", "per-project"]) ("document tags must be a valid current array even in %s mode", async scoping => {
-    values["hindsight.scoping"] = scoping;
+    settings.scoping = scoping;
     const bank = scoping === "global" ? "bank" : "bank-project";
     const f = fixture(() => Response.json({ id: "doc", bank_id: bank, original_text: "forbidden-document" }));
     const result = await f.run({ action: "source_read", id: "doc" });
@@ -340,7 +382,7 @@ test.each([200, 401, 404])("failing stream cleanup cannot replace size/status cl
 });
 
 test.each(["global", "per-project"]) ("malformed fact/support tags fail even without a tag filter (%s)", async scoping => {
-    values["hindsight.scoping"] = scoping;
+    settings.scoping = scoping;
     let support = false;
     const f = fixture(() => support ? recall([], { bad: fact("bad", 123) }) : recall([fact("bad", 123)]));
     expect((await f.run({ action: "source_search", query: "x" })).category).toBe("scope_schema");
@@ -544,7 +586,7 @@ test("snapshot retains every permitted supporting-fact reference beyond the prev
 });
 
 test.each(["global", "per-project", "per-project-tagged"])("snapshot applies safe source scope and metadata allowlists in %s mode", async scoping => {
-    values["hindsight.scoping"] = scoping;
+    settings.scoping = scoping;
     const original = " \ud800😀\n\u0001".repeat(200) + "tail ";
     const identity = "id-" + "\u0001".repeat(500);
     const f = fixture(() => recall([fact("allowed", [], {
@@ -634,7 +676,7 @@ test.each(actions)("%s failures never persist evidence or expose an expansion li
 });
 
 test("upstream truncation and query clipping alone do not promise recoverable evidence", async () => {
-    values["hindsight.recallMaxQueryChars"] = 2;
+    settings.recallMaxQueryChars = 2;
     const f = fixture(request => new URL(request.url).pathname.endsWith("/memories/recall")
         ? recall([fact("fact", [])], {}, { source_facts_truncated: true })
         : new URL(request.url).pathname.endsWith("/search") ? pageHits(["a", "b", "c", "d", "e", "not-verified"])

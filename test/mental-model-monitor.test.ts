@@ -64,10 +64,9 @@ beforeAll(async () => {
             return { release: () => heldLocks.delete(file) };
         } }, loader: "object" }));
     } });
-    // Load after installing the host fakes. The isolated graph keeps evidence and logs separate from other suites.
     const src = path.join(root, "src");
     fs.mkdirSync(src);
-    for (const file of ["mental-model-monitor.ts", "evidence.ts", "runtime-config.ts"]) fs.copyFileSync(path.join(import.meta.dir, "../src", file), path.join(src, file));
+    for (const file of ["mental-model-monitor.ts", "mental-model-status.ts", "mental-model-status-view.ts", "hindsight-http.ts", "runtime-config.ts"]) fs.copyFileSync(path.join(import.meta.dir, "../src", file), path.join(src, file));
     fs.copyFileSync(path.join(src, "mental-model-monitor.ts"), path.join(src, "second-monitor.ts"));
     for (const file of ["mental-model-monitor.ts", "second-monitor.ts"]) {
         const { registerMentalModelMonitor } = await import(path.join(src, file));
