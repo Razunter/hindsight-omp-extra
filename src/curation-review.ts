@@ -27,7 +27,7 @@ export async function confirmArchive(ui: ExtensionContext["ui"], review: string,
                         return ["Resize to review. Esc cancels."];
                     }
                     if (columns !== width || rows !== height) {
-                        lines = wrapTextWithAnsi(renderable, columns);
+                        if (columns !== width) lines = wrapTextWithAnsi(renderable, columns);
                         width = columns;
                         height = rows;
                         page = 0;

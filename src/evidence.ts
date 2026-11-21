@@ -124,7 +124,7 @@ function currentScope(pi: ExtensionAPI, cwd: string): Scope {
     };
 }
 
-export async function request(scope: Pick<Scope, "apiUrl" | "token" | "bank">, suffix: string, signal: AbortSignal, body?: RecordValue, method = body ? "POST" : "GET"): Promise<RecordValue> {
+export async function request(scope: Pick<Scope, "apiUrl" | "token" | "bank">, suffix: string, signal: AbortSignal, body?: RecordValue, method?: string): Promise<RecordValue> {
     return requestJson(scope.apiUrl + "/v1/default/banks/" + encodeURIComponent(scope.bank) + suffix, scope.token, signal, body, method);
 }
 

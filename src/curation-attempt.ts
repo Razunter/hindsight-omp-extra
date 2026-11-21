@@ -27,7 +27,7 @@ export interface Attempt {
 type AttemptSearch = { id: string } | { callId: string } | { replacementFor: string; connection: string };
 
 export function findAttempt(session: ExtensionContext["sessionManager"], match: AttemptSearch): Attempt | undefined {
-    const branch = new Set(session.getBranch().map(entry => entry.id));
+    let branch: Set<string> | undefined;
     const entries = session.getEntries();
     for (let i = entries.length - 1; i >= 0; i--) {
         const entry = entries[i]!;
@@ -48,6 +48,7 @@ export function findAttempt(session: ExtensionContext["sessionManager"], match: 
                     (value.decision === "replace" ? !value.replacement || typeof value.replacement.documentId !== "string" ||
                         !/^curation-[0-9a-f-]{36}$/.test(value.replacement.documentId) ||
                         typeof value.replacement.operationId !== "string" || !UUID.test(value.replacement.operationId) : value.replacement !== undefined))) return;
+        branch ??= new Set(session.getBranch().map(entry => entry.id));
         if (!branch.has(entry.id)) {
             // OMP restore can rewind to the assistant's pending call, leaving an in-tool append on the old continuation.
             let parentId = entry.parentId;

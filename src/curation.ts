@@ -66,8 +66,10 @@ export function registerCuration(pi: ExtensionAPI): void {
     for (const event of ["session_start", "session_switch", "session_branch", "session_tree"] as const) {
         pi.on(event, (_event, ctx) => {
             if (!nativeMain(ctx)) return;
-            // Re-entered or imported entries are not a new user-started pass in this lifecycle.
-            invalidated = new Set(ctx.sessionManager.getEntries().flatMap(entry => entry.type === "custom_message" && entry.customType === PASS ? [entry.id] : []));
+            invalidated = new Set();
+            for (const entry of ctx.sessionManager.getEntries()) {
+                if (entry.type === "custom_message" && entry.customType === PASS) invalidated.add(entry.id);
+            }
             investigation = undefined;
         });
     }
@@ -171,7 +173,7 @@ export function registerCuration(pi: ExtensionAPI): void {
                 } else decision = "obsolete";
                 if (action === "obsolete") {
                     const attestation = `I confirm Hindsight fact ${originals[0]!.fact.id} is obsolete and has no remaining use, including as history.`;
-                    if (lead.kind !== "note" || !lead.text.split(/(?<=[.!?])\s+|\r?\n/).some(line => line.trim().toLowerCase() === attestation.toLowerCase())) {
+                    if (lead.kind !== "note" || !hasAttestation(lead.text, attestation)) {
                         return outcome({ status: "unavailable", reason: "obsolescence_not_established",
                             note: "Use a first-hand note that identifies the fact and confirms it is obsolete and not useful even as history. A failed search does not qualify." });
                     }
@@ -211,8 +213,7 @@ function contextPass(messages: readonly AgentMessage[], ctx: ExtensionContext, i
         const leads = hostLeads(message.details, ctx);
         if (!leads) return;
         const persisted = activePass(ctx, invalidated);
-        if (persisted?.timestamp === message.timestamp && persisted.leads.length === leads.length
-            && persisted.leads.every((lead, index) => lead.ref === leads[index].ref && lead.kind === leads[index].kind && lead.text === leads[index].text)) return persisted.leads;
+        if (persisted?.timestamp === message.timestamp && isDeepStrictEqual(persisted.leads, leads)) return persisted.leads;
         // A saved but inactive pass (including one copied on fork or revisited on the tree) is not queued.
         if (ctx.sessionManager.getEntries().some(entry => entry.type === "custom_message" && entry.customType === PASS && Date.parse(entry.timestamp) === message.timestamp)) return;
         return leads;
@@ -314,7 +315,12 @@ function supersedes(lead: Lead, original: CuratableFact, keeper: CuratableFact, 
     if (!isDeepStrictEqual(material(original), material(keeper))) return false;
     if (correction === keeper.text) return true;
     const attestation = `I confirm Hindsight fact ${original.id} is superseded by ${keeper.id} and the keeper preserves its still-useful details.`;
-    return lead.text.split(/(?<=[.!?])\s+|\r?\n/).some(sentence => sentence.trim().toLowerCase() === attestation.toLowerCase());
+    return hasAttestation(lead.text, attestation);
+}
+
+function hasAttestation(text: string, attestation: string): boolean {
+    const expected = attestation.toLowerCase();
+    return text.split(/(?<=[.!?])\s+|\r?\n/).some(sentence => sentence.trim().toLowerCase() === expected);
 }
 
 function exactReplacement(fact: CuratableFact, text: string) {
@@ -553,7 +559,6 @@ async function investigate(target: CurationTarget, lead: Lead, signal: AbortSign
         if (source.status === "foreign_project") return;
         const { metadata, document_id: _document, chunk_id: _chunk, ...shown } = fact;
         const candidate = { ...shown, provenance: provenance(metadata), source };
-        // Never show a partial fact as the exact original.
         if (Buffer.byteLength(JSON.stringify(candidate)) > 3000) return;
         return { fact, source, candidate };
     }));
