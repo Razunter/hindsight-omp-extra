@@ -35,7 +35,7 @@ type Entry = Record<string, unknown>;
 type Context = typeof ctx;
 type ToolResult = { content: { text: string }[]; isError?: boolean };
 type Tool = { name: string; execute(id: string, params: unknown, signal: AbortSignal | undefined, update: undefined, ctx: Context): Promise<ToolResult> };
-type EventHandler = (event: { messages?: Entry[] }, ctx: Context) => unknown;
+type EventHandler = (event: { messages?: Entry[]; toolName?: string; parentToolCallId?: string; input?: Entry }, ctx: Context) => unknown;
 const tools = new Map<string, Tool>();
 const handlers = new Map<string, EventHandler[]>();
 let enabled = true;
@@ -201,6 +201,10 @@ try {
     branch = [saved, wake];
     assert.match(await cue(), /hindsight_curate/);
     assert.equal(requests.length, 0, "a cue must not start recall");
+    const nestedMutation = { toolName: "hindsight_curate", parentToolCallId: "eval-call", input: { action: "archive" } };
+    const checkCall = (event: typeof nestedMutation) => (handlers.get("tool_call") ?? []).map(handler => handler(event, ctx));
+    assert.ok(checkCall(nestedMutation).some(result => (result as Entry | undefined)?.block === true));
+    assert.ok(checkCall({ ...nestedMutation, input: { action: "investigate" } }).every(result => result === undefined));
     const result = await run();
     assert.equal((await run({ action: "investigate", lead: ref, targets: [], keeper: "" })).body.status, "ok",
         "strict provider tool schemas can fill unused optional arguments with empty values");
@@ -227,6 +231,8 @@ try {
         [[lead({ cwd: "/foreign/project" })], [providerMessage(lead({ cwd: "/foreign/project" }))]],
         [[saved, { type: "message", message: typed }], [custom, typed]],
         [[saved, { type: "reset_boundary" }], [custom, synthetic]],
+        [[lead({ text: "Correct the duplicated instructions in the Hindsight README." })], [providerMessage(lead({ text: "Correct the duplicated instructions in the Hindsight README." }))]],
+        [[lead({ text: "The Hindsight README retained duplicate instructions about release signing." })], [providerMessage(lead({ text: "The Hindsight README retained duplicate instructions about release signing." }))]],
         [[saved, { type: "custom_message", customType: "skill-prompt" }], [custom, { role: "custom", customType: "skill-prompt" }]],
         [[saved, lead({ id: "later", ref: ids[0], timestamp: "2026-01-02T00:00:00.000Z", text: "The CSS skill repeats its example." })], [custom, providerMessage(lead({ id: "later", ref: ids[0], timestamp: "2026-01-02T00:00:00.000Z", text: "The CSS skill repeats its example." }))]],
         [[lead({ text: "Hindsight bank not reachable after startup." })], [providerMessage(lead({ text: "Hindsight bank not reachable after startup." }))]],
@@ -270,6 +276,10 @@ try {
     assert.match(await cue([custom, providerMessage(current)]), /hindsight_curate/);
     assert.equal((await run()).error, false);
     assert.equal((requests[0].body as Entry).query, observation);
+    const retentionNote = lead({ id: "retention-note", text: "Hindsight retained duplicate instructions about release signing." });
+    branch = [retentionNote];
+    assert.match(await cue([providerMessage(retentionNote)]), /hindsight_curate/);
+    assert.equal((await run()).body.status, "ok");
     const longLead = lead({ id: "long-pass", text: `${text} 😀`, timestamp: "2026-01-03T00:00:00.000Z" });
     branch = [current, longLead];
     settings.recallMaxQueryChars = text.length + 1;
@@ -444,12 +454,40 @@ try {
         else assert.deepEqual(applied.body.unknown, [ids[0]]);
     }
 
+    for (const mode of ["different sources", "different long session IDs", "target-only excerpt"]) {
+        await prepare();
+        for (const [index, id] of ids.slice(0, 2).entries()) {
+            const sourceId = `witness-${index}`;
+            const excerptId = mode === "target-only excerpt" && index === 0 ? chunkId : null;
+            const document_metadata = mode === "different sources" ? { source: `Calibration witness ${index}` } :
+                { session_id: mode === "target-only excerpt" ? "same-session" : "s".repeat(256) + index };
+            docs.set(sourceId, { ...document, id: sourceId, document_metadata });
+            if (excerptId) chunks[excerptId] = { id: excerptId, chunk_index: 0, text: sourceText, truncated: false };
+            facts.set(id, rawFact(id, { text: duplicate, document_id: sourceId, chunk_id: excerptId, metadata: { author: "Recorder" } }));
+        }
+        await run();
+        requests.length = 0;
+        ctx.ui.custom = nativeForm;
+        assert.equal((await archive()).body.reason, "no_complete_same_scope_keeper", mode);
+        assert.deepEqual(requests, [], mode);
+        docs.clear();
+    }
+    await prepare();
+    const unicodeSession = "😀".repeat(129);
+    docs.set(documentId, { ...document, document_metadata: { session_id: unicodeSession } });
+    facts.set(ids[0], rawFact(ids[0], { document_id: documentId }));
+    const unicodeSource = (await run()).body.facts.find((fact: Entry) => fact.id === ids[0]).source;
+    assert.equal(unicodeSource.provenance.session_id, unicodeSession);
+    docs.clear();
+    ctx.ui.custom = answer("a") as unknown as typeof nativeForm;
+
     const batch = { action: "archive", lead: ref, targets: [ids[0], ids[2]], keeper: ids[1] };
     const invocation = { type: "message", id: "archive-call", parentId: current.id,
         message: { role: "assistant", content: [{ type: "toolCall", id: "fixture", name: "hindsight_curate" }] } };
     for (const mode of ["ack", "lost", "conflict"] as const) {
         await prepare(3);
         branch.push(invocation);
+        if (mode === "conflict") branch.push({ type: "message", id: "other-tool-result", parentId: invocation.id, message: { role: "toolResult" } });
         for (const targets of [[ids[0], ids[0]], [ids[0], ids[1]]]) {
             assert.equal((await run({ ...batch, targets })).body.reason, "invalid_input");
         }
@@ -470,14 +508,19 @@ try {
     const interrupted = branch.pop()!;
     assert.equal(interrupted.customType, "hindsight-curation-attempt");
     const attemptId = (interrupted.data as Entry).id;
-    siblingEntries = [interrupted];
+    const otherResult = branch.pop()!;
+    assert.equal(otherResult.id, "other-tool-result");
+    siblingEntries = [otherResult, interrupted];
     await emit("session_start");
     ctx.ui.custom = nativeForm;
     requests.length = 0;
     const recovered = await run({ action: "reconcile", attempt: attemptId, lead: ref });
     assert.deepEqual(recovered.body.unknown, [ids[0]], "a conflicting archive reason is not attributed to the attempt");
-    assert.deepEqual(recovered.body.unchanged, [ids[2]]);
-    assert.deepEqual((await run(batch)).body.unchanged, [ids[2]], "replayed archive calls can only reconcile");
+    assert.deepEqual(recovered.body.observedActive, [ids[2]]);
+    assert.deepEqual(recovered.body.unchanged, []);
+    const active = facts.get(ids[2])!;
+    facts.set(ids[2], { ...active, text: "Edited while OMP was stopped" });
+    assert.deepEqual((await run(batch)).body.observedActive, [ids[2]], "replay reports active without claiming the text is unchanged");
     assert.ok(requests.length && requests.every(request => request.method === "GET"));
     requests.length = 0;
     settings.hindsightApiToken = "changed";
@@ -486,6 +529,12 @@ try {
     branch = [];
     assert.equal((await run({ action: "reconcile", attempt: attemptId })).body.reason, "attempt_not_in_branch");
     assert.equal(requests.length, 0);
+    branch = [lead({ id: "explicit-keeper", text: `I confirm Hindsight fact ${ids[0]} is superseded by ${ids[1]} and the keeper preserves its still-useful details.` })];
+    facts.set(ids[0], rawFact(ids[0]));
+    facts.set(ids[1], rawFact(ids[1]));
+    recallOverride = { results: [] };
+    assert.deepEqual((await run()).body.facts.map((fact: Entry) => fact.id), ids.slice(0, 2));
+    recallOverride = undefined;
 
     patchMode = "ack";
     facts.set(ids[0], rawFact(ids[0], { text: "The retired Quill lookup code is BLUE." }));
@@ -521,6 +570,15 @@ try {
     const corrected = "Quill uses the GREEN fixture release key.";
     const correction = `Hindsight has the wrong Quill fixture release key. I confirm Hindsight fact ${ids[0]} is incorrect and the exact correction preserves its still-useful details. Exact replacement: ${corrected}`;
     const replace = () => run({ action: "replace", lead: ref, targets: [ids[0]] });
+    facts.clear();
+    docs.clear();
+    facts.set(ids[0], rawFact(ids[0], { text: "Quill uses the obsolete BLUE fixture release key.", date: timestamp, entities: [] }));
+    branch = [lead({ id: "capability-changed", text: correction })];
+    await run();
+    ctx.ui.custom = answer("a", () => { retainMode = "incompatible"; }) as unknown as typeof nativeForm;
+    assert.equal((await replace()).body.reason, "retain_capability_or_document_changed");
+    assert.equal(branch.some(entry => entry.customType === "hindsight-curation-attempt"), false, "failed preflight must not strand a replacement");
+    ctx.ui.custom = answer("a") as unknown as typeof nativeForm;
     for (const mode of ["incompatible", "unsupported_archive", "wrong_type", "wrong_date", "extra", "archived_extra", "missing", "deny_archive", "lost", "ack"] as const) {
         facts.clear();
         docs.clear();
@@ -553,6 +611,14 @@ try {
             assert.deepEqual(result.body.unchanged, [ids[0]], mode);
             assert.equal(facts.get(ids[0]!)?.state, "valid", mode);
             assert.equal(writes.some(write => write.method === "PATCH"), mode === "deny_archive", mode);
+        }
+        if (mode === "wrong_date") {
+            const recovered = await run({ action: "reconcile", attempt: result.body.attempt });
+            assert.equal(recovered.body.status, "unverified");
+            assert.equal(recovered.body.keeper, undefined);
+            assert.equal(recovered.body.replacement.factId, ids[2]);
+            assert.equal(recovered.body.replacement.state, "observed_not_verified");
+            assert.deepEqual(recovered.body.observedActive, [ids[0]]);
         }
         if (mode === "missing") {
             requests.length = 0;

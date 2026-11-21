@@ -76,7 +76,7 @@ export async function observeReplacement(read: CurationRequest, ids: Replacement
     } catch { operation = "unknown"; }
     const scope = { ...ids, operation, factIds: [] as string[] };
     try {
-        // The default list hides archived rows. An extra archived row also invalidates exactly-one readback.
+        // The default list hides archived rows, but the document must contain exactly one fact and it must be active.
         const [active, archived] = await Promise.all((["valid", "invalidated"] as const).map(async state => {
             const response = await read("/memories/list?" + new URLSearchParams({ document_id: ids.documentId, state, limit: "2" }));
             const { offset, limit, total, items } = response;

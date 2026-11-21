@@ -58,6 +58,10 @@ export function findAttempt(session: ExtensionContext["sessionManager"], match: 
                 seen.add(parentId);
                 const parent = session.getEntry(parentId);
                 if (!parent || parent.type === "reset_boundary") break;
+                if (parent.type === "message" && parent.message.role === "toolResult") {
+                    parentId = parent.parentId;
+                    continue;
+                }
                 if (parent.type === "message") {
                     sameInvocation = branch.has(parent.id) && parent.message.role === "assistant" &&
                         parent.message.content.some(part => part.type === "toolCall" && part.id === value.callId && part.name === "hindsight_curate");
@@ -84,7 +88,7 @@ export async function recordAttempt(pi: ExtensionAPI, session: ExtensionContext[
         if (entry?.type !== "custom" || entry.customType !== ATTEMPT_ENTRY || !isDeepStrictEqual(entry.data, attempt)) return false;
         await session.ensureOnDisk();
         if (session.getSessionFile() !== path) return false;
-        // Local append failures can be latched without throwing. Check the exact entry on disk before an external mutation.
+        // OMP can record an append failure without throwing. Check the exact session entry on disk before writing to Hindsight.
         const file = Bun.file(path);
         const tail = await file.slice(Math.max(0, file.size - 65_536)).text();
         for (const line of tail.split("\n")) {
