@@ -25,7 +25,7 @@ type Settings = {
     bankIdPrefix: string;
 };
 type Seed = { id: string; name: string; sourceQuery: string; tags: string[]; legacyIds?: string[] };
-type Model = { id: string; name: string; tags: string[]; is_stale?: boolean | null; last_refresh_failed_at?: string | null; knowledgePage?: boolean };
+type Model = { id: string; name: string; tags: string[]; is_stale?: boolean | null; last_refresh_failed_at?: string | null; last_refreshed_at?: string | null; knowledgePage?: boolean };
 type Operation = { mental_model_id: string; status: "pending" | "processing"; startsOnProcessingRead?: boolean };
 type Bank = { models: Model[]; operations?: Operation[]; failOperations?: boolean; repeatOperationsPage?: boolean };
 // OMP's lock conflicts per path across and within processes and is gone once released.
@@ -124,6 +124,7 @@ function fixture(banks: Record<string, Bank>) {
             const settings: Settings = { backend: "hindsight", hindsightApiUrl: server.url.href, hindsightApiToken: "fixture-token", mentalModelsEnabled: true,
                 mentalModelAutoSeed: false, requestTimeoutMs: 1000, scoping: "per-project-tagged", bankId: "memory", bankIdPrefix: "team" };
             const notifications: { message: string; severity: string }[] = [];
+            const startupNotifications: typeof notifications = [];
             const timers: { kind: string; callback: () => void | Promise<void>; ms: number }[] = [];
             let start!: (event: { type: "session_start" }, context: typeof ctx) => void | Promise<void>;
             let cwd = `/fixture/${project}`;
@@ -137,9 +138,13 @@ function fixture(banks: Record<string, Bank>) {
             const host = { pi: { settings }, on(name: string, handler: typeof start) { if (name === "session_start") start = handler; } };
             registrars[instance](host as unknown as ExtensionAPI);
             return {
-                ctx, notifications, settings, timers,
+                ctx, notifications, startupNotifications, settings, timers,
                 move(project: string) { cwd = `/fixture/${project}`; },
-                async start() { await start({ type: "session_start" }, ctx); },
+                async start() {
+                    const first = notifications.length;
+                    await start({ type: "session_start" }, ctx);
+                    startupNotifications.push(...notifications.splice(first));
+                },
                 async tick(kind = "timeout") {
                     const timer = timers.find(timer => timer.kind === kind);
                     if (!timer) throw new Error(`Missing ${kind} callback`);
@@ -153,6 +158,66 @@ function fixture(banks: Record<string, Bank>) {
 const model = (id: string, fields: Partial<Omit<Model, "id">> = {}): Model => ({ id, name: id, tags: [], ...fields });
 const paused = { last_refresh_failed_at: failure, is_stale: true };
 const stale = { is_stale: true };
+
+test("startup shows scoped local results and preserves the last successful check across a failure and recovery", async () => {
+    const now = Date.UTC(2026, 10, 22, 9);
+    const refreshed = "2026-11-20T14:59:00Z";
+    const local = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+    setSystemTime(now);
+    const data: Bank = { models: [
+        model("user-preferences", { ...stale, last_refreshed_at: refreshed }),
+        model("project-decisions-alpha", { ...paused, last_refreshed_at: null }),
+        model("project-conventions-alpha"),
+        model("project-decisions-beta", paused),
+        model("custom-too", paused),
+    ] };
+    const f = fixture({ [bank]: data });
+    const alpha = f.session();
+    const fresh = async (project = "alpha", prefix = "team") => {
+        const session = f.session(project, 1);
+        session.settings.bankIdPrefix = prefix;
+        const requestCount = f.requests.length;
+        await session.start();
+        expect(f.requests).toHaveLength(requestCount);
+        expect(session.startupNotifications).toHaveLength(1);
+        const { message } = session.startupNotifications[0];
+        expect(message).not.toContain("\n");
+        return message;
+    };
+
+    await alpha.start();
+    expect(alpha.startupNotifications.map(({ message }) => message)).toEqual([expect.stringContaining("Not checked yet")]);
+    expect(f.requests).toEqual([]);
+    await alpha.tick();
+    const saved = await fresh();
+    expect(saved).toContain("3 models");
+    expect(saved).toContain("1 stale");
+    expect(saved).toContain("1 paused");
+    expect(saved).toContain("1 unknown");
+    expect(saved).toContain(local.format(new Date(refreshed)));
+    expect(saved).toContain(local.format(now));
+    expect(saved).not.toContain("user-preferences");
+    expect(await fresh("beta")).not.toContain("1 paused");
+    expect(await fresh("alpha", "other")).toContain("Not checked yet");
+
+    setSystemTime(now + day);
+    data.failOperations = true;
+    await alpha.tick("interval");
+    const unavailable = await fresh();
+    expect(unavailable).toContain("Check unavailable");
+    expect(unavailable).toContain("last known");
+    expect(unavailable).toContain("1 stale");
+    expect(unavailable).toContain(local.format(now));
+    expect(await fresh("alpha", "other")).not.toContain("Check unavailable");
+
+    data.failOperations = false;
+    data.models = [model("user-preferences", { is_stale: false, last_refreshed_at: refreshed })];
+    await alpha.tick("interval");
+    const recovered = await fresh();
+    expect(recovered).toContain("1 model");
+    expect(recovered).not.toMatch(/unavailable|paused|stale/);
+    expect(recovered).toContain(local.format(now + day));
+});
 
 test("warns only for scoped seeds, with Paused before Stale and in-flight refreshes taking precedence", async () => {
     const f = fixture({
@@ -237,7 +302,7 @@ test("a refresh that starts processing between the two operation listings still 
     expect(f.requests.filter(request => request.route === "operations").map(request => request.status)).toEqual(["pending", "processing"]);
 });
 
-test("a repeated operations page fails the check without recording it", async () => {
+test("a repeated operations page does not publish a successful status", async () => {
     const f = fixture({ [bank]: {
         models: [model("user-preferences", paused)],
         // The page total is a multiple of the page size, so the repeat looks complete and hides the refresh on page two.
@@ -249,7 +314,10 @@ test("a repeated operations page fails the check without recording it", async ()
     await session.start();
     await session.tick();
     expect(session.notifications).toEqual([]);
-    expect(fs.readdirSync(path.join(agentDir, "hindsight-mental-model-monitor"))).toEqual([]);
+    const fresh = f.session("alpha", 1);
+    await fresh.start();
+    expect(fresh.startupNotifications.map(({ message }) => message)).toEqual([expect.stringContaining("Check unavailable")]);
+    expect(fresh.startupNotifications[0].message).not.toContain("last known");
 });
 
 test("server-provided names cannot restyle the warning or add lines to it", async () => {
@@ -263,7 +331,7 @@ test("server-provided names cannot restyle the warning or add lines to it", asyn
     expect(message).toContain("Evil [31m Paused: Fake");
 });
 
-test("an unavailable operations page never warns or consumes the next check", async () => {
+test("an unavailable operations page does not claim a finding or consume the next check", async () => {
     const data = { models: [model("user-preferences", paused)], failOperations: true };
     const f = fixture({ [bank]: data });
     const session = f.session();
@@ -273,7 +341,6 @@ test("an unavailable operations page never warns or consumes the next check", as
     await session.start();
     await session.tick();
     expect(session.notifications).toEqual([]);
-    expect(fs.readdirSync(path.join(agentDir, "hindsight-mental-model-monitor"))).toEqual([]);
     const log = logLines().slice(earlier);
     expect(log).toHaveLength(1);
     expect(log[0]).toContain("http");

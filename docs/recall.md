@@ -79,13 +79,17 @@ Main and rebound child instances keep separate state. Children/advisors and inel
 
 Nudges are advisory, and improved useful retrieval or task correctness has not been demonstrated. They remain disabled by default. Tools without a public leaf-result event cannot advance cadence.
 
-## Mental model warnings
+## Mental model status
 
-In an interactive main session, the extension checks existing OMP-seeded mental models in the active default Hindsight bank. It first checks about a minute after startup, then tries hourly while OMP is open. A completed check counts for 24 hours per seed across sessions in the same OMP profile. Shared seeds do not warn again when you open another project within that window.
+On startup, OMP shows a compact summary of the last saved check: model counts, the oldest known successful refresh, and the check time. Open `/hindsight` and select **Status** for each model's state and refresh time. Dates use your local time zone and format. Both views read only local state, including when local Hindsight management is Off.
+
+**Not checked yet** means the monitor has not saved a result. **Check unavailable** means the last attempt failed; any previous successful result remains visible as **last known**. A model that has never refreshed is distinct from one whose refresh time is unknown.
+
+In an interactive main session, the extension checks existing OMP-seeded mental models in the active default Hindsight bank. It first checks about a minute after startup, then tries hourly while OMP is open. A completed check counts for 24 hours per seed across sessions in the same OMP profile. Background warnings for a shared seed do not repeat when you open another project within that window.
 
 - **Paused** means the last refresh failed. Automatic refresh waits until a refresh succeeds.
 - **Stale** means newer memories exist in the model's scope since its last refresh.
 
 The warning does not block prompts. It lists Paused models first and omits models with a queued or running refresh. You can refresh the listed models in the Hindsight Control Plane. The extension does not refresh them for you.
 
-The check requires the Hindsight memory backend and enabled mental models. It does not check other banks, unrelated projects' seeds, custom models, or knowledge pages. A check that cannot read from Hindsight does not warn, and the next hourly attempt can retry it.
+The monitor requires the Hindsight memory backend and enabled mental models. It excludes other banks, unrelated projects' seeds, custom models, and knowledge pages. A failed check does not establish a model's state and can retry on the next hourly attempt. An old refresh date alone does not mean a model is Stale.

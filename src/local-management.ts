@@ -2,6 +2,7 @@ import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { BASE_LABEL, CONFIG_LABEL, CUDA_RECIPE, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, candidateModelDevices, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, serviceModelDevices, type ContainerInfo, type ImageInfo } from "./docker";
 import { initialState, liveOperation, readState, releaseLease, takeLease, updateState, type ApprovedRuntime, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
+import { mentalModelStatus } from "./mental-model-monitor";
 import { EXTENSION_ROOT, hasLegacyConfiguration, log, providerNames, resolveSettings, saveProviderSelection, savedProviderSelection, type HindsightSettings } from "./runtime-config";
 import { latestStableRelease, STABLE_IMAGE } from "./stable-release";
 
@@ -34,7 +35,7 @@ export function registerLocalManagement(pi: ExtensionAPI): void {
         description: "Local Hindsight management: status, Off/CPU/GPU mode, provider configuration, apply, updates and update checks",
         handler: async (_args, ctx) => {
             if (ctx.hasUI !== true) return;
-            try { await openMenu(ctx.ui); }
+            try { await openMenu(pi, ctx); }
             catch (error) { ctx.ui.notify(visible(error), "error"); }
         },
     });
@@ -300,9 +301,10 @@ async function readinessProblem(settings: HindsightSettings): Promise<string | u
     }
 }
 
-async function openMenu(ui: UI): Promise<void> {
+async function openMenu(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+    const { ui } = ctx;
     const choice = await ui.select("Hindsight local management", Object.values(MENU));
-    if (choice === MENU.status) showStatus(ui);
+    if (choice === MENU.status) showStatus(ui, mentalModelStatus(pi, ctx, "details")?.message);
     if (choice === MENU.mode) {
         const mode = await ui.select("Local Hindsight management mode", ["Off", "CPU", "GPU"]);
         if (mode === "Off") {
@@ -320,7 +322,7 @@ async function openMenu(ui: UI): Promise<void> {
     if (choice === MENU.check) await checkNow(ui);
 }
 
-function showStatus(ui: UI): void {
+function showStatus(ui: UI, mentalModels: string | undefined): void {
     const state = readState();
     const active = state?.active;
     const lines = [
@@ -342,6 +344,7 @@ function showStatus(ui: UI): void {
     lines.push(state?.check ? `Last update check (${new Date(state.check.attemptedAt).toISOString()}): ${describeCheck(state.check)}` : "Last update check: none");
     const operation = state && liveOperation(state);
     if (operation) lines.push(`In progress: ${operation.kind} since ${operation.startedAt}`);
+    if (mentalModels) lines.push(mentalModels);
     ui.notify(lines.join("\n"), "info");
 }
 

@@ -5,13 +5,24 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { computeBankScope } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
 import { isHindsightConfigured, loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
-import { resolveSeedsForScope, seedAlreadyExists } from "@oh-my-pi/pi-coding-agent/hindsight/mental-models";
+import { resolveSeedsForScope, seedAlreadyExists, type MentalModelSeed } from "@oh-my-pi/pi-coding-agent/hindsight/mental-models";
 import { tryAcquireFileLock, type FileLockHandle } from "@oh-my-pi/pi-utils";
 import { request } from "./evidence";
 import { log } from "./runtime-config";
 
-type Model = { id: string; name: string; tags?: string[]; is_stale?: boolean | null; last_refresh_failed_at?: string | null };
-type Finding = { status: "paused" | "stale"; name: string };
+type Model = { id: string; name: string; tags?: string[]; is_stale?: boolean | null; last_refresh_failed_at?: string | null; last_refreshed_at?: unknown };
+type Finding = { status: "Paused" | "Stale"; name: string };
+const MODEL_STATES = ["Paused", "Stale", "Refreshing", "Current", "Unknown"] as const;
+type ObservedModel = { name: string; status: typeof MODEL_STATES[number]; refreshedAt?: number | null };
+type SeedCheck = { checkedAt?: number; model?: ObservedModel | null; failed?: boolean };
+type DueSeed = { seed: MentalModelSeed; file: string; previous: SeedCheck };
+type MonitorScope = {
+    target: { apiUrl: string; bank: string; token?: string };
+    seeds: MentalModelSeed[];
+    dir: string;
+    keyPath: (seedId?: string) => string;
+    timeout: number;
+};
 type ReadPage = (suffix: string) => Promise<Record<string, unknown>>;
 
 const MINUTE_MS = 60_000;
@@ -32,44 +43,107 @@ export function registerMentalModelMonitor(pi: ExtensionAPI): void {
             return;
         }
         current = ctx;
+        const display = mentalModelStatus(pi, ctx, "summary");
+        if (display) ctx.ui.notify(display.message, display.warning ? "warning" : "info");
         const tick = () => check(pi, current ?? ctx);
         ctx.setTimeout(tick, MINUTE_MS);
         ctx.setInterval(tick, HOUR_MS);
     });
 }
 
+export function mentalModelStatus(pi: ExtensionAPI, ctx: ExtensionContext, view: "summary" | "details") {
+    const title = "Hindsight mental models";
+    let scope: MonitorScope | undefined;
+    try { scope = monitorScope(pi, ctx); }
+    catch { return { message: `${title}: Check unavailable`, warning: true }; }
+    if (!scope) return;
+
+    const records = scope.seeds.map(seed => readCheck(scope.keyPath(seed.id) + ".json"));
+    const checked = records.filter(record => record.model !== undefined && record.checkedAt !== undefined);
+    const unavailable = records.some(record => record.failed);
+    if (!checked.length) {
+        return { message: `${title}: ${unavailable ? "Check unavailable" : "Not checked yet"}`, warning: unavailable };
+    }
+
+    const date = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+    const rows: string[] = [];
+    const counts = { Paused: 0, Stale: 0, Refreshing: 0, Current: 0, Unknown: 0 };
+    let modelCount = 0;
+    let latestCheck = 0;
+    let oldestRefresh = Infinity;
+    for (const { checkedAt, model } of checked) {
+        if (checkedAt === undefined) continue;
+        latestCheck = Math.max(latestCheck, checkedAt);
+        if (!model) continue;
+        modelCount++;
+        counts[model.status]++;
+        if (typeof model.refreshedAt === "number") oldestRefresh = Math.min(oldestRefresh, model.refreshedAt);
+        if (view === "details") {
+            const refresh = model.refreshedAt === null ? "never refreshed"
+                : model.refreshedAt === undefined ? "refresh time unknown" : `refreshed ${date.format(model.refreshedAt)}`;
+            rows.push(`${plain(model.name)}: ${model.status} · ${refresh} · checked ${date.format(checkedAt)}`);
+        }
+    }
+
+    const summary = [`${modelCount} ${modelCount === 1 ? "model" : "models"}`];
+    for (const status of MODEL_STATES) {
+        if (counts[status] && status !== "Current") summary.push(`${counts[status]} ${status.toLowerCase()}`);
+    }
+    if (checked.length < records.length) summary.push(`${records.length - checked.length} unchecked`);
+    if (Number.isFinite(oldestRefresh)) summary.push(`oldest refresh ${date.format(oldestRefresh)}`);
+    else if (modelCount) summary.push("no known refresh time");
+    summary.push(`checked ${date.format(latestCheck)}`);
+    const label = unavailable ? "Check unavailable · last known: " : "";
+    return {
+        message: [`${title}: ${label}${summary.join(" · ")}`, ...rows].join("\n"),
+        warning: unavailable || counts.Paused > 0 || counts.Stale > 0,
+    };
+}
+
+function monitorScope(pi: ExtensionAPI, ctx: ExtensionContext): MonitorScope | undefined {
+    const settings = pi.pi.settings;
+    if (lookup("memory.backend")?.get(settings) !== "hindsight") return;
+    const config = loadHindsightConfig(settings);
+    if (!isHindsightConfigured(config) || !config.mentalModelsEnabled) return;
+    // A timer retains its start context, but the session manager follows /move.
+    const scope = computeBankScope(config, ctx.sessionManager.getCwd());
+    const seeds = resolveSeedsForScope(scope, config.scoping);
+    if (!seeds.length) return;
+    const url = new URL(config.hindsightApiUrl);
+    if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) {
+        throw new Error("configuration");
+    }
+    const apiUrl = url.href.replace(/\/+$/, "");
+    const target = { apiUrl, bank: scope.bankId, token: config.hindsightApiToken ?? undefined };
+    const dir = path.join(getAgentDir(), "hindsight-mental-model-monitor");
+    const keyPath = (seedId?: string) => path.join(dir, createHash("sha256").update(JSON.stringify(
+        seedId === undefined ? [apiUrl, scope.bankId] : [apiUrl, scope.bankId, seedId]
+    )).digest("hex"));
+    return { target, seeds, dir, keyPath, timeout: config.requestTimeoutMs };
+}
+
 async function check(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
     let phase = "configuration";
     let failure: string | undefined;
     let lock: FileLockHandle | null | undefined;
+    let due: DueSeed[] = [];
     try {
-        const settings = pi.pi.settings;
-        if (lookup("memory.backend")?.get(settings) !== "hindsight") return;
-        const config = loadHindsightConfig(settings);
-        if (!isHindsightConfigured(config) || !config.mentalModelsEnabled) return;
-        // A timer retains its start context, but the session manager follows /move.
-        const scope = computeBankScope(config, ctx.sessionManager.getCwd());
-        const seeds = resolveSeedsForScope(scope, config.scoping);
-        if (!seeds.length) return;
-        const url = new URL(config.hindsightApiUrl);
-        if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) {
-            throw new Error("configuration");
-        }
-        const apiUrl = url.href.replace(/\/+$/, "");
-        const target = { apiUrl, bank: scope.bankId, token: config.hindsightApiToken ?? undefined };
-        const timeout = config.requestTimeoutMs;
+        const scope = monitorScope(pi, ctx);
+        if (!scope) return;
+        const { target, seeds, dir, keyPath, timeout } = scope;
         if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new Error("configuration");
 
         phase = "storage";
-        const dir = path.join(getAgentDir(), "hindsight-mental-model-monitor");
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
         // OMP names the lock after the path string, so every alias of one profile must resolve to one path.
-        const root = fs.realpathSync(dir);
-        const keyPath = (...parts: string[]) => path.join(root, createHash("sha256").update(JSON.stringify([apiUrl, scope.bankId, ...parts])).digest("hex"));
+        const lockPath = path.join(fs.realpathSync(dir), path.basename(keyPath()));
         // One lock per bank, held for the whole check, so concurrent sessions cannot split one bank's findings across two warnings.
-        lock = tryAcquireFileLock(keyPath());
+        lock = tryAcquireFileLock(lockPath);
         if (!lock) return;
-        const due = seeds.map(seed => ({ seed, record: keyPath(seed.id) + ".json" })).filter(({ record }) => !recent(record));
+        due = seeds.map(seed => {
+            const file = keyPath(seed.id) + ".json";
+            return { seed, file, previous: readCheck(file) };
+        }).filter(({ previous }) => !recent(previous.checkedAt));
         if (!due.length) return;
 
         phase = "request";
@@ -86,42 +160,57 @@ async function check(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
             if (!isModel(value) || models.has(value.id)) throw new CheckError("schema");
             models.set(value.id, value);
         });
-        const candidates: Model[] = [];
-        for (const { seed } of due) {
+        const matched = due.map(({ seed }) => {
             let model = models.get(seed.id);
             for (const id of seed.legacyIds ?? []) {
                 if (model) break;
                 const candidate = models.get(id);
-                if (candidate && seedAlreadyExists(seed, [{ ...candidate, bank_id: scope.bankId }])) model = candidate;
+                if (candidate && seedAlreadyExists(seed, [{ ...candidate, bank_id: target.bank }])) model = candidate;
             }
-            if (model && status(model)) candidates.push(model);
-        }
-        const retrying = candidates.length ? await listRetries(readPage) : undefined;
+            return model;
+        });
+        const retrying = matched.some(model => model && finding(status(model))) ? await listRetries(readPage) : undefined;
         const findings: Finding[] = [];
-        for (const model of candidates) {
-            const finding = status(model, retrying);
-            if (finding) findings.push({ status: finding, name: model.name || model.id });
-        }
+        const observed = matched.map(model => {
+            if (!model) return null;
+            const state = status(model, retrying);
+            const name = model.name || model.id;
+            if (finding(state)) findings.push({ status: state, name });
+            const timestamp = typeof model.last_refreshed_at === "string" ? Date.parse(model.last_refreshed_at) : NaN;
+            const refreshedAt = model.last_refreshed_at === null ? null : Number.isFinite(timestamp) ? timestamp : undefined;
+            return { status: state, name, refreshedAt };
+        });
 
         // A warning already shown is better repeated than lost to a failed record write.
         phase = "notification";
-        if (findings.length) notify(ctx, scope.bankId, findings);
+        if (findings.length) notify(ctx, target.bank, findings);
         phase = "storage";
         const checkedAt = Date.now();
-        for (const { record } of due) complete(record, checkedAt);
+        for (const [index, { file }] of due.entries()) saveCheck(file, { checkedAt, model: observed[index] });
     } catch (error) {
         failure = error instanceof CheckError ? error.category : phase;
+        if (phase === "request") {
+            try {
+                for (const { file, previous } of due) saveCheck(file, { ...previous, failed: true });
+            } catch {
+                log("Could not save mental model check availability");
+            }
+        }
     } finally {
         lock?.release();
         if (failure) log("Mental model check failed:", failure);
     }
 }
 
-function status(model: Model, retrying?: ReadonlySet<string>): Finding["status"] | undefined {
-    if (retrying?.has(model.id)) return undefined;
-    if (model.last_refresh_failed_at) return "paused";
-    if (model.is_stale === true) return "stale";
-    return undefined;
+function status(model: Model, retrying?: ReadonlySet<string>): ObservedModel["status"] {
+    if (retrying?.has(model.id)) return "Refreshing";
+    if (model.last_refresh_failed_at) return "Paused";
+    if (model.is_stale === true) return "Stale";
+    return model.is_stale === false ? "Current" : "Unknown";
+}
+
+function finding(status: ObservedModel["status"]): status is Finding["status"] {
+    return status === "Paused" || status === "Stale";
 }
 
 function isModel(value: unknown): value is Model {
@@ -171,7 +260,7 @@ async function listRetries(readPage: ReadPage): Promise<Set<string>> {
 
 function notify(ctx: ExtensionContext, bank: string, findings: Finding[]): void {
     const paused: string[] = [], stale: string[] = [];
-    for (const finding of findings) (finding.status === "paused" ? paused : stale).push(plain(finding.name));
+    for (const finding of findings) (finding.status === "Paused" ? paused : stale).push(plain(finding.name));
     const lines = [`Hindsight mental models in bank ${plain(bank)}`];
     if (paused.length) lines.push(`Paused: ${paused.join(", ")}. The last refresh failed. Automatic refresh waits until a refresh succeeds.`);
     if (stale.length) lines.push(`Stale: ${stale.join(", ")}. Newer memories exist since the last refresh.`);
@@ -185,18 +274,30 @@ function plain(text: string): string {
 }
 
 /** Atomic write; the caller holds the bank lock, so no other process writes this record meanwhile. */
-function complete(record: string, checkedAt: number): void {
+function saveCheck(record: string, result: SeedCheck): void {
     const temporary = record + ".tmp";
-    fs.writeFileSync(temporary, JSON.stringify({ checkedAt }), { mode: 0o600 });
+    fs.writeFileSync(temporary, JSON.stringify(result), { mode: 0o600 });
     fs.renameSync(temporary, record);
 }
 
-/** An unreadable or malformed record counts as never checked, so the next check overwrites it. */
-function recent(record: string): boolean {
-    let checkedAt: unknown;
-    try { checkedAt = JSON.parse(fs.readFileSync(record, "utf8")).checkedAt; }
-    catch { return false; }
-    if (typeof checkedAt !== "number") return false;
+function readCheck(record: string): SeedCheck {
+    try {
+        const { checkedAt, model, failed }: SeedCheck = JSON.parse(fs.readFileSync(record, "utf8"));
+        if (!isCount(checkedAt) || !validDate(checkedAt)) return { failed: failed === true };
+        const validModel = model === null || (model && typeof model.name === "string"
+            && MODEL_STATES.includes(model.status) && (model.refreshedAt == null || validDate(model.refreshedAt)));
+        return { checkedAt, model: validModel ? model : undefined, failed: failed === true };
+    } catch {
+        return {};
+    }
+}
+
+function validDate(value: unknown): value is number {
+    return typeof value === "number" && Math.abs(value) <= 8.64e15;
+}
+
+function recent(checkedAt: number | undefined): boolean {
+    if (checkedAt === undefined) return false;
     const age = Date.now() - checkedAt;
     return age >= 0 && age < CADENCE_MS;
 }
