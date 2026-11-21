@@ -7,7 +7,7 @@ const nudgeInterval = register({
     validate: value => { if (value !== undefined) validateInterval(value); },
 });
 const NON_WORK_TOOLS: Record<string, true | undefined> = {
-    recall: true, reflect: true, hindsight_evidence: true, retain: true, learn: true,
+    recall: true, reflect: true, hindsight_evidence: true, hindsight_curate: true, retain: true, learn: true,
     eval: true, multi_tool_use: true, "multi_tool_use.parallel": true, parallel: true,
     ask: true, todo: true, task: true, wait: true, context_notes: true, new_context: true,
     manage_skill: true, observer_resolve: true, observer_check: true, observer_review: true, observer_evaluation: true,
