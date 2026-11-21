@@ -1,6 +1,28 @@
 #!/bin/sh
 set -eu
-cd "$(git rev-parse --show-toplevel)"
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if (
+    unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
+    # Bracket globs match the root filenames without excluding directories of the same name.
+    git diff --cached --quiet --no-ext-diff --no-renames --ignore-submodules=none -- \
+        ':(exclude,glob)README[.]md' \
+        ':(exclude,glob)CHANGELOG[.]md' \
+        ':(exclude,glob)docs/**/*.md'
+); then
+    # Raw diff headers expose file modes without parsing Git's quoted paths.
+    staged_diff=$(git diff --cached --raw --no-color --no-ext-diff --no-renames --ignore-submodules=none)
+    if [ -n "$staged_diff" ] && printf '%s\n' "$staged_diff" | awk '
+        $1 !~ /^:(000000|100644)$/ || $2 !~ /^(000000|100644)$/ || $5 !~ /^[AMD]$/ { exit 1 }
+    '; then
+        exit 0
+    fi
+else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+fi
+
 # Checks the staged tree in a temp export, so unstaged edits and untracked files neither block the commit nor leak into the check.
 staged=$(mktemp -d -t precommit-XXXXXX)
 trap 'rm -rf "$staged"' EXIT

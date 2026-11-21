@@ -201,4 +201,6 @@ bun run check
 
 This runs the Bun test suite and bundles the extension into `.tmp/build`. Tests use synthetic configuration and fake Docker rather than your running Hindsight deployment.
 
-Enable the bundled git hooks in a clone with `git config core.hooksPath hooks`. `pre-commit` runs `bun run check` on an export of the staged files, so unstaged edits and untracked files neither block the commit nor reach the check; `commit-msg` refuses a subject without a conventional type, as in `fix: …` or `feat(scope): …`.
+Enable the bundled Git hooks in a clone with `git config core.hooksPath hooks`. The `pre-commit` hook skips checks when staged changes affect only non-executable regular documentation files: `README.md` and `CHANGELOG.md` at the root, or `.md` files anywhere under `docs/`. Changes to Markdown under `skills/` still trigger checks because the extension uses those files at runtime.
+
+For other commits, `pre-commit` runs `bun run check` on an export of the staged files. Unstaged edits and untracked files do not reach the check. The `commit-msg` hook requires a conventional subject such as `fix: …` or `feat(scope): …`.
