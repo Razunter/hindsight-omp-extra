@@ -6,6 +6,9 @@ export const ATTEMPT_ENTRY = "hindsight-curation-attempt";
 export const CURATION_LIMIT = 5;
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+export interface ReplacementIds { documentId: string; operationId: string }
+export type Decision = "duplicate" | "superseded" | "obsolete" | "replace";
+
 export interface Attempt {
     id: string;
     callId: string;
@@ -16,25 +19,35 @@ export interface Attempt {
     project: string;
     tags: string[];
     targetIds: string[];
+    decision: Decision;
     keeperId?: string;
+    replacement?: ReplacementIds;
 }
 
-export function findAttempt(session: ExtensionContext["sessionManager"], match: { id?: string; callId?: string }): Attempt | undefined {
+type AttemptSearch = { id: string } | { callId: string } | { replacementFor: string; connection: string };
+
+export function findAttempt(session: ExtensionContext["sessionManager"], match: AttemptSearch): Attempt | undefined {
     const branch = new Set(session.getBranch().map(entry => entry.id));
     const entries = session.getEntries();
     for (let i = entries.length - 1; i >= 0; i--) {
         const entry = entries[i]!;
         if (entry.type !== "custom" || entry.customType !== ATTEMPT_ENTRY || !entry.data || typeof entry.data !== "object") continue;
         const value = entry.data as Partial<Attempt>;
-        if (match.id !== undefined ? value.id !== match.id : value.callId !== match.callId) continue;
+        if ("id" in match ? value.id !== match.id : "callId" in match ? value.callId !== match.callId :
+            value.decision !== "replace" || value.connection !== match.connection || !Array.isArray(value.targetIds) || !value.targetIds.includes(match.replacementFor)) continue;
         if (typeof value.id !== "string" || !UUID.test(value.id) || typeof value.callId !== "string" ||
             value.sessionId !== session.getSessionId() || typeof value.connection !== "string" || !/^[0-9a-f]{64}$/.test(value.connection) ||
             typeof value.bank !== "string" || typeof value.project !== "string" || (value.scope !== "project" && value.scope !== "global") ||
             !Array.isArray(value.tags) || !value.tags.every(tag => typeof tag === "string") ||
             !Array.isArray(value.targetIds) || !value.targetIds.length || value.targetIds.length > CURATION_LIMIT ||
             !value.targetIds.every(id => typeof id === "string" && UUID.test(id)) || new Set(value.targetIds).size !== value.targetIds.length ||
-            (value.keeperId === undefined ? value.targetIds.length !== 1 : typeof value.keeperId !== "string" ||
-                !UUID.test(value.keeperId) || value.targetIds.includes(value.keeperId))) return;
+            !["duplicate", "superseded", "obsolete", "replace"].includes(value.decision as string) ||
+            (value.decision === "duplicate" || value.decision === "superseded"
+                ? typeof value.keeperId !== "string" || !UUID.test(value.keeperId) || value.targetIds.includes(value.keeperId) || value.replacement !== undefined
+                : value.keeperId !== undefined || value.targetIds.length !== 1 ||
+                    (value.decision === "replace" ? !value.replacement || typeof value.replacement.documentId !== "string" ||
+                        !/^curation-[0-9a-f-]{36}$/.test(value.replacement.documentId) ||
+                        typeof value.replacement.operationId !== "string" || !UUID.test(value.replacement.operationId) : value.replacement !== undefined))) return;
         if (!branch.has(entry.id)) {
             // OMP restore can rewind to the assistant's pending call, leaving an in-tool append on the old continuation.
             let parentId = entry.parentId;

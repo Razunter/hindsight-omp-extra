@@ -125,10 +125,13 @@ function currentScope(pi: ExtensionAPI, cwd: string): Scope {
 }
 
 export async function request(scope: Pick<Scope, "apiUrl" | "token" | "bank">, suffix: string, signal: AbortSignal, body?: RecordValue, method = body ? "POST" : "GET"): Promise<RecordValue> {
-    const url = scope.apiUrl + "/v1/default/banks/" + encodeURIComponent(scope.bank) + suffix;
+    return requestJson(scope.apiUrl + "/v1/default/banks/" + encodeURIComponent(scope.bank) + suffix, scope.token, signal, body, method);
+}
+
+export async function requestJson(url: string, token: string | undefined, signal: AbortSignal, body?: RecordValue, method = body ? "POST" : "GET"): Promise<RecordValue> {
     const response = await fetch(url, {
         method, redirect: "error", signal,
-        headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...(scope.token ? { Authorization: "Bearer " + scope.token } : {}) },
+        headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...(token ? { Authorization: "Bearer " + token } : {}) },
         ...(body ? { body: JSON.stringify(body) } : {}),
     });
     if (!response.ok) {

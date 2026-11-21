@@ -7,9 +7,10 @@ import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { computeBankScope } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
 import { isHindsightConfigured, loadHindsightConfig, type HindsightScoping } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { CURATION_LIMIT, UUID, connectionKey, findAttempt, recordAttempt, type Attempt } from "./curation-attempt";
+import { CURATION_LIMIT, UUID, connectionKey, findAttempt, recordAttempt, type Attempt, type Decision } from "./curation-attempt";
 import { confirmArchive } from "./curation-review";
-import { request } from "./evidence";
+import { exactRetainStrategy, observeReplacement, submitReplacement, unusedReplacementDocument, type CurationRequest, type ExactReplacement } from "./curation-retain";
+import { request, requestJson } from "./evidence";
 
 const TOOL = "hindsight_curate";
 const PASS = "skill-observer";
@@ -88,9 +89,9 @@ export function registerCuration(pi: ExtensionAPI): void {
     pi.registerTool({
         name: TOOL,
         label: "Hindsight curation",
-        description: "Review Hindsight facts during a user-started /observe pass. Investigate one cued lead. Call archive for exact duplicates with target and keeper IDs; call obsolete for one fact the user's note explicitly attests is obsolete and has no remaining use, including history. Both actions open their own native confirmation before any write. Do not ask separately. Reconcile an interrupted attempt by its recorded ID; this only reads. Report IDs and outcomes without quoting archived claims.",
+        description: "Review Hindsight facts during a user-started /observe pass. Investigate one cued lead. Archive with target and keeper IDs for duplicates or a first-hand correction with an existing keeper; use obsolete for a fact the note attests is obsolete without useful history; use replace for one incorrect fact when the note gives an exact replacement and confirms it preserves useful details. These actions open their own native review before any write. Do not ask separately. Reconcile an interrupted attempt by its recorded ID (read-only). Report IDs and outcomes, not archived wording.",
         parameters: pi.arktype({
-            action: "'investigate' | 'archive' | 'obsolete' | 'reconcile'", "lead?": "string | null",
+            action: "'investigate' | 'archive' | 'obsolete' | 'replace' | 'reconcile'", "lead?": "string | null",
             "targets?": "string[] | null", "keeper?": "string | null", "attempt?": "string | null",
         }),
         approval: "read",
@@ -109,7 +110,7 @@ export function registerCuration(pi: ExtensionAPI): void {
                 (leadRef == null || leadRef === "" || (typeof leadRef === "string" && UUID.test(leadRef))) && noTargets && noKeeper
                 : (attemptId == null || attemptId === "") && typeof leadRef === "string" && UUID.test(leadRef) &&
                     (action === "investigate" ? noTargets && noKeeper : haveTargets &&
-                        (action === "obsolete" ? targetIds.length === 1 && noKeeper :
+                        (action === "obsolete" || action === "replace" ? targetIds.length === 1 && noKeeper :
                             action === "archive" && typeof keeperId === "string" && UUID.test(keeperId) && !targetIds.includes(keeperId)));
             if (!valid) return outcome({ status: "error", reason: "invalid_input" });
             if (invocationSignal?.aborted) return outcome({ status: "error", reason: "cancelled" });
@@ -127,7 +128,7 @@ export function registerCuration(pi: ExtensionAPI): void {
                 if (!isDeepStrictEqual(getTarget(pi, ctx.cwd), target) || session.getCwd() !== ctx.cwd || session.getSessionFile() !== sessionFile) throw new Error("scope_changed");
             };
             const recorded = action === "reconcile" ? findAttempt(session, { id: attemptId as string })
-                : action === "archive" || action === "obsolete" ? findAttempt(session, { callId }) : undefined;
+                : action !== "investigate" ? findAttempt(session, { callId }) : undefined;
             if (recorded) return outcome(await reconcile(recorded, target, assertScope, invocationSignal));
             if (action === "reconcile") return outcome({ status: "unavailable", reason: "attempt_not_in_branch" });
 
@@ -140,20 +141,34 @@ export function registerCuration(pi: ExtensionAPI): void {
                 const current = activePass(ctx, generation);
                 if (current?.id !== pass.id || !current.leads.some(item => item.ref === lead.ref && item.kind === lead.kind && item.text === lead.text)) throw new Error("pass_changed");
             };
-            if (action === "archive" || action === "obsolete") {
+            if (action !== "investigate") {
                 if (reviewing) return outcome({ status: "unavailable", reason: "another_review_open" });
                 if (!investigation || investigation.passId !== pass.id || investigation.lead !== lead.ref || !isDeepStrictEqual(investigation.target, target)) {
                     return outcome({ status: "unavailable", reason: "investigate_first" });
                 }
                 const candidates = investigation.candidates;
                 const originals = (targetIds as string[]).map(id => candidates.find(candidate => candidate.fact.id === id));
-                const keeper = candidates.find(candidate => candidate.fact.id === keeperId);
+                let keeper = candidates.find(candidate => candidate.fact.id === keeperId);
                 if (!originals.every((item): item is Candidate => item !== undefined)) {
                     return outcome({ status: "unavailable", reason: action === "archive" ? "no_complete_same_scope_keeper" : "target_not_in_investigation" });
                 }
-                if (action === "archive" && (!keeper || !originals.every(item => duplicateOf(item, keeper)))) {
-                    return outcome({ status: "unavailable", reason: "no_complete_same_scope_keeper" });
-                }
+                const first = originals[0]!.fact;
+                const correction = correctionText(lead, first.id);
+                let decision: Decision;
+                if (action === "archive") {
+                    if (keeper && originals.every(item => duplicateOf(item, keeper!))) decision = "duplicate";
+                    else if (keeper && originals.length === 1 && supersedes(lead, first, keeper.fact, correction)) decision = "superseded";
+                    else return outcome({ status: "unavailable", reason: "no_complete_same_scope_keeper" });
+                } else if (action === "replace") {
+                    if (!correction || correction === first.text) return outcome({ status: "unavailable", reason: "exact_firsthand_correction_required" });
+                    keeper = candidates.find(candidate => supersedes(lead, first, candidate.fact, correction));
+                    decision = keeper ? "superseded" : "replace";
+                    if (!keeper) {
+                        const previous = findAttempt(session, { replacementFor: first.id, connection: connectionKey(sessionId, target) });
+                        if (previous) return outcome({ ...await reconcile(previous, target, assertScope, invocationSignal),
+                            reason: "replacement_attempt_exists", note: "A retain was already attempted. Reconcile it or review an active keeper; no retain was submitted again." });
+                    }
+                } else decision = "obsolete";
                 if (action === "obsolete") {
                     const attestation = `I confirm Hindsight fact ${originals[0]!.fact.id} is obsolete and has no remaining use, including as history.`;
                     if (lead.kind !== "note" || !lead.text.split(/(?<=[.!?])\s+|\r?\n/).some(line => line.trim().toLowerCase() === attestation.toLowerCase())) {
@@ -163,7 +178,7 @@ export function registerCuration(pi: ExtensionAPI): void {
                 }
                 reviewing = true;
                 try {
-                    return outcome(await archiveFacts(pi, ctx, callId, target, lead, originals, keeper, assertCurrent, invocationSignal));
+                    return outcome(await archiveFacts(pi, ctx, callId, target, lead, { originals, keeper, decision, correction }, assertCurrent, invocationSignal));
                 } catch (error) {
                     return outcome({ status: "error", reason: invocationSignal?.aborted ? "cancelled" : changeReason(error) });
                 } finally { reviewing = false; }
@@ -287,18 +302,48 @@ function duplicateOf(target: Candidate, keeper: Candidate): boolean {
                 Boolean(target.source.provenance.source) && isDeepStrictEqual(target.source.provenance, keeper.source.provenance)));
 }
 
-type Read = (suffix: string, body?: JsonObject, method?: string) => Promise<JsonObject>;
-function scopedRequest(target: CurationTarget, assertCurrent: () => void, signal?: AbortSignal): Read {
+function correctionText(lead: Lead, id: string): string | undefined {
+    if (lead.kind !== "note") return;
+    const match = new RegExp(`(?:^|[.!?]\\s+|\\r?\\n)I confirm Hindsight fact ${id} is incorrect and the exact correction preserves its still-useful details\\. Exact replacement: ([^\\r\\n]+)$`, "i").exec(lead.text);
+    return match?.[1];
+}
+
+function supersedes(lead: Lead, original: CuratableFact, keeper: CuratableFact, correction: string | undefined): boolean {
+    if (lead.kind !== "note" || original.id === keeper.id) return false;
+    const material = ({ id, text, document_id, chunk_id, edited_at, ...claim }: CuratableFact) => claim;
+    if (!isDeepStrictEqual(material(original), material(keeper))) return false;
+    if (correction === keeper.text) return true;
+    const attestation = `I confirm Hindsight fact ${original.id} is superseded by ${keeper.id} and the keeper preserves its still-useful details.`;
+    return lead.text.split(/(?<=[.!?])\s+|\r?\n/).some(sentence => sentence.trim().toLowerCase() === attestation.toLowerCase());
+}
+
+function exactReplacement(fact: CuratableFact, text: string) {
+    if (fact.type !== "world" || fact.occurred_start !== null || fact.occurred_end !== null || fact.entities.length ||
+        fact.mentioned_at !== (fact.date || null) || !text.trim() || text !== text.trim() || Buffer.byteLength(text) > 3_000 ||
+        /[\p{C}\p{Zl}\p{Zp}]|⟦hs-att:/u.test(text)) return;
+    return { type: "world", text, date: fact.date, context: fact.context, tags: fact.tags, metadata: fact.metadata };
+}
+
+function matchesReplacement(fact: CuratableFact, draft: ExactReplacement, documentId: string) {
+    return fact.document_id === documentId && fact.type === "world" && fact.text === draft.text && fact.context === draft.context &&
+        fact.date === draft.date && fact.mentioned_at === (draft.date || null) && fact.occurred_start === null && fact.occurred_end === null &&
+        fact.entities.length === 0 && isDeepStrictEqual(fact.tags, draft.tags) && isDeepStrictEqual(fact.metadata, draft.metadata);
+}
+
+
+function scopedRequest(target: CurationTarget, assertCurrent: () => void, signal?: AbortSignal): CurationRequest {
     return (suffix, body, method) => {
         assertCurrent();
         const deadline = AbortSignal.timeout(target.timeout);
-        return request(target, suffix, signal ? AbortSignal.any([deadline, signal]) : deadline, body, method);
+        const requestSignal = signal ? AbortSignal.any([deadline, signal]) : deadline;
+        return suffix === "/openapi.json" ? requestJson(target.apiUrl + suffix, target.token, requestSignal) : request(target, suffix, requestSignal, body, method);
     };
 }
 
-function archiveReason(attempt: Attempt): string {
-    const explanation = attempt.keeperId ? `Duplicate of ${attempt.keeperId}; same claim, scope and material metadata.`
-        : "The operator confirmed the fact is obsolete and has no remaining use, including as history.";
+function archiveReason(attempt: Attempt, keeperId = attempt.keeperId): string {
+    const explanation = attempt.decision === "duplicate" ? `Duplicate of ${keeperId}; same claim, scope and material metadata.`
+        : attempt.decision === "obsolete" ? "The operator confirmed the fact is obsolete and has no remaining use, including as history."
+        : `Superseded by ${keeperId ?? `the verified fact from document ${attempt.replacement!.documentId}`}; first-hand correction preserving useful details.`;
     return `${explanation} Curation attempt ${attempt.id}.`;
 }
 
@@ -309,7 +354,7 @@ function archiveSummary(attempt: Attempt) {
 }
 
 async function readArchiveState(
-    read: Read, target: CurationTarget, attempt: Attempt, id: string, assertCurrent: () => void, expected?: CuratableFact,
+    read: CurationRequest, target: CurationTarget, attempt: Attempt, id: string, assertCurrent: () => void, expected?: CuratableFact, keeperId = attempt.keeperId,
 ): Promise<"unchanged" | "observedArchived" | "unknown" | "conflictingReason"> {
     try {
         const actual = await read("/memories/" + id);
@@ -319,7 +364,8 @@ async function readArchiveState(
         if (!fact || fact.scope.kind !== attempt.scope || !isDeepStrictEqual(fact.tags, attempt.tags) ||
             (expected && !isDeepStrictEqual(fact, expected))) return "unknown";
         if (!archived) return "unchanged";
-        return actual.invalidation_reason === archiveReason(attempt) ? "observedArchived" : "conflictingReason";
+        if (attempt.replacement && !keeperId) return "unknown";
+        return actual.invalidation_reason === archiveReason(attempt, keeperId) ? "observedArchived" : "conflictingReason";
     } catch { return "unknown"; }
 }
 
@@ -327,42 +373,70 @@ async function reconcile(attempt: Attempt, target: CurationTarget | undefined, a
     const summary = archiveSummary(attempt);
     if (!target || attempt.connection !== connectionKey(attempt.sessionId, target) || target.bank !== attempt.bank || target.project !== attempt.project ||
         classifyScope(attempt.tags, target)?.kind !== attempt.scope) {
-        return { status: "unverified", reason: "scope_changed", ...summary, unknown: attempt.targetIds };
+        return { status: "unverified", reason: "scope_changed", ...summary, unknown: attempt.targetIds,
+            ...(attempt.replacement ? { replacement: { ...attempt.replacement, state: "unknown" } } : {}) };
     }
     const read = scopedRequest(target, assertCurrent, signal);
-    const states = await Promise.all(attempt.targetIds.map(id => readArchiveState(read, target, attempt, id, assertCurrent)));
+    const replacement = attempt.replacement && await observeReplacement(read, attempt.replacement, attempt.tags, false);
+    if (replacement?.state === "observed") {
+        try {
+            const fact = parseFact(await read("/memories/" + replacement.factId), target, replacement.factId);
+            assertCurrent();
+            if (fact && fact.document_id === attempt.replacement?.documentId && fact.scope.kind === attempt.scope &&
+                isDeepStrictEqual(fact.tags, attempt.tags) && fact.type === "world") summary.keeper = fact.id;
+        } catch { /* Report only what was observed. */ }
+    }
+    const states = await Promise.all(attempt.targetIds.map(id => readArchiveState(read, target, attempt, id, assertCurrent, undefined, summary.keeper)));
     for (const [index, state] of states.entries()) {
         if (state === "conflictingReason") summary.unknown.push(attempt.targetIds[index]!);
         summary[state].push(attempt.targetIds[index]!);
     }
-    return { status: summary.unknown.length ? "unverified" : "observed", ...summary,
+    return { status: summary.unknown.length ? "unverified" : "observed", ...summary, ...(replacement ? { replacement } : {}),
         note: "Readback only. The attempt record does not store previous fact text or prove who changed a fact." };
 }
 
 async function archiveFacts(
     pi: ExtensionAPI, ctx: ExtensionContext, callId: string, target: CurationTarget, lead: Lead,
-    originals: Candidate[], keeper: Candidate | undefined, assertCurrent: () => void, signal?: AbortSignal,
+    plan: { originals: Candidate[]; keeper?: Candidate; decision: Decision; correction?: string }, assertCurrent: () => void, signal?: AbortSignal,
 ): Promise<JsonObject> {
+    const { originals, decision, correction } = plan;
+    let { keeper } = plan;
     const first = originals[0]!.fact;
     const session = ctx.sessionManager;
     const sessionId = session.getSessionId();
+    const read = scopedRequest(target, assertCurrent, signal);
+    let draft: ExactReplacement | undefined;
+    if (decision === "replace") {
+        const fields = exactReplacement(first, correction!);
+        if (!fields) return { status: "unavailable", reason: "replacement_does_not_fit_exact_retain",
+            note: "Find an active same-scope keeper preserving the fact's type and metadata. The original was not changed." };
+        const capability = await exactRetainStrategy(read, target.bank, fields.text);
+        assertCurrent();
+        if (!capability.strategy) return { status: "unavailable", reason: capability.reason,
+            note: "No verified exact-retain path. Find an active keeper before archiving the original." };
+        draft = { ...fields, strategy: capability.strategy };
+    }
     const attempt: Attempt = {
         id: randomUUID(), callId, sessionId, connection: connectionKey(sessionId, target),
         bank: target.bank, scope: first.scope.kind, project: target.project, tags: first.tags,
-        targetIds: originals.map(item => item.fact.id), ...(keeper ? { keeperId: keeper.fact.id } : {}),
+        targetIds: originals.map(item => item.fact.id), decision, ...(keeper ? { keeperId: keeper.fact.id } : {}),
+        ...(draft ? { replacement: { documentId: `curation-${randomUUID()}`, operationId: randomUUID() } } : {}),
     };
-    const reason = archiveReason(attempt);
+    const action = decision === "duplicate" ? `archive ${originals.length} duplicate fact(s)`
+        : decision === "obsolete" ? "archive one obsolete fact without a replacement"
+        : decision === "superseded" ? "archive one fact superseded by an active keeper" : "retain an exact replacement, then archive one fact";
     const review = [
-        `Action: ${keeper ? `archive ${originals.length} duplicate fact(s)` : "archive one obsolete fact without a replacement"}. Bank: ${target.bank}. Scope: ${first.scope.kind}. Project: ${target.project}.`,
+        `Action: ${action}. Bank: ${target.bank}. Scope: ${first.scope.kind}. Project: ${target.project}.`,
         `Audience tags: ${JSON.stringify(first.tags)}. Archive removes these facts from recall, including historical recall.`,
         `Evidence (${lead.kind}): ${lead.text}`,
-        `Reason: ${reason}`,
+        `Reason: ${archiveReason(attempt)}`,
         ...originals.map(item => `Archive ${item.fact.id}:\n${JSON.stringify(item, null, 2)}`),
-        keeper ? `Keep active ${keeper.fact.id}:\n${JSON.stringify(keeper, null, 2)}` : "No replacement. The operator attested that this fact has no remaining use.",
+        keeper ? `Keep active ${keeper.fact.id}:\n${JSON.stringify(keeper, null, 2)}`
+            : draft ? `Exact replacement:\n${JSON.stringify(draft, null, 2)}\nDocument: ${attempt.replacement!.documentId}\nThe new fact can remain active if archive fails or is refused.`
+            : "No replacement. The operator attested that this fact has no remaining use.",
     ].join("\n\n");
     const approval = await confirmArchive(ctx.ui, review, signal);
     if (approval !== "approved") return { status: "unavailable", reason: approval ?? "declined" };
-    const read = scopedRequest(target, assertCurrent, signal);
     const recheck = async (candidates: Candidate[]) => {
         const snapshots = await Promise.all(candidates.map(async previous => {
             const fact = parseFact(await read("/memories/" + previous.fact.id), target, previous.fact.id);
@@ -378,6 +452,38 @@ async function archiveFacts(
     if (!await recordAttempt(pi, session, attempt)) return { status: "error", reason: "attempt_not_saved" };
 
     const summary = archiveSummary(attempt);
+    let replacement: JsonObject | undefined;
+    if (draft && attempt.replacement) {
+        const ids = attempt.replacement;
+        const capability = await exactRetainStrategy(read, target.bank, draft.text);
+        if (capability.strategy !== draft.strategy || !await unusedReplacementDocument(read, ids)) {
+            return { status: "unavailable", reason: "retain_capability_or_document_changed", ...summary };
+        }
+        if (!await recheck(originals)) return { status: "unavailable", reason: "reviewed_fact_changed", ...summary };
+        const acknowledged = await submitReplacement(read, target.bank, ids, draft);
+        const observed = await observeReplacement(read, ids, attempt.tags, true);
+        replacement = { ...observed, acknowledged };
+        if (observed.state === "observed") {
+            try {
+                const fact = parseFact(await read("/memories/" + observed.factId), target, observed.factId);
+                assertCurrent();
+                if (fact && matchesReplacement(fact, draft, ids.documentId)) {
+                    const source = await supportingSource(fact, target, {}, undefined, read);
+                    assertCurrent();
+                    if (source.status !== "foreign_project") keeper = { fact, source };
+                }
+            } catch { /* The replacement must be positively verified before archive. */ }
+            replacement.state = keeper ? "verified" : "mismatch";
+        }
+        if (!keeper) {
+            const original = originals[0]!.fact;
+            const state = await readArchiveState(read, target, attempt, original.id, assertCurrent, original);
+            summary[state].push(original.id);
+            return { status: "unverified", reason: "replacement_not_verified", ...summary, replacement };
+        }
+        summary.keeper = keeper.fact.id;
+    }
+    const reason = archiveReason(attempt, summary.keeper);
     let stopped = false;
     let failure: string | undefined;
     for (const item of originals) {
@@ -390,7 +496,7 @@ async function archiveFacts(
                 acknowledged = true;
             } catch (error) { failure = changeReason(error); }
         }
-        const state = await readArchiveState(read, target, attempt, id, assertCurrent, item.fact);
+        const state = await readArchiveState(read, target, attempt, id, assertCurrent, item.fact, summary.keeper);
         if (acknowledged && state === "observedArchived") summary.archived.push(id);
         else {
             stopped = true;
@@ -398,8 +504,9 @@ async function archiveFacts(
             summary[state].push(id);
         }
     }
-    const status = !stopped ? "ok" : summary.archived.length ? "partial" : "unverified";
-    return { status, ...(failure ? { reason: failure } : {}), ...summary };
+    const status = !stopped ? "ok" : summary.archived.length ? "partial"
+        : replacement && summary.keeper && summary.unchanged.length === originals.length ? "retained_only" : "unverified";
+    return { status, ...(failure ? { reason: failure } : {}), ...summary, ...(replacement ? { replacement } : {}) };
 }
 
 async function investigate(target: CurationTarget, lead: Lead, signal: AbortSignal, assertCurrent: () => void) {

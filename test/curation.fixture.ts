@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -85,8 +85,8 @@ const saved = lead();
 const synthetic = { role: "user", content: [{ type: "text", text: "Continue" }], synthetic: true, attribution: "agent", timestamp: Date.parse(timestamp) + 2 };
 const providerMessage = (entry: Entry) => ({ role: "custom", customType: "skill-observer", display: false, attribution: "user", timestamp: Date.parse(String(entry.timestamp)), content: entry.content, details: entry.details });
 const custom = providerMessage(saved);
-const run = async (params: unknown = { action: "investigate", lead: ref }, signal?: AbortSignal) => {
-    const result = await tool.execute("fixture", params, signal, undefined, ctx);
+const run = async (params: unknown = { action: "investigate", lead: ref }, signal?: AbortSignal, callId = "fixture") => {
+    const result = await tool.execute(callId, params, signal, undefined, ctx);
     return { error: result.isError === true, raw: result.content[0].text, body: JSON.parse(result.content[0].text) };
 };
 const cue = async (messages: Entry[] = [custom, synthetic]) => JSON.stringify(await emit("context", messages));
@@ -104,6 +104,9 @@ const chunks: Entry = {};
 let recallOverride: Entry | undefined;
 let afterRecall: (() => void) | undefined;
 let patchMode: "ack" | "lost" | "conflict" = "ack";
+let retainMode: "ack" | "lost" | "wrong_type" | "wrong_date" | "extra" | "archived_extra" | "missing" | "incompatible" | "unsupported_archive" | "deny_archive" = "ack";
+const operations = new Map<string, string>();
+const extraId = "49f1eb83-39f1-4761-a997-61b69a139925";
 const prefix = () => `/v1/default/banks/${settings.scoping === "per-project" ? "team-bank-project" : "team-bank"}`;
 process.env.NO_PROXY = [process.env.NO_PROXY, "127.0.0.1"].filter(Boolean).join(",");
 process.env.no_proxy = process.env.NO_PROXY;
@@ -111,14 +114,65 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) 
     const url = new URL(request.url);
     const body = request.method === "POST" || request.method === "PATCH" ? await request.json() : undefined;
     requests.push({ method: request.method, path: url.pathname, query: url.search, body });
-    if (!url.pathname.startsWith(prefix() + "/") || request.headers.get("Authorization") !== "Bearer fixture-token") return new Response(null, { status: 403 });
+    if (request.headers.get("Authorization") !== "Bearer fixture-token") return new Response(null, { status: 403 });
+    if (request.method === "GET" && url.pathname === "/openapi.json") {
+        return Response.json({ paths: {
+            "/v1/default/banks/{bank_id}/memories/{memory_id}": retainMode === "unsupported_archive" ? { get: {} } : { get: {}, patch: {} },
+            "/v1/default/banks/{bank_id}/memories": { post: {} },
+            "/v1/default/banks/{bank_id}/memories/list": { get: {} },
+            "/v1/default/banks/{bank_id}/operations/{operation_id}": { get: {} },
+        }, components: { schemas: { RetainRequest: { properties: { operation_id: {}, async: {} } }, MemoryItem: { properties: { strategy: {} } } } } });
+    }
+    if (!url.pathname.startsWith(prefix() + "/")) return new Response(null, { status: 404 });
     const route = url.pathname.slice(prefix().length);
     if (request.method === "POST" && route === "/memories/recall") {
         const result = recallOverride ?? { results: [...facts.values()].map(({ id, type, document_id, chunk_id }) => ({ id, type, document_id, chunk_id, text: "Never trust this recall preview" })), chunks };
         afterRecall?.();
         return Response.json(result);
     }
+    if (request.method === "GET" && route === "/config") {
+        return Response.json({ bank_id: prefix().split("/").at(-1), config: { retain_strategies: {
+            exact: { retain_extraction_mode: retainMode === "incompatible" ? "verbose" : "chunks", retain_chunk_size: 1000 },
+        } } });
+    }
+    if (request.method === "GET" && route.startsWith("/operations/")) {
+        const operation_id = route.split("/").at(-1)!;
+        const document_id = operations.get(operation_id);
+        return document_id ? Response.json({ operation_id, operation_type: "batch_retain", status: "completed", result_metadata: { document_id, extraction_errors_count: 0 } }) : new Response(null, { status: 404 });
+    }
+    if (request.method === "GET" && route === "/memories/list") {
+        const documentId = url.searchParams.get("document_id");
+        const state = url.searchParams.get("state") ?? "valid";
+        const items = [...facts.values()].filter(item => item.document_id === documentId && item.state === state).map(item => ({ ...item, fact_type: item.type }));
+        return Response.json({ items, total: items.length, offset: 0, limit: 2 });
+    }
+    if (request.method === "POST" && route === "/memories") {
+        const request = body as { async: boolean; operation_id: string; items: Entry[] };
+        assert.equal(request.async, true);
+        assert.equal(request.items.length, 1);
+        const [item] = request.items;
+        const documentId = String(item?.document_id);
+        assert.equal(item?.strategy, "exact");
+        assert.equal(item?.resolve_entities, false);
+        assert.equal(operations.has(request.operation_id), false);
+        assert.ok(![...facts.values()].some(fact => fact.document_id === documentId));
+        const attempt = readFileSync(sessionFile, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).at(-1);
+        assert.equal(attempt?.customType, "hindsight-curation-attempt");
+        assert.match(JSON.stringify(attempt.data), new RegExp(request.operation_id));
+        assert.match(JSON.stringify(attempt.data), new RegExp(documentId));
+        assert.doesNotMatch(JSON.stringify(attempt.data), /Quill uses|fixture-token/);
+        operations.set(request.operation_id, documentId);
+        const date = retainMode === "wrong_date" ? "2025-12-01T00:00:00.000Z" : item?.timestamp === "unset" ? "" : item?.timestamp;
+        const row = rawFact(ids[2]!, { text: item?.content, date, mentioned_at: date || null, entities: [],
+            type: retainMode === "wrong_type" ? "experience" : "world", tags: item?.tags, metadata: item?.metadata, context: item?.context, document_id: documentId });
+        if (retainMode !== "missing") facts.set(ids[2]!, row);
+        if (retainMode === "extra" || retainMode === "archived_extra") facts.set(extraId, { ...row, id: extraId,
+            state: retainMode === "archived_extra" ? "invalidated" : "valid" } as typeof row);
+        return retainMode === "lost" ? new Response(null, { status: 502 })
+            : Response.json({ operation_id: request.operation_id, async: true, success: true, bank_id: prefix().split("/").at(-1) });
+    }
     if (request.method === "PATCH" && route.startsWith("/memories/")) {
+        if (retainMode === "deny_archive") return new Response(null, { status: 403 });
         const id = route.split("/").at(-1)!;
         const fact = facts.get(id);
         assert.equal(fact?.state, "valid");
@@ -134,7 +188,7 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) 
     }
     if (request.method === "GET" && route === "/documents") {
         const item = docs.get(url.searchParams.get("q") ?? "");
-        return Response.json({ items: item ? [item] : [], total: item ? 1 : 0, offset: 0, limit: 5 });
+        return Response.json({ items: item ? [item] : [], total: item ? 1 : 0, offset: 0, limit: Number(url.searchParams.get("limit")) });
     }
     return new Response(null, { status: 404 });
 } });
@@ -463,4 +517,59 @@ try {
     assert.deepEqual(requests.filter(request => request.method !== "GET").map(request => [request.method, request.path]), [
         ["PATCH", `${prefix()}/memories/${ids[0]}`],
     ]);
+
+    const corrected = "Quill uses the GREEN fixture release key.";
+    const correction = `Hindsight has the wrong Quill fixture release key. I confirm Hindsight fact ${ids[0]} is incorrect and the exact correction preserves its still-useful details. Exact replacement: ${corrected}`;
+    const replace = () => run({ action: "replace", lead: ref, targets: [ids[0]] });
+    for (const mode of ["incompatible", "unsupported_archive", "wrong_type", "wrong_date", "extra", "archived_extra", "missing", "deny_archive", "lost", "ack"] as const) {
+        facts.clear();
+        docs.clear();
+        operations.clear();
+        facts.set(ids[0]!, rawFact(ids[0]!, { text: "Quill uses the obsolete BLUE fixture release key.", date: timestamp, entities: [] }));
+        branch = [lead({ id: "correction-pass", text: correction })];
+        retainMode = mode;
+        await run();
+        requests.length = 0;
+        const result = await replace();
+        const writes = requests.filter(request => request.method !== "GET");
+        if (mode === "incompatible" || mode === "unsupported_archive") {
+            assert.equal(result.body.status, "unavailable", mode);
+            assert.equal(writes.length, 0, mode);
+            assert.equal(facts.get(ids[0]!)?.state, "valid");
+            continue;
+        }
+        assert.equal(writes.filter(write => write.method === "POST").length, 1, mode);
+        assert.match(review, /can remain active if/i);
+        assert.ok(review.includes(corrected));
+        assert.doesNotMatch(result.raw, /Quill uses/);
+        assert.equal(typeof result.body.replacement.documentId, "string");
+        assert.equal(typeof result.body.replacement.operationId, "string");
+        if (mode === "ack" || mode === "lost") {
+            assert.deepEqual(result.body.archived, [ids[0]], mode);
+            assert.equal(result.body.keeper, ids[2]);
+            assert.equal(facts.get(ids[2]!)?.text, corrected);
+            assert.equal(facts.get(ids[2]!)?.date, timestamp);
+        } else {
+            assert.deepEqual(result.body.unchanged, [ids[0]], mode);
+            assert.equal(facts.get(ids[0]!)?.state, "valid", mode);
+            assert.equal(writes.some(write => write.method === "PATCH"), mode === "deny_archive", mode);
+        }
+        if (mode === "missing") {
+            requests.length = 0;
+            const repeated = await run({ action: "replace", lead: ref, targets: [ids[0]] }, undefined, "not-a-retry");
+            assert.equal(repeated.body.reason, "replacement_attempt_exists");
+            assert.equal(repeated.body.replacement.operationId, result.body.replacement.operationId);
+            assert.ok(requests.every(request => request.method === "GET"));
+        }
+        if (mode === "deny_archive") {
+            assert.equal(result.body.status, "retained_only");
+            assert.equal(result.body.keeper, ids[2]);
+            retainMode = "ack";
+            await run();
+            requests.length = 0;
+            const reused = await run({ action: "archive", lead: ref, targets: [ids[0]], keeper: ids[2] }, undefined, "new-keeper-review");
+            assert.deepEqual(reused.body.archived, [ids[0]], "a new confirmation can reuse the verified replacement without another retain");
+            assert.ok(requests.every(request => request.method !== "POST"));
+        }
+    }
 } finally { server.stop(true); rmSync(sessionDir, { recursive: true, force: true }); }
