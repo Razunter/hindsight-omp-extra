@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 const cwd = "/repo/project";
@@ -24,6 +26,7 @@ Bun.plugin({ name: "curation-native-host", setup(build) {
         },
     });
     module("@oh-my-pi/pi-natives/vcs", { repo: () => undefined });
+    module("@oh-my-pi/pi-tui", { matchesKey: (input: string, key: string) => input === key, wrapTextWithAnsi: (text: string) => text.split("\n") });
 } });
 // Install the native host module doubles before loading the registered extension.
 const { registerCuration } = await import("../src/curation");
@@ -36,9 +39,15 @@ type EventHandler = (event: { messages?: Entry[] }, ctx: Context) => unknown;
 const tools = new Map<string, Tool>();
 const handlers = new Map<string, EventHandler[]>();
 let enabled = true;
+const sessionDir = mkdtempSync(path.join(tmpdir(), "hindsight-curation-fixture-"));
+const sessionFile = path.join(sessionDir, "session.jsonl");
+let persist = true;
 registerCuration({
     pi: { settings }, arktype() { return {}; },
     on(name: string, handler: EventHandler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+    appendEntry(customType: string, data: unknown) {
+        branch.push({ type: "custom", customType, data, id: `custom-${branch.length}`, parentId: branch.at(-1)?.id });
+    },
     registerTool(tool: Tool) { tools.set(tool.name, tool); },
     getActiveTools: () => enabled ? ["eval", "hindsight_curate"] : ["eval"],
 } as unknown as Parameters<typeof registerCuration>[0]);
@@ -52,7 +61,14 @@ const nativeForm = async () => { throw new Error("Investigation must not open a 
 const ctx = {
     cwd, mode: "tui", hasUI: true, agent: { kind: "main" },
     ui: { formDialog: nativeForm as typeof nativeForm | undefined, custom: nativeForm as typeof nativeForm | undefined },
-    sessionManager: { getBranch: () => [...branch], getEntries: () => [...branch], getCwd: () => liveCwd, getSessionId: () => liveSession },
+    sessionManager: {
+        getBranch: () => [...branch], getEntries: () => [...branch], getCwd: () => liveCwd, getSessionId: () => liveSession,
+        getSessionFile: () => sessionFile, getLeafId: () => branch.at(-1)?.id,
+        async ensureOnDisk() {
+            if (!persist) throw new Error("Session record unavailable");
+            writeFileSync(sessionFile, branch.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+        },
+    },
     setTimeout() {}, setInterval() {},
 };
 const emit = (event: string, messages?: Entry[]) => Promise.all((handlers.get(event) ?? []).map(handler => handler({ messages }, ctx)));
@@ -84,12 +100,13 @@ const docs = new Map<string, Entry>();
 const chunks: Entry = {};
 let recallOverride: Entry | undefined;
 let afterRecall: (() => void) | undefined;
+let patchMode: "ack" | "lost" | "conflict" = "ack";
 const prefix = () => `/v1/default/banks/${settings.scoping === "per-project" ? "team-bank-project" : "team-bank"}`;
 process.env.NO_PROXY = [process.env.NO_PROXY, "127.0.0.1"].filter(Boolean).join(",");
 process.env.no_proxy = process.env.NO_PROXY;
 const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const url = new URL(request.url);
-    const body = request.method === "POST" ? await request.json() : undefined;
+    const body = request.method === "POST" || request.method === "PATCH" ? await request.json() : undefined;
     requests.push({ method: request.method, path: url.pathname, query: url.search, body });
     if (!url.pathname.startsWith(prefix() + "/") || request.headers.get("Authorization") !== "Bearer fixture-token") return new Response(null, { status: 403 });
     const route = url.pathname.slice(prefix().length);
@@ -97,6 +114,16 @@ const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) 
         const result = recallOverride ?? { results: [...facts.values()].map(({ id, type, document_id, chunk_id }) => ({ id, type, document_id, chunk_id, text: "Never trust this recall preview" })), chunks };
         afterRecall?.();
         return Response.json(result);
+    }
+    if (request.method === "PATCH" && route.startsWith("/memories/")) {
+        const id = route.split("/").at(-1)!;
+        const fact = facts.get(id);
+        assert.equal(fact?.state, "valid");
+        assert.deepEqual(Object.keys(body as object).sort(), ["reason", "state"]);
+        assert.equal((body as Entry).state, "invalidated");
+        const reason = patchMode === "conflict" ? "Another operator archived it" : String((body as Entry).reason);
+        facts.set(id, { ...fact!, state: "invalidated", invalidated_at: timestamp, invalidation_reason: reason } as never);
+        return patchMode === "lost" ? new Response(null, { status: 502 }) : Response.json(facts.get(id));
     }
     if (request.method === "GET" && route.startsWith("/memories/")) {
         const fact = facts.get(route.split("/").at(-1)!);
@@ -118,6 +145,9 @@ try {
     assert.match(await cue(), /hindsight_curate/);
     assert.equal(requests.length, 0, "a cue must not start recall");
     const result = await run();
+    assert.equal((await run({ action: "investigate", lead: ref, targets: [], keeper: "" })).body.status, "ok",
+        "strict provider tool schemas can fill unused optional arguments with empty values");
+    requests.splice(4);
     assert.equal(result.error, false);
     assert.equal(result.body.status, "ok");
     assert.equal(result.body.bank, "team-bank");
@@ -279,4 +309,81 @@ try {
     assert.equal(capped.body.truncated, true);
     assert.equal(capped.body.facts.length, 5);
     assert.equal(requests.length, 6);
-} finally { server.stop(true); }
+
+    const duplicate = 'Quill uses the "blue" calibration dial.\nKeep this line <literal>.';
+    const prepare = async () => {
+        branch = [current];
+        facts.clear();
+        for (const id of ids.slice(0, 2)) facts.set(id, rawFact(id, { text: duplicate }));
+        await run();
+        requests.length = 0;
+    };
+    const archive = () => run({ action: "archive", lead: ref, targets: [ids[0]], keeper: ids[1] });
+    let review = "";
+    const answer = (key: string, duringReview?: () => void, readAll = true) => async (factory: Function) => {
+        let decision: unknown;
+        const component = factory({ terminal: { rows: 28, columns: 180 }, requestRender() {} }, {}, {}, (value: unknown) => { decision = value; });
+        review = component.render(180).join("\n");
+        duringReview?.();
+        for (let page = 0; readAll && !review.includes("a Archive") && page < 10; page++) {
+            component.handleInput("pageDown");
+            review += "\n" + component.render(180).join("\n");
+        }
+        component.handleInput(key);
+        return decision;
+    };
+    for (const [mode, key, edit] of [
+        ["declined", "enter", undefined],
+        ["dismissed", "escape", undefined],
+        ["branch changed", "a", () => { branch = [current, { type: "reset_boundary" }]; }],
+        ["token changed", "a", () => { settings.hindsightApiToken = "changed"; }],
+        ["keeper changed", "a", () => { facts.set(ids[1], rawFact(ids[1], { text: "historical distinction" })); }],
+    ] as const) {
+        await prepare();
+        ctx.ui.custom = answer(key, edit) as unknown as typeof nativeForm;
+        await archive();
+        assert.equal(requests.some(request => request.method === "PATCH"), false, mode);
+        settings.hindsightApiToken = "fixture-token";
+    }
+    await prepare();
+    ctx.ui.custom = answer("a", undefined, false) as unknown as typeof nativeForm;
+    assert.equal((await archive()).body.reason, "declined", "approval before the last page cannot authorize a shortened review");
+    assert.equal(requests.some(request => request.method === "PATCH"), false);
+
+    const timeout = AbortSignal.timeout;
+    try {
+        AbortSignal.timeout = ms => ms === 120_000 ? AbortSignal.abort() : timeout(ms);
+        ctx.ui.custom = (async (_factory: unknown, options: { signal: AbortSignal }) => options.signal.throwIfAborted()) as unknown as typeof nativeForm;
+        assert.equal((await archive()).body.reason, "timeout");
+        assert.equal(requests.some(request => request.method === "PATCH"), false);
+    } finally { AbortSignal.timeout = timeout; }
+
+    facts.set(ids[0], rawFact(ids[0], { text: duplicate, occurred_start: "2022-01-01T00:00:00.000Z" }));
+    await run();
+    assert.equal((await archive()).body.reason, "no_complete_same_scope_keeper");
+    assert.equal(requests.some(request => request.method === "PATCH"), false);
+
+    await prepare();
+    ctx.ui.custom = answer("a") as unknown as typeof nativeForm;
+    persist = false;
+    assert.equal((await archive()).body.reason, "attempt_not_saved");
+    assert.equal(requests.some(request => request.method === "PATCH"), false);
+    persist = true;
+    for (const mode of ["ack", "lost", "conflict"] as const) {
+        await prepare();
+        patchMode = mode;
+        const applied = await archive();
+        assert.ok(review.includes(ids[0]) && review.includes(ids[1]) && review.includes("Keep this line <literal>"));
+        assert.equal(requests.filter(request => request.method === "PATCH").length, 1);
+        assert.equal(facts.get(ids[0])?.state, "invalidated");
+        assert.equal(facts.get(ids[0])?.text, duplicate);
+        assert.equal(facts.get(ids[1])?.state, "valid");
+        const attempt = branch.find(entry => entry.customType === "hindsight-curation-attempt");
+        assert.ok(attempt);
+        assert.doesNotMatch(JSON.stringify(attempt), /Keep this line|fixture-token/);
+        assert.doesNotMatch(applied.raw, /Keep this line/);
+        if (mode === "ack") assert.deepEqual(applied.body.archived, [ids[0]]);
+        else if (mode === "lost") assert.deepEqual(applied.body.observedArchived, [ids[0]]);
+        else assert.deepEqual(applied.body.unknown, [ids[0]]);
+    }
+} finally { server.stop(true); rmSync(sessionDir, { recursive: true, force: true }); }
