@@ -85,7 +85,7 @@ export function registerRecallAssistance(pi: ExtensionAPI): void {
         const { guidance, lessonTool, observe, viaEval } = assistance(ctx);
         const quality = [
             lessonTool ? curatedLessonGuidance(lessonTool, viaEval) : "",
-            observe ? "Observations: When injected memories repeat one fact across entries, a mental-model snapshot is truncated, or a recalled claim proved wrong and a saved correction cannot retire it, record an observation with `observe`, naming the entries involved and the fix wanted, then continue the task." : "",
+            observe ? "Observations: Use `observe` when Hindsight recall repeats a fact or a saved correction cannot retire an incorrect recalled fact. Start these observations with `Hindsight recall:`. Record truncated mental-model snapshots separately. Name the affected entries or snapshot and the change needed, then continue the task." : "",
         ].filter(Boolean).join("\n");
         const footers = [
             footerEnabled.get(pi.pi.settings) && guidance ? "<hindsight-omp-retrieval>\n" + guidance + "\n</hindsight-omp-retrieval>" : "",

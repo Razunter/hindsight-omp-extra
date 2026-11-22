@@ -4,6 +4,7 @@
 
 - In a `skill-observer` observation pass, `hindsight_curate` investigates a specific Hindsight finding. After native approval, it can archive duplicate or obsolete facts. If it creates a replacement, it verifies the exact fact before archiving the original. Check interrupted attempts by ID without repeating writes.
 - Curation investigates only leads listed in Hindsight's eligibility cue. Findings without an eligible lead stay in the observation report.
+- Memory guidance now asks the agent to label duplicate or incorrect recalled facts `Hindsight recall:` so `/observe` can route them to Hindsight curation.
 - When `eval` is disabled, the retrieval footer points to direct tools and, when enabled, OMP 19.1 shell commands instead of removed `xd://` routes.
 - Interactive main sessions now warn about Paused or Stale OMP-seeded mental models in the active default Hindsight bank. The read-only check runs in the background and shares a 24-hour cadence per seed across sessions in the same OMP profile.
 - Startup shows a compact summary of the saved mental model status. `/hindsight` **Status** shows per-model refresh times in local time, even with management Off. Both views read local state only. A failed check leaves the last known result visible.

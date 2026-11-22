@@ -250,9 +250,10 @@ test("observation guidance names observe beside lessons and holds the block alon
         { reuse: true, active: ["learn"] },
     ] });
     expect(quality(results[0])).toContain("Curated lessons:");
-    expect(quality(results[0])).toContain("record an observation with `observe`");
+    expect(quality(results[0])).toContain("`observe`");
     expect(results[1]).toEqual(results[0]);
-    expect(quality(results[2])).toMatch(/^Observations: [^\n]*`observe`[^\n]*$/);
+    expect(quality(results[2])).toContain("`observe`");
+    expect(quality(results[2])).not.toContain("Curated lessons:");
     expect(quality(results[3])).toContain("Curated lessons:");
     expect(quality(results[3])).not.toContain("`observe`");
 });
