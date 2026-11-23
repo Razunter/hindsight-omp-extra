@@ -118,14 +118,70 @@ export async function inspectUpstream(reference: string): Promise<{ digest: stri
     }
 }
 
-export interface ContainerInfo { id: string; imageId: string; running: boolean; labels: Record<string, string>; gpu: boolean }
+export type ConfigurationProblem = { kind: "mismatch" | "unavailable"; message: string };
+export interface ContainerInfo {
+    id: string;
+    imageId: string;
+    running: boolean;
+    labels: Record<string, string>;
+    gpu: boolean;
+    configurationProblem?: ConfigurationProblem;
+}
 
-export async function inspectContainer(name: string): Promise<ContainerInfo | undefined> {
-    const result = await docker(["container", "inspect", "--format", "{{json .}}", name]);
-    if (result.exitCode !== 0) return undefined;
-    const container = JSON.parse(result.stdout);
-    const gpu = (container.HostConfig?.DeviceRequests ?? []).some((request: { Capabilities?: string[][] }) => request.Capabilities?.some(set => set.includes("gpu")));
-    return { id: String(container.Id), imageId: String(container.Image), running: container.State?.Running === true, labels: container.Config?.Labels ?? {}, gpu };
+export async function inspectContainer(name: string, settings?: HindsightSettings): Promise<ContainerInfo | "unavailable" | undefined> {
+    const result = await docker(["container", "inspect", "--format", "{{json .}}", name]).catch(() => undefined);
+    if (result?.exitCode !== 0) {
+        return result?.exitCode === 1 && result.stderr.trim() === `Error response from daemon: No such container: ${name}` ? undefined : "unavailable";
+    }
+    try {
+        const container = JSON.parse(result.stdout);
+        if (typeof container.Id !== "string" || typeof container.Image !== "string" || typeof container.State?.Running !== "boolean") return "unavailable";
+        const labels = container.Config?.Labels ?? {};
+        const gpu = (container.HostConfig?.DeviceRequests ?? []).some((request: { Capabilities?: string[][] }) => request.Capabilities?.some(set => set.includes("gpu")));
+        const configurationProblem = settings && labels[CONFIG_LABEL] === settings.configDigest
+            ? compareConfiguration(settings, container.Config.Env, container.Mounts)
+            : undefined;
+        return { id: container.Id, imageId: container.Image, running: container.State.Running, labels, gpu, configurationProblem };
+    } catch {
+        return "unavailable";
+    }
+}
+
+function compareConfiguration(settings: HindsightSettings, env: unknown, mounts: unknown): ConfigurationProblem | undefined {
+    if (!Array.isArray(env) || !env.every(entry => typeof entry === "string")) {
+        return { kind: "unavailable", message: "Hindsight could not verify the container environment." };
+    }
+    const missing = new Set(Object.keys(settings.env));
+    const differs = (key: string): ConfigurationProblem => ({
+        kind: "mismatch", message: `The container's ${key} does not match the selected configuration.`,
+    });
+    for (const entry of env) {
+        const separator = entry.indexOf("=");
+        if (separator < 0) continue;
+        const key = entry.slice(0, separator);
+        if (!Object.hasOwn(settings.env, key)) continue;
+        if (!missing.delete(key) || settings.env[key] !== entry.slice(separator + 1)) return differs(key);
+    }
+    for (const key of missing) return differs(key);
+
+    const credentialMount = settings.credentialMount;
+    if (!credentialMount) return;
+    const unavailable: ConfigurationProblem = { kind: "unavailable", message: "Hindsight could not verify the credential bind mount." };
+    if (!Array.isArray(mounts) || !mounts.every(entry => typeof entry?.Destination === "string")) return unavailable;
+    const mount = mounts.find(entry => entry.Destination === credentialMount.destination);
+    if (mount && (typeof mount.Type !== "string" || (mount.Type === "bind" && typeof mount.RW !== "boolean"))) return unavailable;
+    if (mount?.Type === "bind" && mount.RW) return;
+    return { kind: "mismatch", message: "The credential bind mount does not match the selected configuration." };
+}
+
+export async function checkContainerConfiguration(container: ContainerInfo, settings: HindsightSettings): Promise<ConfigurationProblem | undefined> {
+    const mount = settings.credentialMount;
+    if (container.configurationProblem || !mount) return container.configurationProblem;
+    const unreadableExit = 42;
+    const probe = `command -v head >/dev/null 2>&1 || exit 126; test -f "$1" && head -c 1 "$1" >/dev/null 2>&1 || exit ${unreadableExit}`;
+    const result = await docker(["exec", container.id, "/bin/sh", "-c", probe, "sh", `${mount.destination}/${mount.requiredFile}`], 3_000).catch(() => undefined);
+    if (result?.exitCode === unreadableExit) return { kind: "mismatch", message: `The credential file ${mount.requiredFile} is not readable inside the running container.` };
+    if (result?.exitCode !== 0) return { kind: "unavailable", message: `Hindsight could not check whether the credential file ${mount.requiredFile} is readable inside the running container.` };
 }
 
 /** Run `use` with the settings' environment in a 0600 file that is removed afterwards; credentials never travel as arguments. */
@@ -141,12 +197,15 @@ async function withEnvironmentFile<T>(settings: HindsightSettings, use: (file: s
 }
 
 /** Create and start the managed container from an image ID. */
-export async function runManagedContainer(settings: HindsightSettings, imageId: string, installationId: string): Promise<boolean> {
+export async function runManagedContainer(settings: HindsightSettings, imageId: string, installationId: string): Promise<{ started: boolean; createdId?: string }> {
+    const mount = settings.credentialMount;
     return withEnvironmentFile(settings, async environmentFile => {
+        const cidfile = path.join(path.dirname(environmentFile), "container-id");
         const bindAddress = settings.bindAddress.includes(":") ? "[" + settings.bindAddress + "]" : settings.bindAddress;
         const run = await docker([
             "run", "-d", "--pull", "never",
             "--name", settings.containerName,
+            "--cidfile", cidfile,
             "--restart", "unless-stopped",
             "--shm-size", String(SHM_SIZE_BYTES),
             ...(settings.gpu ? ["--gpus", "all"] : []),
@@ -156,10 +215,11 @@ export async function runManagedContainer(settings: HindsightSettings, imageId: 
             "-p", `${bindAddress}:${settings.uiPort}:${settings.env.HINDSIGHT_CP_PORT ?? "9999"}`,
             "--env-file", environmentFile,
             "-v", `${settings.volumeName}:/home/hindsight/.pg0`,
-            ...(settings.codexAuthDir ? ["-v", settings.codexAuthDir + ":/home/hindsight/.codex:rw"] : []),
+            ...(mount ? ["-v", `${mount.source}:${mount.destination}:rw`] : []),
             imageId,
         ], 60_000);
-        return run.exitCode === 0;
+        const id = (await Bun.file(cidfile).text().catch(() => "")).trim();
+        return { started: run.exitCode === 0, createdId: /^[a-f0-9]{64}$/.test(id) ? id : undefined };
     });
 }
 

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { BASE_LABEL, CONFIG_LABEL, CUDA_RECIPE, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, candidateModelDevices, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, serviceModelDevices, type ContainerInfo, type ImageInfo } from "./docker";
+import { BASE_LABEL, CONFIG_LABEL, CUDA_RECIPE, DERIVATIVE_LABEL, INSTALLATION_LABEL, buildCudaDerivative, candidateModelDevices, checkContainerConfiguration, docker, dockerAvailable, inspectContainer, inspectImage, inspectUpstream, removeImage, runManagedContainer, serviceModelDevices, type ConfigurationProblem, type ContainerInfo, type ImageInfo } from "./docker";
 import { initialState, liveOperation, readState, releaseLease, takeLease, updateState, type ApprovedRuntime, type ManagementMode, type ManagementState, type UpdateCheck } from "./management-state";
 import { readMentalModelSnapshot } from "./mental-model-status";
 import { formatMentalModelStatus } from "./mental-model-status-view";
@@ -21,6 +21,7 @@ const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const PULL_TIMEOUT_MS = 60 * 60 * 1000;
 const PINNED = /@(sha256:[a-f0-9]{64})$/;
 const KEEP_GPU = " GPU stays requested; no CPU fallback was applied.";
+const CONTAINER_UNAVAILABLE = "Hindsight could not verify the selected configuration because Docker could not inspect the container.";
 
 type UI = ExtensionContext["ui"];
 type Outcome = { level: "info" | "warning" | "error"; message: string };
@@ -245,25 +246,26 @@ async function recover(settings: HindsightSettings): Promise<Outcome> {
     if (!state || state.mode === "off" || !state.active) return off;
     const name = settings.containerName;
     const pending = isPending(state, settings);
-    const pendingNote = " The requested configuration differs from the approved runtime and was not applied; apply it from /hindsight.";
-    const container = await inspectContainer(name);
+    const pendingNote = ` The requested configuration differs from the approved runtime and was not applied. Choose ${MENU.apply} in /hindsight.`;
+    const container = await inspectContainer(name, pending ? undefined : settings);
+    if (container === "unavailable") return { level: "warning", message: CONTAINER_UNAVAILABLE + (pending ? pendingNote : "") };
     if (container && !matchesApproved(container, state)) {
         return { level: "warning", message: `Hindsight: container ${name} is not the approved managed runtime and was left unchanged; apply the requested configuration from /hindsight to replace it.` };
     }
     if (container?.running) {
         return pending
             ? { level: "warning", message: "Hindsight: the approved runtime is running." + pendingNote }
-            : { level: "info", message: `Hindsight: managed runtime running (API :${settings.apiPort}, UI :${settings.uiPort})` };
+            : withConfigurationStatus(settings, container, { level: "info", message: `Hindsight: managed runtime running (API :${settings.apiPort}, UI :${settings.uiPort})` });
     }
     if (!container && pending) return { level: "warning", message: "Hindsight: the managed container is missing and was not recreated." + pendingNote };
     if (!container && !await inspectImage(state.active.imageId)) {
         return { level: "warning", message: `Hindsight: the approved image is no longer cached, so the missing container was not recreated; choose ${MENU.apply} in /hindsight to approve ${state.active.mode === "gpu" ? "building" : "downloading"} it again.` };
     }
     if ((readState()?.mode ?? "off") === "off") return off;
-    const started = container
-        ? (await docker(["start", name])).exitCode === 0
+    const launch = container
+        ? { started: (await docker(["start", container.id])).exitCode === 0, createdId: container.id }
         : await runManagedContainer(settings, state.active.imageId, state.installationId);
-    if (!started) {
+    if (!launch.started) {
         log("Could not start the approved runtime");
         return { level: "error", message: "Hindsight: could not start the approved runtime; see the extension's hindsight.log" };
     }
@@ -271,7 +273,30 @@ async function recover(settings: HindsightSettings): Promise<Outcome> {
     const problem = await readinessProblem(settings);
     return problem
         ? { level: "error", message: `Hindsight: the approved runtime started but ${problem}.` }
-        : { level: "info", message: `Hindsight: managed runtime ready (API :${settings.apiPort}, UI :${settings.uiPort})` };
+        : withConfigurationStatus(settings, await inspectLaunchedContainer(settings, launch.createdId), { level: "info", message: `Hindsight: managed runtime ready (API :${settings.apiPort}, UI :${settings.uiPort})` });
+}
+
+async function inspectLaunchedContainer(settings: HindsightSettings, expectedId: string | undefined) {
+    if (!expectedId) return undefined;
+    const container = await inspectContainer(settings.containerName, settings);
+    return container === "unavailable" || container?.id === expectedId ? container : undefined;
+}
+
+async function configurationProblem(settings: HindsightSettings, container: ContainerInfo | "unavailable" | undefined): Promise<ConfigurationProblem | undefined> {
+    if (container === "unavailable") return { kind: "unavailable", message: CONTAINER_UNAVAILABLE };
+    if (!container?.running || container.labels[CONFIG_LABEL] !== settings.configDigest) {
+        return { kind: "unavailable", message: "Hindsight could not verify the selected configuration: no matching managed container is running." };
+    }
+    return checkContainerConfiguration(container, settings);
+}
+
+function configurationWarning(problem: ConfigurationProblem): string {
+    return problem.kind === "mismatch" ? `${problem.message} Choose ${MENU.apply} in /hindsight.` : problem.message;
+}
+
+async function withConfigurationStatus(settings: HindsightSettings, container: ContainerInfo | "unavailable" | undefined, outcome: Outcome): Promise<Outcome> {
+    const problem = await configurationProblem(settings, container);
+    return problem ? { level: "warning", message: `${outcome.message}\n${configurationWarning(problem)}` } : outcome;
 }
 
 /**
@@ -297,7 +322,8 @@ async function readinessProblem(settings: HindsightSettings): Promise<string | u
             const problem = notOnCuda(models, await serviceModelDevices(settings.containerName, models.map(([, key]) => key.toLowerCase())));
             return problem && `reported a healthy API and database, but ${problem}`;
         }
-        if (!(await inspectContainer(settings.containerName))?.running || Date.now() >= deadline) return "did not report a healthy API and database";
+        const container = await inspectContainer(settings.containerName);
+        if (!container || container === "unavailable" || !container.running || Date.now() >= deadline) return "did not report a healthy API and database";
         await Bun.sleep(500);
     }
 }
@@ -305,7 +331,7 @@ async function readinessProblem(settings: HindsightSettings): Promise<string | u
 async function openMenu(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
     const { ui } = ctx;
     const choice = await ui.select("Hindsight local management", Object.values(MENU));
-    if (choice === MENU.status) showStatus(ui, formatMentalModelStatus(readMentalModelSnapshot(pi, ctx), "details")?.message);
+    if (choice === MENU.status) await showStatus(ui, formatMentalModelStatus(readMentalModelSnapshot(pi, ctx), "details")?.message);
     if (choice === MENU.mode) {
         const mode = await ui.select("Local Hindsight management mode", ["Off", "CPU", "GPU"]);
         if (mode === "Off") {
@@ -323,7 +349,7 @@ async function openMenu(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> 
     if (choice === MENU.check) await checkNow(ui);
 }
 
-function showStatus(ui: UI, mentalModels: string | undefined): void {
+async function showStatus(ui: UI, mentalModels: string | undefined): Promise<void> {
     const state = readState();
     const active = state?.active;
     const lines = [
@@ -336,7 +362,16 @@ function showStatus(ui: UI, mentalModels: string | undefined): void {
     ];
     if (state && state.mode !== "off") {
         const { settings, error } = resolveSettings(state.mode === "gpu");
-        lines.push(!settings ? `Pending: the requested configuration is invalid. ${error}` : isPending(state, settings) ? "Pending: the requested configuration has not been applied" : "Pending: none");
+        const pending = settings && isPending(state, settings);
+        if (!settings) lines.push(`Pending: the requested configuration is invalid. ${error}`);
+        else if (pending) lines.push(`Pending: the requested configuration has not been applied. Choose ${MENU.apply} in /hindsight.`);
+        else {
+            const container = await inspectContainer(settings.containerName, settings);
+            const problem = container && container !== "unavailable" && container.running && !matchesApproved(container, state)
+                ? { kind: "mismatch", message: "The selected configuration is not applied to the running container." } as const
+                : await configurationProblem(settings, container);
+            if (problem) lines.push(configurationWarning(problem));
+        }
     } else {
         lines.push("Management is Off: Docker was not inspected and the service is not managed.");
     }
@@ -401,6 +436,10 @@ async function planTarget(state: ManagementState, settings: HindsightSettings, u
         const cached = await inspectImage(`${repository}@${digest}`);
         if (cached) return { kind: "cached", reference: `${repository}@${digest}`, imageId: cached.id, digests };
     }
+    if (!update && approved?.mode === "cpu") {
+        const cached = await inspectImage(approved.imageId);
+        if (cached) return { kind: "cached", reference: approved.imageId, imageId: cached.id, digests };
+    }
     return { kind: "download", reference: base, digests };
 }
 
@@ -440,14 +479,33 @@ async function apply(ui: UI, update: boolean): Promise<void> {
         await startCheck(ui, settings);
         return;
     }
-    const container = await inspectContainer(settings.containerName);
-    if (target.kind === "cached" && container?.running && !isPending(state, settings) && matchesApproved(container, state) && container.imageId === target.imageId) {
-        ui.notify("Hindsight: the approved runtime already matches the requested configuration; nothing to apply.", "info");
+    const pending = isPending(state, settings);
+    const container = await inspectContainer(settings.containerName, pending || update ? undefined : settings);
+    if (container === "unavailable") {
+        ui.notify(`${CONTAINER_UNAVAILABLE} Nothing was replaced.`, "warning");
         return;
+    }
+    let repair: { id: string; message: string } | undefined;
+    if (target.kind === "cached" && container?.running && !pending && matchesApproved(container, state) && container.imageId === target.imageId) {
+        if (update) {
+            ui.notify("Hindsight: the offered update is already running. Nothing to apply.", "info");
+            return;
+        }
+        const problem = await checkContainerConfiguration(container, settings);
+        if (!problem) {
+            ui.notify("Hindsight: Nothing to apply.", "info");
+            return;
+        }
+        if (problem.kind === "unavailable") {
+            ui.notify(`${problem.message} Nothing was replaced.`, "warning");
+            return;
+        }
+        repair = { id: container.id, message: problem.message };
     }
     const mode = MODE_NAME[state.mode];
     const verb = { cached: "Apply", download: "Download and apply", build: "Build and apply" }[target.kind];
-    if (!await ui.confirm(`${verb} the Hindsight ${mode} runtime?`, describePlan(state, settings, target, container))) return;
+    const plan = describePlan(state, settings, target, container);
+    if (!await ui.confirm(`${verb} the Hindsight ${mode} runtime?`, repair ? `${repair.message}\n\n${plan}` : plan)) return;
     // Under the lease's lock: a choice made while the confirmation was open (Off, another mode or configuration, or a runtime
     // another process applied) voids the approval before anything is downloaded or built.
     const current = resolveSettings(gpu).settings;
@@ -468,7 +526,7 @@ async function apply(ui: UI, update: boolean): Promise<void> {
         : target.kind === "download"
         ? `Hindsight: preparing ${target.reference} in the background; the current service keeps running until cutover.`
         : `Hindsight: building the CUDA image from ${target.base} in the background; the current service keeps running until cutover.`, "info");
-    void runOperation(ui, lease, () => applyApproved(settings, target, lease, state.installationId, state.active));
+    void runOperation(ui, lease, () => applyApproved(settings, target, lease, state.installationId, state.active, repair?.id));
 }
 
 /**
@@ -507,7 +565,7 @@ function describePlan(state: ManagementState, settings: HindsightSettings, targe
         container
             ? `Shared service: container ${settings.containerName} keeps running until cutover, is stopped gracefully (up to 75 seconds) and replaced.`
             : `Shared service: creates container ${settings.containerName}.`,
-        `Data: reuses volume ${settings.volumeName}${settings.codexAuthDir ? " and the Codex credential directory" : ""}, the same ports, bind address and worker identity.`,
+        `Data: reuses volume ${settings.volumeName}${settings.credentialMount ? " and the selected provider's credential directory" : ""}, the same ports, bind address and worker identity.`,
         ...(runningImage !== undefined && !sameRelease ? ["Warning: a different Hindsight version may migrate the reused database; replacing the image does not roll the database back."] : []),
     ].join("\n");
 }
@@ -547,7 +605,7 @@ async function prepareImage(target: Target, installationId: string): Promise<{ i
     return { imageId: built.id };
 }
 
-async function applyApproved(settings: HindsightSettings, target: Target, lease: string, installationId: string, approvedActive: ApprovedRuntime | undefined): Promise<Outcome> {
+async function applyApproved(settings: HindsightSettings, target: Target, lease: string, installationId: string, approvedActive: ApprovedRuntime | undefined, repairContainerId: string | undefined): Promise<Outcome> {
     const mode = settings.gpu ? "gpu" : "cpu";
     const keepGpu = settings.gpu ? KEEP_GPU : "";
     const fail = async (stage: FailureStage, message: string, level: Outcome["level"] = "error"): Promise<Outcome> => {
@@ -570,10 +628,14 @@ async function applyApproved(settings: HindsightSettings, target: Target, lease:
     const candidate = await inspectImage(target.reference);
     const name = settings.containerName;
     const existing = await inspectContainer(name);
+    if (existing === "unavailable") return fail("validate", abandoned("Docker could not inspect the container"), "warning");
+    const repairTargetChanged = repairContainerId !== undefined && existing?.id !== repairContainerId;
     let changed: string | undefined;
     await updateState(state => {
         changed = state?.operation?.id !== lease ? "another process took over local management"
-            : approvalChanged(state, settings, current, approvedActive) ?? (candidate?.id !== imageId ? "the image changed after approval" : undefined);
+            : approvalChanged(state, settings, current, approvedActive)
+                ?? (candidate?.id !== imageId ? "the image changed after approval"
+                    : repairTargetChanged ? "the container changed after the configuration repair was approved" : undefined);
         if (changed) return undefined;
         return { ...state!, operation: { ...state!.operation!, candidateImageId: imageId } };
     });
@@ -581,21 +643,24 @@ async function applyApproved(settings: HindsightSettings, target: Target, lease:
 
     let previous: string | undefined;
     if (existing) {
-        if (existing.running && (await docker(["stop", "--time", "75", name], 90_000)).exitCode !== 0) {
+        const ref = repairContainerId ?? name;
+        if (existing.running && (await docker(["stop", "--time", "75", ref], 90_000)).exitCode !== 0) {
             return fail("cutover", "Hindsight: could not stop the current container gracefully; it was left in place and nothing was replaced.");
         }
         previous = `${name}-previous-${existing.id.slice(0, 12)}`;
-        if ((await docker(["rename", name, previous])).exitCode !== 0) {
-            if (existing.running) await docker(["start", name]);
+        if ((await docker(["rename", ref, previous])).exitCode !== 0) {
+            if (existing.running) await docker(["start", ref]);
             return fail("cutover", "Hindsight: could not set the current container aside; it was restarted and nothing was replaced.");
         }
     }
-    if (!await runManagedContainer(settings, imageId, installationId)) {
+    const launch = await runManagedContainer(settings, imageId, installationId);
+    if (!launch.started) {
         log("docker run failed during cutover");
         if (!previous) return fail("cutover", "Hindsight: the new container could not be created; see the extension's hindsight.log");
-        await docker(["rm", name]);
-        const restored = (await docker(["rename", previous, name])).exitCode === 0 &&
-            (!existing!.running || (await docker(["start", name])).exitCode === 0);
+        if (launch.createdId) await docker(["rm", launch.createdId]);
+        const previousId = existing!.id;
+        const restored = (await docker(["rename", previousId, name])).exitCode === 0 &&
+            (!existing!.running || (await docker(["start", previousId])).exitCode === 0);
         return fail("cutover", restored
             ? "Hindsight: the new container could not be created; the previous container was restored."
             : `Hindsight: the new container could not be created and the previous container ${previous} could not be restored; restore it manually.`);
@@ -637,5 +702,6 @@ async function applyApproved(settings: HindsightSettings, target: Target, lease:
         owned: state.owned?.filter(entry => !superseded.gone.includes(entry.imageId)),
         cleanupFailure: message ? { message, at: new Date().toISOString() } : undefined,
     });
-    return message ? { level: "warning", message: `${ready}. Cleanup needs attention: ${message}.` } : { level: "info", message: ready };
+    const outcome: Outcome = message ? { level: "warning", message: `${ready}. Cleanup needs attention: ${message}.` } : { level: "info", message: ready };
+    return withConfigurationStatus(settings, await inspectLaunchedContainer(settings, launch.createdId), outcome);
 }

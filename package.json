@@ -1,6 +1,6 @@
 {
   "name": "hindsight-omp-extra",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "OMP extension for self-hosted Hindsight, supporting-source evidence, and knowledge ingestion.",
   "author": "Razunter",
   "license": "MIT",

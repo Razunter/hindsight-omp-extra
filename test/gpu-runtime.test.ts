@@ -45,6 +45,25 @@ test("a derivative built by an older CUDA recipe is rebuilt rather than reused, 
     expect(derivatives(f)).toEqual([active.imageId]);
 });
 
+test("Apply offers a rebuild when the running CUDA runtime uses the previous recipe", () => {
+    const { f, active } = gpuRuntime();
+    const state = f.state();
+    const older = "sha256:" + "4".repeat(64);
+    const image = state.images[active.imageId];
+    image.tags = ["hindsight-omp-cuda:" + "a".repeat(12) + "-000000000000"];
+    image.labels!["io.github.razunter.hindsight-omp.derivative"] = "cuda-000000000000";
+    state.images[older] = image;
+    delete state.images[active.imageId];
+    state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME].image = older;
+    f.setState(state);
+    f.manage({ active: { ...active, imageId: older } });
+
+    const result = f.run([{ startup: false, command: true, choices: [menu.apply], confirm: true }]);
+    expect(confirmations(result)[0]?.message ?? "").toContain("builds the CUDA derivative");
+    expect(f.container()?.image).toBe(active.imageId);
+    expect(f.state().data).toBe("preserved-data");
+});
+
 test("GPU is offered but never chosen implicitly, and CPU works on a host without CUDA", () => {
     const f = setup();
     const result = f.run([{ startup: false, command: true, choices: [menu.mode, "CPU"], confirm: true }]);

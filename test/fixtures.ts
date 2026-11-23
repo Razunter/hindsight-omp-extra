@@ -11,6 +11,7 @@ export interface Container {
     shmSize: number;
     portBindings: Record<string, { HostIp: string; HostPort: string }[]>;
     labels: Record<string, string>;
+    codexAuthExit?: number;
     /** Started with `--gpus all` (a GPU DeviceRequest). */
     gpus?: boolean;
 }
@@ -18,6 +19,8 @@ export interface DockerState {
     containers: Record<string, Container>;
     calls: string[][];
     runFails: boolean;
+    runFailsAfterCreate?: boolean;
+    runConflict?: Container;
     data: string | null;
     images: Record<string, { tags: string[]; digests?: string[]; labels?: Record<string, string> }>;
     health?: "healthy" | "unhealthy";
@@ -32,8 +35,8 @@ export interface DockerState {
     imageRemoveFails?: boolean;
     runEnvironment?: Record<string, string | undefined>;
     envFile?: { path: string; mode: number };
-    /** Simulates another process: once a call starting with `when` has been seen more than `skip` times, patch management state or move a tag. */
-    mutate?: { when: string; skip?: number; management?: Record<string, unknown>; retag?: { tag: string; image: string } };
+    /** Simulates another process changing state after a particular Docker command begins. */
+    mutate?: { when: string; skip?: number; management?: Record<string, unknown>; retag?: { tag: string; image: string }; replaceContainer?: { name: string; id: string } };
     /** Registry manifests by exact reference, as `buildx imagetools inspect --format '{{json .Manifest}}'` prints them; a missing reference fails. */
     registry?: Record<string, unknown>;
     buildxMissing?: boolean;
@@ -47,11 +50,13 @@ export interface DockerState {
     inferenceFails?: ("validation" | "service")[];
     /** Image IDs whose `docker image inspect` fails like an unreachable daemon instead of reporting absence. */
     imageInspectFails?: string[];
+    containerInspectFails?: boolean;
     /** `docker build` outcome: fails like a dependency conflict, or sleeps before succeeding. */
     buildFails?: boolean;
     buildDelayMs?: number;
     /** Files of the last build context and its build arguments. */
     buildContext?: { files: string[]; buildArgs: string[] };
+    codexAuthExitOnRun?: number;
 }
 export interface StartupResult {
     notifications: { message: string; level: string }[];
@@ -134,6 +139,10 @@ if (mutation && state.calls.filter(call => call.join(" ").startsWith(mutation.wh
         for (const image of Object.values(state.images)) image.tags = image.tags.filter(tag => tag !== mutation.retag.tag);
         (state.images[mutation.retag.image] ??= { tags: [] }).tags.push(mutation.retag.tag);
     }
+    if (mutation.replaceContainer) {
+        const { name, id } = mutation.replaceContainer;
+        state.containers[name] = { ...state.containers[name], id };
+    }
 }
 const findImage = ref => state.images[ref] ? ref : Object.keys(state.images).find(id => state.images[id].tags.includes(ref) || (state.images[id].digests ?? []).includes(ref));
 const findContainer = ref => Object.keys(state.containers).find(name => name === ref || state.containers[name].id === ref);
@@ -178,9 +187,15 @@ case "tag": {
 case "ps": out = Object.values(state.containers).filter(container => args.at(-1) === "ancestor=" + container.image).map(container => container.id).join("\\n"); break;
 case "container": {
     const name = findContainer(args.at(-1));
-    if (args[1] !== "inspect" || !name) { code = 1; break; }
+    if (state.containerInspectFails) { code = 1; err = "Error response from daemon: access denied"; break; }
+    if (args[1] !== "inspect" || !name) { code = 1; err = "Error response from daemon: No such container: " + args.at(-1); break; }
     const container = state.containers[name];
-    out = JSON.stringify({ Id: container.id, Name: "/" + name, Image: container.image, State: { Running: container.running }, Config: { Labels: container.labels }, HostConfig: { DeviceRequests: container.gpus ? [{ Driver: "", Count: -1, DeviceIDs: null, Capabilities: [["gpu"]], Options: {} }] : null } }); break;
+    out = JSON.stringify({
+        Id: container.id, Name: "/" + name, Image: container.image, State: { Running: container.running },
+        Config: { Labels: container.labels, Env: container.env },
+        Mounts: container.mounts.map(mount => ({ ...mount, Type: path.isAbsolute(mount.Source) ? "bind" : "volume" })),
+        HostConfig: { DeviceRequests: container.gpus ? [{ Driver: "", Count: -1, DeviceIDs: null, Capabilities: [["gpu"]], Options: {} }] : null },
+    }); break;
 }
 case "build": {
     const value = flag => args.flatMap((arg, i) => arg === flag ? [args[i + 1]] : []);
@@ -209,6 +224,15 @@ case "exec": {
     // The readiness inference probe: one JSON line of device lists for the model kinds after the script.
     const container = state.containers[findContainer(args[1])];
     if (!container?.running) { code = 1; err = "Error response from daemon: container is not running"; break; }
+    if (args[2] === "/bin/sh") {
+        if (container.codexAuthExit !== undefined) { code = container.codexAuthExit; break; }
+        const target = args[6];
+        const source = container.mounts.find(mount => mount.Destination === path.dirname(target))?.Source ?? path.dirname(file) + "/absent";
+        const result = Bun.spawnSync(["/bin/sh", "-c", args[4], args[5], path.join(source, path.basename(target))]);
+        if (result.stdout.length || result.stderr.length) throw new Error("Credential file probe emitted output");
+        code = result.exitCode;
+        break;
+    }
     if (state.inferenceFails?.includes("service")) { code = 1; err = "RuntimeError: Failed to find C compiler. Please specify via CC environment variable"; break; }
     const device = state.modelDevice ?? (container.gpus && state.gpu === "cuda" ? "cuda" : "cpu");
     out = JSON.stringify(Object.fromEntries(args.slice(args.indexOf("-c") + 2).map(kind => [kind, [device]]))); break;
@@ -234,9 +258,10 @@ case "run": {
     if (args.includes("--gpus") && !state.gpu) { code = 125; break; }
     state.runEnvironment = Object.fromEntries(["PATH", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"].map(key => [key, process.env[key]]));
     const env = [], mounts = [], portBindings = {}, labels = {};
-    let name;
+    let name, cidfile;
     for (let i = 1; i < args.length; i++) {
         if (args[i] === "--name") name = args[++i];
+        if (args[i] === "--cidfile") cidfile = args[++i];
         if (args[i] === "--label") { const [key, ...value] = args[++i].split("="); labels[key] = value.join("="); }
         if (args[i] === "--env-file") {
             const envFile = args[++i];
@@ -253,12 +278,16 @@ case "run": {
     const volume = mounts.find(mount => mount.Destination === "/home/hindsight/.pg0")?.Source;
     if (Object.values(state.containers).some(container => container.running && container.mounts.some(mount => mount.Source === volume))) state.sharedVolumeRun = true;
     const image = findImage(args.at(-1));
+    if (state.runConflict && name) state.containers[name] = state.runConflict;
     if (state.runFails) { code = 1; err = args.join(" "); }
     else if (!image || !name || state.containers[name]) code = 1;
     else {
         const id = state.calls.length.toString(16).padStart(64, "c");
-        state.containers[name] = { id, image, running: !state.exitsAfterRun, env, mounts, portBindings, labels, ...(args.includes("--gpus") ? { gpus: true } : {}), shmSize: args.includes("--shm-size") ? Number(args[args.indexOf("--shm-size") + 1]) : 67108864 };
-        out = id;
+        state.containers[name] = { id, image, running: !state.exitsAfterRun && !state.runFailsAfterCreate, env, mounts, portBindings, labels, ...(args.includes("--gpus") ? { gpus: true } : {}), shmSize: args.includes("--shm-size") ? Number(args[args.indexOf("--shm-size") + 1]) : 67108864 };
+        state.containers[name].codexAuthExit = state.codexAuthExitOnRun;
+        if (cidfile) fs.writeFileSync(cidfile, id);
+        if (state.runFailsAfterCreate) code = 125;
+        else out = id;
     }
     break;
 }
@@ -372,6 +401,11 @@ for (let i = 0; i < steps.length; i++) {
         async confirm(title, message) {
             dialogs.push({ title, message });
             if (step.afterConfirm) fs.writeFileSync(managementFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(managementFile, "utf8")), ...step.afterConfirm }));
+            if (step.afterConfirmContainer) {
+                const dockerState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+                Object.assign(dockerState.containers, step.afterConfirmContainer);
+                fs.writeFileSync(stateFile, JSON.stringify(dockerState));
+            }
             return step.confirm ?? false;
         },
     } };

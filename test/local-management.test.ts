@@ -24,8 +24,8 @@ function legacyContainer(f: Fixture, running = true): Container {
     f.setState(state);
     return container;
 }
-function status(f: Fixture): string {
-    return f.run([{ startup: false, command: true, choices: [menu.status] }]).notifications.at(-1)!.message;
+function status(f: Fixture, overrides?: Record<string, string>): string {
+    return f.run([{ startup: false, command: true, choices: [menu.status] }], overrides).notifications.at(-1)!.message;
 }
 function localFiles(f: Fixture) {
     return [".env", ".selected-provider", "providers/primary.env"].map(file => fs.readFileSync(path.join(f.root, file), "utf8"));
@@ -148,8 +148,244 @@ test("applying an unchanged active runtime asks nothing and restarts nothing", (
     const before = mutating(f).length;
     const result = f.apply();
     expect(result.dialogs.filter(dialog => dialog.message !== undefined)).toEqual([]);
-    expect(result.notifications.at(-1)?.level).toBe("info");
+    expect(result.notifications.at(-1)).toEqual({ level: "info", message: "Hindsight: Nothing to apply." });
     expect(mutating(f)).toHaveLength(before);
+});
+
+function codexFixture(): Fixture {
+    const f = setup();
+    const auth = path.join(f.root, "codex");
+    fs.mkdirSync(auth);
+    fs.writeFileSync(path.join(auth, "auth.json"), JSON.stringify({ tokens: { access_token: "synthetic-access", refresh_token: "synthetic-refresh" } }));
+    f.envFile("providers/primary.env", { ...profile, HINDSIGHT_API_LLM_PROVIDER: "openai-codex", HINDSIGHT_OMP_CODEX_AUTH_DIR: auth });
+    return f;
+}
+
+test("Apply repairs a stale Codex bind mount only after approval, using the same image and data", () => {
+    const f = codexFixture();
+    f.apply();
+    const state = f.state();
+    state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME].codexAuthExit = 42;
+    f.setState(state);
+    const before = mutating(f).length;
+    const declined = f.run([{ startup: false, command: true, choices: [menu.apply], confirm: false }]);
+    expect(declined.dialogs.at(-1)?.message).toEqual(expect.stringContaining("auth.json is not readable"));
+    expect(mutating(f)).toHaveLength(before);
+    expect(status(f)).toContain("auth.json is not readable");
+    expect(f.run().notifications.some(n => n.level === "warning" && n.message.includes("auth.json is not readable"))).toBe(true);
+    expect(mutating(f)).toHaveLength(before);
+
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(f.container()).toMatchObject({ image: imageId, running: true });
+    expect(f.container()!.id).not.toBe(state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME].id);
+    expect(f.state().data).toBe("preserved-data");
+    expect(status(f)).not.toContain("auth.json is not readable");
+    expect(f.apply().dialogs.filter(dialog => dialog.message !== undefined)).toEqual([]);
+});
+
+test.each([
+    ["API key", "HINDSIGHT_API_LLM_API_KEY"],
+    ["auth headers", "HINDSIGHT_API_LLM_DEFAULT_HEADERS"],
+    ["Codex host path metadata", "HINDSIGHT_OMP_CODEX_AUTH_DIR"],
+])("Startup and Status report drift in %s and Apply repairs it without exposing values", (_label, key) => {
+    const f = key === "HINDSIGHT_OMP_CODEX_AUTH_DIR" ? codexFixture() : setup();
+    if (key === "HINDSIGHT_API_LLM_DEFAULT_HEADERS") {
+        f.envFile("providers/primary.env", { ...profile, [key]: '{"Authorization":"synthetic-expected=header"}' });
+    }
+    f.apply();
+    const state = f.state();
+    const container = state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME];
+    const expected = nativeEnv(container)[key];
+    expect(expected).toBeDefined();
+    const wrong = "synthetic-wrong=value";
+    container.env = container.env.map(entry => entry.startsWith(`${key}=`) ? `${key}=${wrong}` : entry);
+    f.setState(state);
+    const before = mutating(f).length;
+    const startup = f.run().notifications.at(-1);
+    const declined = f.run([{ startup: false, command: true, choices: [menu.apply], confirm: false }]);
+    expect(startup?.level).toBe("warning");
+    for (const message of [startup!.message, status(f), declined.dialogs.at(-1)?.message ?? ""]) {
+        expect(message).toContain(key);
+        expect(message).not.toContain(wrong);
+        expect(message).not.toContain(expected);
+    }
+    expect(mutating(f)).toHaveLength(before);
+
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(nativeEnv(f.container())[key]).toBe(expected);
+    expect(f.container()).toMatchObject({ image: imageId, running: true });
+    expect(f.container()!.id).not.toBe(container.id);
+    expect(f.state().data).toBe("preserved-data");
+    expect(mutating(f).slice(before).filter(([verb]) => verb === "pull" || verb === "build")).toEqual([]);
+    expect(status(f)).not.toContain(key);
+});
+
+test("Apply repairs drift using the approved CPU image ID when its registry reference is gone", () => {
+    const f = setup();
+    f.apply();
+    const state = f.state();
+    state.images[imageId].digests = [];
+    const container = state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME];
+    container.env = container.env.filter(entry => !entry.startsWith("HINDSIGHT_API_LLM_API_KEY="));
+    f.setState(state);
+    const before = mutating(f).length;
+    const result = f.apply();
+    expect(result.notifications.at(-1)?.level).toBe("info");
+    expect(result.notifications.at(-1)?.message).not.toContain("matches the selected configuration");
+    expect(mutating(f).slice(before).some(([verb]) => verb === "pull")).toBe(false);
+    expect(f.container()?.image).toBe(imageId);
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_API_KEY).toBe(profile.HINDSIGHT_API_LLM_API_KEY);
+});
+
+test("a readable Codex file on a read-only bind does not verify the selection", () => {
+    const f = codexFixture();
+    f.apply();
+    const state = f.state();
+    state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME].mounts.find(mount => mount.Destination === "/home/hindsight/.codex")!.RW = false;
+    f.setState(state);
+    const before = f.state().calls.length;
+    expect(status(f)).toContain("credential bind mount");
+    expect(f.state().calls.slice(before).some(([verb]) => verb === "exec")).toBe(false);
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(f.container()?.mounts.find(mount => mount.Destination === "/home/hindsight/.codex")?.RW).toBe(true);
+});
+
+test("Startup and Status accept a readable credential bind with a rewritten Docker source", () => {
+    const f = codexFixture();
+    f.apply();
+    const state = f.state();
+    const container = state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME];
+    const mount = container.mounts.find(mount => mount.Destination === "/home/hindsight/.codex")!;
+    mount.Source = "/daemon/rewritten-credential-source";
+    container.codexAuthExit = 0;
+    f.setState(state);
+
+    const before = mutating(f).length;
+    const startup = f.run([{}], { WSL_DISTRO_NAME: "" });
+    expect(startup.notifications.filter(n => n.level === "warning")).toEqual([]);
+    expect(startup.notifications.at(-1)?.message).not.toContain("matches the selected configuration");
+    const report = status(f, { WSL_DISTRO_NAME: "" });
+    expect(report).not.toContain("matches the selected configuration");
+    expect(report).not.toMatch(/credential (bind mount|file)/);
+    expect(mutating(f)).toHaveLength(before);
+});
+
+test("a pending provider selection does not probe the previously applied Codex mount", () => {
+    const f = codexFixture();
+    f.apply();
+    f.envFile("providers/next.env", profile);
+    f.select("next");
+    const before = f.state().calls.length;
+    expect(f.run().notifications.at(-1)?.message).toContain("was not applied");
+    expect(status(f)).toContain("has not been applied. Choose Apply requested configuration");
+    expect(f.state().calls.slice(before).some(([verb]) => verb === "exec")).toBe(false);
+    expect(f.apply().notifications.at(-1)?.level).toBe("info");
+    expect(nativeEnv(f.container()).HINDSIGHT_API_LLM_PROVIDER).toBe("openai");
+});
+
+test("a failed container inspection is inconclusive and does not offer replacement", () => {
+    const f = setup();
+    f.apply();
+    f.setState({ ...f.state(), containerInspectFails: true });
+    const before = mutating(f).length;
+    expect(status(f)).toContain("could not verify");
+    const result = f.apply();
+    expect(result.notifications.at(-1)).toMatchObject({ level: "warning", message: expect.stringContaining("could not verify") });
+    expect(result.dialogs.every(dialog => dialog.message === undefined)).toBe(true);
+    expect(mutating(f)).toHaveLength(before);
+});
+
+test("Status reports a different running configuration without probing its credentials", () => {
+    const f = codexFixture();
+    f.apply();
+    const state = f.state();
+    state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME].labels["io.github.razunter.hindsight-omp.config"] = "different";
+    f.setState(state);
+    const before = f.state().calls.length;
+    expect(status(f)).toContain("not applied to the running container. Choose Apply requested configuration");
+    expect(f.state().calls.slice(before).some(([verb]) => verb === "exec")).toBe(false);
+});
+
+test("missing credential mount metadata is inconclusive and does not offer replacement", () => {
+    const f = codexFixture();
+    f.apply();
+    const state = f.state();
+    const mount = state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME].mounts.find(mount => mount.Destination === "/home/hindsight/.codex");
+    Reflect.deleteProperty(mount!, "RW");
+    f.setState(state);
+    const before = mutating(f).length;
+    expect(status(f)).toContain("could not verify the credential bind mount");
+    const result = f.apply();
+    expect(result.notifications.at(-1)?.message).toContain("could not verify the credential bind mount");
+    expect(result.dialogs.every(dialog => dialog.message === undefined)).toBe(true);
+    expect(mutating(f)).toHaveLength(before);
+});
+
+test("an unavailable Codex mount probe does not claim the runtime matches or replace it", () => {
+    const f = codexFixture();
+    f.apply();
+    const state = f.state();
+    state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME].codexAuthExit = 125;
+    f.setState(state);
+    const before = mutating(f).length;
+    const result = f.apply();
+    expect(result.notifications.at(-1)).toMatchObject({ level: "warning", message: expect.stringContaining("could not check whether the credential file auth.json is readable") });
+    expect(mutating(f)).toHaveLength(before);
+});
+
+test("mount repair approval cannot replace a new container that took the same name", () => {
+    const f = codexFixture();
+    f.apply();
+    const name = infrastructure.HINDSIGHT_CONTAINER_NAME;
+    const state = f.state();
+    const replacement = { ...state.containers[name], id: "d".repeat(64) };
+    state.containers[name].codexAuthExit = 42;
+    f.setState(state);
+    const before = mutating(f).length;
+    const result = f.run([{ startup: false, command: true, choices: [menu.apply], confirm: true, afterConfirmContainer: { [name]: replacement } }]);
+    expect(result.notifications.at(-1)).toMatchObject({ level: "warning", message: expect.stringContaining("the container changed") });
+    expect(f.container()?.id).toBe(replacement.id);
+    expect(mutating(f)).toHaveLength(before);
+});
+
+test("mount repair rollback preserves a stopped container that arrived during cutover", () => {
+    const f = codexFixture();
+    f.apply();
+    const name = infrastructure.HINDSIGHT_CONTAINER_NAME;
+    const state = f.state();
+    const original = state.containers[name];
+    original.codexAuthExit = 42;
+    const occupant = { ...original, id: "d".repeat(64), running: false, labels: {} };
+    f.setState({ ...state, runConflict: occupant });
+    const result = f.apply();
+    expect(f.container()).toEqual(occupant);
+    const previous = `${name}-previous-${original.id.slice(0, 12)}`;
+    expect(f.container(previous)).toEqual({ ...original, running: false });
+    expect(result.notifications.at(-1)).toMatchObject({ level: "error", message: expect.stringContaining(previous) });
+});
+
+test("after an approved cutover an unreadable Codex mount is reported without another restart", () => {
+    const f = codexFixture();
+    f.setState({ ...f.state(), codexAuthExitOnRun: 42 });
+    const result = f.apply();
+    expect(result.notifications.at(-1)).toMatchObject({ level: "warning", message: expect.stringContaining("auth.json is not readable") });
+    expect(f.container()?.running).toBe(true);
+    expect(mutating(f).map(call => call[0])).toEqual(["run"]);
+});
+
+test("cutover does not verify a different container that took the name after launch", () => {
+    const f = codexFixture();
+    f.apply();
+    const state = f.state();
+    const name = infrastructure.HINDSIGHT_CONTAINER_NAME;
+    state.containers[name].codexAuthExit = 42;
+    state.mutate = { when: `rm ${name}-previous-`, replaceContainer: { name, id: "d".repeat(64) } };
+    f.setState(state);
+    const before = state.calls.length;
+    const result = f.apply();
+    expect(result.notifications.at(-1)?.message).toContain("could not verify the selected configuration");
+    expect(f.container()?.id).toBe("d".repeat(64));
+    expect(f.state().calls.slice(before).some(call => call[0] === "exec" && call[1] === "d".repeat(64))).toBe(false);
 });
 
 test("Off stops future management immediately without stopping or deleting the service", () => {
@@ -239,9 +475,9 @@ test("a container that exits fails readiness without waiting for the timeout", (
     expect(f.management()).toMatchObject({ failure: { stage: "readiness" } });
 });
 
-test("a failed launch restores and restarts the previous container", () => {
+test.each(["before", "after"] as const)("a launch that fails %s container creation restores and restarts the previous container", stage => {
     const f = setup(); const container = legacyContainer(f);
-    const state = f.state(); state.runFails = true; f.setState(state);
+    f.setState({ ...f.state(), runFails: stage === "before", runFailsAfterCreate: stage === "after" });
     expect(f.apply().notifications.at(-1)?.level).toBe("error");
     expect(f.state().containers).toEqual({ "fixture-hindsight": container });
     expect(f.management()).toMatchObject({ failure: { stage: "cutover" } });
@@ -259,10 +495,13 @@ test("a later success replaces the failure record with the active runtime", () =
 
 test("startup starts a stopped approved runtime without preparing anything", () => {
     const f = setup(); f.apply();
-    const state = f.state(); state.containers["fixture-hindsight"].running = false; f.setState(state);
-    const before = f.state().calls.length;
+    const state = f.state();
+    const stopped = state.containers[infrastructure.HINDSIGHT_CONTAINER_NAME];
+    stopped.running = false;
+    f.setState(state);
+    const before = mutating(f).length;
     expect(f.run().notifications.at(-1)?.level).toBe("info");
-    expect(f.state().calls.slice(before).filter(call => !["version", "image", "container", "buildx"].includes(call[0]))).toEqual([["start", "fixture-hindsight"]]);
+    expect(mutating(f).slice(before)).toEqual([["start", stopped.id]]);
     expect(f.container()!.running).toBe(true);
 });
 

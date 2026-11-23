@@ -19,10 +19,10 @@ export type HindsightSettings = {
     apiPort: string;
     uiPort: string;
     bindAddress: string;
-    codexAuthDir?: string;
+    credentialMount?: { source: string; destination: string; requiredFile: string };
     /** The container requests all GPUs (`--gpus all`). */
     gpu: boolean;
-    /** Complete container environment, including credentials; only ever written to the 0600 env file. */
+    /** Complete container environment, including credentials; do not display or log values. */
     env: Record<string, string>;
     /** Identity of the desired container environment and run shape. */
     configDigest: string;
@@ -76,7 +76,7 @@ export function resolveSettings(gpu = false): { settings?: HindsightSettings; er
     } catch (error) {
         return { error: error instanceof Error ? error.message : "Hindsight: could not read selected provider configuration" };
     }
-    const { provider, env, nativeEnv, codexAuthDir } = configuration;
+    const { provider, env, credentialMount } = configuration;
     const get = (name: string): string | undefined =>
         Bun.env[name] ?? env[name];
     const containerName = get("HINDSIGHT_CONTAINER_NAME");
@@ -103,16 +103,15 @@ export function resolveSettings(gpu = false): { settings?: HindsightSettings; er
     if (missing.length > 0) {
         return { error: "Hindsight: missing shared settings in .env or process environment: " + missing.join(", ") };
     }
-    if (![apiPort, uiPort, nativeEnv.HINDSIGHT_API_PORT ?? "8888", nativeEnv.HINDSIGHT_CP_PORT ?? "9999"].every(port => /^\d+$/.test(port!) && Number(port) >= 1 && Number(port) <= 65535)) {
+    if (![apiPort, uiPort, env.HINDSIGHT_API_PORT ?? "8888", env.HINDSIGHT_CP_PORT ?? "9999"].every(port => /^\d+$/.test(port!) && Number(port) >= 1 && Number(port) <= 65535)) {
         return { error: "Hindsight: host and container API/UI ports must be ports from 1 to 65535" };
     }
     if (!/^\d+$/.test(workerMaxSlots!) || !Number.isSafeInteger(Number(workerMaxSlots)) || Number(workerMaxSlots) < 1) {
         return { error: "Hindsight: HINDSIGHT_API_WORKER_MAX_SLOTS must be a positive integer" };
     }
     const containerEnv: Record<string, string> = {
-        HINDSIGHT_CP_DATAPLANE_API_URL: `http://localhost:${nativeEnv.HINDSIGHT_API_PORT ?? "8888"}`,
-        ...nativeEnv,
-        ...(codexAuthDir ? { HINDSIGHT_OMP_CODEX_AUTH_DIR: codexAuthDir } : {}),
+        HINDSIGHT_CP_DATAPLANE_API_URL: `http://localhost:${env.HINDSIGHT_API_PORT ?? "8888"}`,
+        ...env,
         HINDSIGHT_API_WORKER_ID: workerId!,
         HINDSIGHT_API_WORKER_MAX_SLOTS: workerMaxSlots!,
     };
@@ -121,19 +120,20 @@ export function resolveSettings(gpu = false): { settings?: HindsightSettings; er
     }
     const shape = {
         containerName, image, volumeName, apiPort, uiPort, bindAddress,
-        codexAuthDir: codexAuthDir ?? null, shmSize: SHM_SIZE_BYTES, ...(gpu ? { gpus: "all" } : {}),
+        // Keep existing approval digests stable when only the in-memory mount representation changes.
+        codexAuthDir: credentialMount?.source ?? null, shmSize: SHM_SIZE_BYTES, ...(gpu ? { gpus: "all" } : {}),
         env: Object.entries(containerEnv).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
     };
     return {
         settings: {
-            provider, containerName: containerName!, image: image!, volumeName: volumeName!, apiPort: apiPort!, uiPort: uiPort!, bindAddress, codexAuthDir, gpu,
+            provider, containerName: containerName!, image: image!, volumeName: volumeName!, apiPort: apiPort!, uiPort: uiPort!, bindAddress, credentialMount, gpu,
             env: containerEnv,
             configDigest: "sha256:" + createHash("sha256").update(JSON.stringify(shape)).digest("hex"),
         },
     };
 }
 
-function selectedProviderConfiguration(extensionEnv: Record<string, string>): { provider: string; env: Record<string, string>; nativeEnv: Record<string, string>; codexAuthDir?: string } {
+function selectedProviderConfiguration(extensionEnv: Record<string, string>): Pick<HindsightSettings, "provider" | "env" | "credentialMount"> {
     const name = savedProviderSelection();
     if (name === undefined) {
         throw new Error("Hindsight: no saved provider selection; create providers/<name>.env and select it from /hindsight");
@@ -198,10 +198,15 @@ function selectedProviderConfiguration(extensionEnv: Record<string, string>): { 
             throw new Error("Hindsight: Go Messages profiles require an application-specific User-Agent in HINDSIGHT_API_LLM_DEFAULT_HEADERS");
         }
     }
-    const codexAuthDir = provider === "openai-codex" ? codexAuthDirectory(env.HINDSIGHT_OMP_CODEX_AUTH_DIR) : undefined;
-    const nativeEnv = { ...env };
-    if (codexAuthDir) nativeEnv.HINDSIGHT_API_LLM_CODEX_HOME = "/home/hindsight/.codex";
-    return { provider: name, env, nativeEnv, codexAuthDir };
+    if (provider !== "openai-codex") return { provider: name, env };
+    const credentialMount = {
+        source: codexAuthDirectory(env.HINDSIGHT_OMP_CODEX_AUTH_DIR),
+        destination: "/home/hindsight/.codex",
+        requiredFile: "auth.json",
+    };
+    env.HINDSIGHT_API_LLM_CODEX_HOME = credentialMount.destination;
+    env.HINDSIGHT_OMP_CODEX_AUTH_DIR = credentialMount.source;
+    return { provider: name, env, credentialMount };
 }
 
 function codexAuthDirectory(value: string | undefined): string {
