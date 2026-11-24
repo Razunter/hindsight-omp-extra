@@ -16,7 +16,7 @@ Changing or removing the override is a pending configuration change. Apply it fr
 
 Local Hindsight management is Off by default. In Off, these files are not read for validation and Docker is not contacted. With CPU or GPU management on, changes to `.env`, the selected profile, or the saved provider selection become a pending configuration that you apply from `/hindsight` after one confirmation, in the current OMP process. File edits never restart Docker by themselves, and startup never applies them. Comments or edits that leave the effective configuration unchanged are not pending.
 
-The container keeps running after OMP exits (`--restart unless-stopped`). Stopping OMP does not stop Hindsight. See [stopping the container](setup.md#stop-the-container).
+The container keeps running after OMP exits, but Docker does not restart newly created managed containers. With local management enabled, a fresh interactive OMP session starts the stopped approved container. See [how to disable Docker autostart for an existing container](setup.md#disable-docker-autostart-for-an-existing-container).
 
 ### Upgrade the installation-state lock
 

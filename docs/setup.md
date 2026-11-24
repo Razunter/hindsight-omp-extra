@@ -189,7 +189,17 @@ The container does not stop itself when OMP exits. With the example container na
 docker stop hindsight-omp
 ```
 
-Use your configured `HINDSIGHT_CONTAINER_NAME` if different. This stops the container without deleting its named data volume. With CPU or GPU management on, the next fresh interactive OMP launch starts the approved container again; choose **Off** in `/hindsight` first to keep it stopped. The container uses Docker’s `unless-stopped` restart policy; closing OMP is not an instruction to stop Docker.
+Use your configured `HINDSIGHT_CONTAINER_NAME` if different. This stops the container without deleting its named data volume. With CPU or GPU management on, the next fresh interactive OMP launch starts the approved container again. Choose **Off** in `/hindsight` first to keep it stopped.
+
+### Disable Docker autostart for an existing container
+
+New managed containers do not start when Docker starts. Containers created by older versions retain their previous restart policy. To disable it without stopping or replacing the container, run:
+
+```sh
+docker update --restart=no hindsight-omp
+```
+
+Use your configured `HINDSIGHT_CONTAINER_NAME` if different.
 
 ## Development checks
 

@@ -206,7 +206,6 @@ export async function runManagedContainer(settings: HindsightSettings, imageId: 
             "run", "-d", "--pull", "never",
             "--name", settings.containerName,
             "--cidfile", cidfile,
-            "--restart", "unless-stopped",
             "--shm-size", String(SHM_SIZE_BYTES),
             ...(settings.gpu ? ["--gpus", "all"] : []),
             "--label", `${INSTALLATION_LABEL}=${installationId}`,
