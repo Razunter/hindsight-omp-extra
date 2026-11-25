@@ -28,6 +28,8 @@ Search previews contain at most five items. Excerpts and metadata are at most 51
 
 The tool streams at most 1 MiB per HTTP response and uses the cancellable `hindsight.recallTimeoutMs` deadline, which defaults to 30 seconds, without retries. Query clipping follows native recall settings.
 
+For Bash or eval wrapper timeouts, see `hindsight_evidence --help`.
+
 Errors and unavailable contracts are explicit. Excluded evidence uses generic markers without its text or IDs. Available provenance is limited to source/source_id/title/filename metadata plus supplied context/timestamps. Absent provenance is marked unavailable.
 
 Selection is byte-aware. Excess items or support references may be omitted, and text may be shortened further, while returned identifiers stay complete. Missing or malformed current tags fail in every scope mode.

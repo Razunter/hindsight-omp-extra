@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.3
+
+- `hindsight_evidence` shows Bash and eval timeout guidance so the wrapper gives evidence requests enough time to finish.
+
 ## 1.0.2
 
 - In a `skill-observer` observation pass, `hindsight_curate` investigates a specific Hindsight finding. After native approval, it can archive duplicate or obsolete facts. If it creates a replacement, it verifies the exact fact before archiving the original. Check interrupted attempts by ID without repeating writes.
