@@ -26,7 +26,10 @@ Bun.plugin({ name: "curation-native-host", setup(build) {
         },
     });
     module("@oh-my-pi/pi-natives/vcs", { repo: () => undefined });
-    module("@oh-my-pi/pi-tui", { matchesKey: (input: string, key: string) => input === key, wrapTextWithAnsi: (text: string) => text.split("\n") });
+    module("@oh-my-pi/pi-tui/text/width", { wrap: (text: string) => text.split("\n") });
+    module("@oh-my-pi/pi-tui/driver/input/keys", {
+        decodeKey: (input: string) => input === "\x1b[97;1:2u" ? { id: "a", kind: "repeat" } : { id: input, kind: "press" },
+    });
 } });
 // Install the native host module doubles before loading the registered extension.
 const { registerCuration } = await import("../src/curation");
@@ -389,12 +392,16 @@ try {
     let review = "";
     const answer = (key: string, duringReview?: () => void, readAll = true) => async (factory: Function) => {
         let decision: unknown;
-        const component = factory({ terminal: { rows: 28, columns: 180 }, requestRender() {} }, {}, {}, (value: unknown) => { decision = value; });
+        const component = factory({ size: () => ({ rows: 28, columns: 180 }), requestRender() {}, suspend: async (run: () => Promise<unknown>) => run() }, {}, {}, (value: unknown) => { decision = value; });
         review = component.render(180).join("\n");
         duringReview?.();
         for (let page = 0; readAll && !review.includes("a Archive") && page < 10; page++) {
             component.handleInput("pageDown");
             review += "\n" + component.render(180).join("\n");
+        }
+        if (readAll && key === "a") {
+            component.handleInput("\x1b[97;1:2u");
+            assert.equal(decision, undefined, "a repeated key cannot approve a review");
         }
         component.handleInput(key);
         return decision;

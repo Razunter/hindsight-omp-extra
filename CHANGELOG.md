@@ -3,6 +3,7 @@
 ## 1.0.3
 
 - `hindsight_evidence` shows Bash and eval timeout guidance so the wrapper gives evidence requests enough time to finish.
+- Fixed the Hindsight archive review dialog on OMP 19.2. Review the full change before approving a request to archive a fact, mark it obsolete, or replace it.
 
 ## 1.0.2
 

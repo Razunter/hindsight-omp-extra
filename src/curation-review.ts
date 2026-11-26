@@ -9,17 +9,18 @@ export async function confirmArchive(ui: ExtensionContext["ui"], review: string,
     const deadline = signal ? AbortSignal.any([signal, timeout]) : timeout;
     const renderable = review.replace(/[\p{C}\p{Zl}\p{Zp}]/gu, character => character === "\n" ? "\n" : `\\u{${character.codePointAt(0)!.toString(16)}}`);
     try {
-        const { matchesKey, wrapTextWithAnsi } = await import("@oh-my-pi/pi-tui");
-        return await ui.custom<"approved" | "declined">((tui, _theme, _keys, done) => {
+        // Older hosts lack these exports; only archive review should be unavailable.
+        const { decodeKey } = await import("@oh-my-pi/pi-tui/driver/input/keys");
+        const { wrap } = await import("@oh-my-pi/pi-tui/text/width");
+        return await ui.custom<"approved" | "declined">((host, _theme, _keys, done) => {
             let page = 0;
             let width = 0;
             let height = 0;
             let lines: string[] = [];
             let lastPage = false;
             let rendered = false;
-            const availableRows = () => Math.min(22, Math.floor(tui.terminal.rows / 2)) - 3;
+            const availableRows = () => Math.min(22, Math.floor(host.size().rows / 2)) - 3;
             return {
-                invalidate() { rendered = false; },
                 render(columns) {
                     const rows = availableRows();
                     if (rows < 3 || columns < 44) {
@@ -27,7 +28,7 @@ export async function confirmArchive(ui: ExtensionContext["ui"], review: string,
                         return ["Resize to review. Esc cancels."];
                     }
                     if (columns !== width || rows !== height) {
-                        if (columns !== width) lines = wrapTextWithAnsi(renderable, columns);
+                        if (columns !== width) lines = wrap(renderable, columns);
                         width = columns;
                         height = rows;
                         page = 0;
@@ -39,17 +40,19 @@ export async function confirmArchive(ui: ExtensionContext["ui"], review: string,
                         lastPage ? "a Archive · Enter/Esc Keep active" : "PgDn Next · PgUp Back · Esc Keep active"];
                 },
                 handleInput(input) {
-                    if (matchesKey(input, "escape") || matchesKey(input, "enter")) return done("declined");
-                    if (!rendered || availableRows() !== height || tui.terminal.columns !== width) return;
-                    if (lastPage && input === "a") return done("approved");
-                    if (matchesKey(input, "pageDown") && !lastPage) page++;
-                    else if (matchesKey(input, "pageUp") && page > 0) page--;
+                    const event = decodeKey(input, { kitty: false, backspaceIsCtrl: false });
+                    const key = event?.id;
+                    if (key === "escape" || key === "enter") return done("declined");
+                    if (!rendered || availableRows() !== height || host.size().columns !== width) return;
+                    if (lastPage && key === "a" && event.kind === "press") return done("approved");
+                    if (key === "pageDown" && !lastPage) page++;
+                    else if (key === "pageUp" && page > 0) page--;
                     else return;
                     rendered = false;
-                    tui.requestRender();
+                    host.requestRender();
                 },
             };
-        }, { signal: deadline });
+        }, { overlay: true, fullscreen: true, signal: deadline });
     } catch {
         return timeout.aborted ? "timeout" as const : "declined" as const;
     }
